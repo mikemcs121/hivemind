@@ -34,10 +34,23 @@
           <div id="board-title">No board selected</div>
           <div id="board-meta"></div>
           <div class="spacer"></div>
+          <button id="git-toggle" class="icon-btn" title="Source Control (Git)" disabled>⑂</button>
+          <button id="broadcast-toggle" class="icon-btn" title="Broadcast input to all threads on this board" disabled>📡</button>
           <button id="mute-toggle" class="icon-btn" title="Notifications">🔔</button>
           <button id="add-term" class="primary" disabled>＋ Thread</button>
         </header>
         <section id="grid"></section>
+        <div id="broadcast-bar" class="hidden">
+          <span class="bc-label">📡 Send to <span id="bc-count">0</span> threads</span>
+          <input id="bc-input" type="text"
+                 placeholder="Type a command and press Enter to send it to every thread on this board…" />
+          <label class="bc-mirror" title="Mirror every keystroke from the focused thread to all threads">
+            <input type="checkbox" id="bc-mirror" /> mirror typing
+          </label>
+          <button id="bc-enter" class="icon-btn" title="Send Enter to all (e.g. submit / approve)">⏎</button>
+          <button id="bc-interrupt" class="icon-btn" title="Send Ctrl-C to all (interrupt)">^C</button>
+          <button id="bc-send" class="primary">Send</button>
+        </div>
         <div id="empty-state" class="empty">
           <h2>Welcome 👋</h2>
           <p>Create a board, point it at a project directory, and open as many
@@ -45,6 +58,60 @@
           <button id="empty-add-board" class="primary">Create your first board</button>
         </div>
       </main>
+
+      <!-- Source Control panel (Git) -->
+      <aside id="git-panel" class="hidden">
+        <div class="git-header">
+          <span class="git-title">Source Control</span>
+          <div class="spacer"></div>
+          <button id="git-refresh" class="git-icon" title="Refresh">⟳</button>
+          <button id="git-close" class="git-icon" title="Close">✕</button>
+        </div>
+        <div id="git-body"></div>
+        <div id="git-msgbar" class="git-msgbar hidden"></div>
+      </aside>
+    </div>
+
+    <!-- Diff viewer -->
+    <div id="diff-backdrop" class="hidden">
+      <div id="diff-modal">
+        <div class="diff-head">
+          <span id="diff-title">Diff</span>
+          <div class="spacer"></div>
+          <button id="diff-close" class="git-icon" title="Close">✕</button>
+        </div>
+        <pre id="diff-body"></pre>
+      </div>
+    </div>
+
+    <!-- Branch menu (switch / create) -->
+    <div id="branch-backdrop" class="hidden">
+      <div id="branch-modal">
+        <h3>Branches</h3>
+        <ul id="branch-list"></ul>
+        <label>New branch
+          <div class="dir-row">
+            <input id="branch-new" type="text" placeholder="feature/my-branch" />
+            <button id="branch-create">Create</button>
+          </div>
+        </label>
+        <div class="modal-actions">
+          <button id="branch-cancel">Close</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Connect to GitHub wizard -->
+    <div id="gh-backdrop" class="hidden">
+      <div id="gh-modal">
+        <div class="gh-head">
+          <span id="gh-title">Connect to GitHub</span>
+          <div class="spacer"></div>
+          <button id="gh-close" class="git-icon" title="Close">✕</button>
+        </div>
+        <div id="gh-body"></div>
+        <div id="gh-msg" class="gh-msg hidden"></div>
+      </div>
     </div>
 
     <!-- Board create/edit modal -->

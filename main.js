@@ -5,6 +5,7 @@ const path = require('path');
 const fs = require('fs');
 const os = require('os');
 const pty = require('@homebridge/node-pty-prebuilt-multiarch');
+const git = require('./git');
 
 // ---------------------------------------------------------------------------
 // Persistence: boards are stored as JSON in the app's userData directory.
@@ -198,6 +199,31 @@ app.whenReady().then(() => {
       ptys.delete(id);
     }
   });
+
+  // -- IPC: git -------------------------------------------------------------
+  // All operations run in the directory passed by the renderer (the active
+  // board's project dir). Each returns a plain object the panel can render.
+  ipcMain.handle('git:status', (_e, { cwd }) => git.status(cwd));
+  ipcMain.handle('git:diff', (_e, { cwd, file, staged, untracked }) => git.diff(cwd, file, staged, untracked));
+  ipcMain.handle('git:stage', (_e, { cwd, files }) => git.stage(cwd, files));
+  ipcMain.handle('git:stageAll', (_e, { cwd }) => git.stageAll(cwd));
+  ipcMain.handle('git:unstage', (_e, { cwd, files }) => git.unstage(cwd, files));
+  ipcMain.handle('git:unstageAll', (_e, { cwd }) => git.unstageAll(cwd));
+  ipcMain.handle('git:discard', (_e, { cwd, files }) => git.discard(cwd, files));
+  ipcMain.handle('git:commit', (_e, { cwd, message }) => git.commit(cwd, message));
+  ipcMain.handle('git:branches', (_e, { cwd }) => git.branches(cwd));
+  ipcMain.handle('git:checkout', (_e, { cwd, name }) => git.checkout(cwd, name));
+  ipcMain.handle('git:createBranch', (_e, { cwd, name }) => git.createBranch(cwd, name));
+  ipcMain.handle('git:init', (_e, { cwd }) => git.init(cwd));
+  ipcMain.handle('git:fetch', (_e, { cwd }) => git.fetch(cwd));
+  ipcMain.handle('git:pull', (_e, { cwd }) => git.pull(cwd));
+  ipcMain.handle('git:push', (_e, { cwd, branch, setUpstream }) => git.push(cwd, { branch, setUpstream }));
+
+  // -- IPC: GitHub connection wizard ----------------------------------------
+  ipcMain.handle('git:remoteUrl', (_e, { cwd }) => git.getRemoteUrl(cwd));
+  ipcMain.handle('git:setRemote', (_e, { cwd, url }) => git.setRemoteOrigin(cwd, url));
+  ipcMain.handle('gh:check', () => git.ghCheck());
+  ipcMain.handle('gh:createRepo', (_e, { cwd, name, visibility, push }) => git.ghCreateRepo(cwd, { name, visibility, push }));
 
   createWindow();
 

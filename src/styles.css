@@ -164,6 +164,40 @@ button.icon-btn {
 }
 button.icon-btn:hover { filter: brightness(1.15); }
 button.icon-btn.muted { opacity: .55; }
+button.icon-btn.active { background: var(--accent); color: #11111b; }
+button.icon-btn.active.mirror { background: var(--peach); }
+button.icon-btn:disabled { opacity: .4; cursor: not-allowed; }
+
+/* ---------------- Broadcast bar ---------------- */
+#broadcast-bar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 14px;
+  background: var(--panel);
+  border-top: 1px solid var(--border);
+}
+#broadcast-bar.hidden { display: none; }
+#broadcast-bar .bc-label { font-size: 12px; color: var(--muted); white-space: nowrap; }
+#broadcast-bar #bc-count { color: var(--accent); font-weight: 700; }
+#bc-input {
+  flex: 1;
+  min-width: 0;
+  background: var(--bg-alt);
+  border: 1px solid var(--border);
+  color: var(--text);
+  border-radius: 6px;
+  padding: 8px 10px;
+  font-size: 13px;
+  font-family: "Cascadia Code", Consolas, monospace;
+}
+#bc-input:focus { outline: none; border-color: var(--accent); }
+#broadcast-bar .bc-mirror {
+  display: flex; align-items: center; gap: 5px;
+  font-size: 12px; color: var(--muted); white-space: nowrap; cursor: pointer;
+}
+#broadcast-bar .bc-mirror input { cursor: pointer; }
+#bc-interrupt { font-size: 12px; font-weight: 700; color: var(--danger); }
 
 /* ---------------- Grid ---------------- */
 #grid {
@@ -282,5 +316,247 @@ button.icon-btn.muted { opacity: .55; }
 }
 .dir-row button:hover, .modal-actions button:hover { filter: brightness(1.15); }
 .modal-actions { display: flex; justify-content: flex-end; gap: 8px; }
+
+/* ---------------- Source Control (Git) panel ---------------- */
+#git-panel {
+  width: 340px;
+  min-width: 340px;
+  background: var(--bg-alt);
+  border-left: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+#git-panel.hidden { display: none; }
+
+.git-header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  height: 46px;
+  padding: 0 10px 0 14px;
+  border-bottom: 1px solid var(--border);
+  background: var(--panel);
+}
+.git-title { font-weight: 600; font-size: 13px; }
+.git-icon {
+  background: transparent; border: none; color: var(--muted);
+  cursor: pointer; font-size: 15px; width: 28px; height: 28px;
+  border-radius: 6px; line-height: 1;
+}
+.git-icon:hover { color: var(--text); background: var(--surface); }
+
+#git-body { flex: 1; overflow-y: auto; padding: 10px; display: flex; flex-direction: column; gap: 12px; }
+
+/* Branch bar */
+.git-branchbar { display: flex; flex-direction: column; gap: 8px; }
+.git-branchline { display: flex; align-items: center; gap: 8px; }
+.branch-select {
+  display: flex; align-items: center; gap: 6px; flex: 1; min-width: 0;
+  background: var(--surface); color: var(--text); border: none;
+  border-radius: 6px; padding: 7px 10px; font-size: 13px; cursor: pointer;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.branch-select:hover { filter: brightness(1.15); }
+.branch-select .bname { overflow: hidden; text-overflow: ellipsis; }
+.git-counts { font-size: 12px; color: var(--muted); white-space: nowrap; font-variant-numeric: tabular-nums; }
+.git-counts .ahead { color: var(--accent-2); }
+.git-counts .behind { color: var(--peach); }
+
+.git-remote-actions { display: flex; gap: 6px; }
+.git-remote-actions button {
+  flex: 1; background: var(--surface); color: var(--text); border: none;
+  border-radius: 6px; padding: 7px 6px; font-size: 12px; cursor: pointer;
+}
+.git-remote-actions button:hover { filter: brightness(1.15); }
+.git-remote-actions button:disabled { opacity: .4; cursor: not-allowed; }
+
+/* Commit box */
+#git-msg {
+  width: 100%; resize: vertical; min-height: 58px;
+  background: var(--panel); border: 1px solid var(--border); color: var(--text);
+  border-radius: 6px; padding: 8px 10px; font-size: 13px;
+  font-family: "Segoe UI", system-ui, sans-serif;
+}
+#git-msg:focus { outline: none; border-color: var(--accent); }
+.git-commit-actions { display: flex; gap: 6px; margin-top: 6px; }
+.git-commit-actions .primary { flex: 1; }
+.git-commit-actions button:not(.primary) {
+  background: var(--surface); color: var(--text); border: none;
+  border-radius: 6px; padding: 7px 10px; font-size: 12px; cursor: pointer;
+}
+.git-commit-actions button:disabled { opacity: .4; cursor: not-allowed; }
+
+/* Change sections */
+.git-section .git-section-head {
+  display: flex; align-items: center; gap: 6px;
+  font-size: 11px; text-transform: uppercase; letter-spacing: .4px;
+  color: var(--muted); padding: 4px 2px; margin-top: 4px;
+}
+.git-section-head .count {
+  background: var(--surface); color: var(--text); border-radius: 9px;
+  padding: 0 6px; font-size: 10px; font-weight: 700; letter-spacing: 0;
+}
+.git-section-head .spacer { flex: 1; }
+.git-section-head button {
+  background: transparent; border: none; color: var(--muted);
+  cursor: pointer; font-size: 13px; padding: 1px 5px; border-radius: 4px;
+}
+.git-section-head button:hover { color: var(--text); background: var(--surface); }
+
+.git-files { list-style: none; margin: 0; padding: 0; }
+.git-file {
+  display: flex; align-items: center; gap: 7px;
+  padding: 5px 6px; border-radius: 5px; cursor: pointer; font-size: 13px;
+}
+.git-file:hover { background: var(--surface); }
+.git-file .fstat {
+  flex: none; width: 14px; text-align: center; font-weight: 700; font-size: 12px;
+  font-family: "Cascadia Code", Consolas, monospace;
+}
+.git-file .fstat.M { color: var(--yellow); }
+.git-file .fstat.A { color: var(--accent-2); }
+.git-file .fstat.D { color: var(--danger); }
+.git-file .fstat.R { color: var(--accent); }
+.git-file .fstat.U { color: var(--peach); }
+.git-file .fname { flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.git-file .fdir { color: var(--muted); }
+.git-file .fact { display: none; gap: 2px; }
+.git-file:hover .fact { display: flex; }
+.git-file .fact button {
+  background: transparent; border: none; color: var(--muted);
+  cursor: pointer; font-size: 13px; padding: 1px 4px; border-radius: 4px;
+}
+.git-file .fact button:hover { color: var(--text); background: var(--bg); }
+
+.git-empty { color: var(--muted); font-size: 13px; text-align: center; padding: 24px 12px; line-height: 1.5; }
+.git-empty .primary { margin-top: 12px; }
+
+/* Status / output message bar */
+.git-msgbar {
+  border-top: 1px solid var(--border); padding: 8px 12px;
+  font-size: 12px; max-height: 140px; overflow-y: auto; white-space: pre-wrap;
+  font-family: "Cascadia Code", Consolas, monospace; color: var(--muted);
+}
+.git-msgbar.err { color: var(--danger); }
+.git-msgbar.ok { color: var(--accent-2); }
+.git-msgbar.hidden { display: none; }
+
+/* Diff viewer */
+#diff-backdrop {
+  position: fixed; inset: 0; background: rgba(0,0,0,.55);
+  display: flex; align-items: center; justify-content: center; z-index: 60;
+}
+#diff-backdrop.hidden { display: none; }
+#diff-modal {
+  background: var(--bg-alt); border: 1px solid var(--border); border-radius: 10px;
+  width: 80vw; max-width: 1000px; height: 80vh; display: flex; flex-direction: column; overflow: hidden;
+}
+.diff-head { display: flex; align-items: center; padding: 10px 12px; border-bottom: 1px solid var(--border); }
+#diff-title { font-family: "Cascadia Code", Consolas, monospace; font-size: 13px; }
+#diff-body {
+  flex: 1; margin: 0; overflow: auto; padding: 12px;
+  font-family: "Cascadia Code", Consolas, monospace; font-size: 12px; line-height: 1.45;
+  white-space: pre; tab-size: 4;
+}
+.diff-add { color: var(--accent-2); }
+.diff-del { color: var(--danger); }
+.diff-hunk { color: var(--accent); }
+.diff-meta { color: var(--muted); }
+
+/* Branch menu */
+#branch-backdrop {
+  position: fixed; inset: 0; background: rgba(0,0,0,.55);
+  display: flex; align-items: center; justify-content: center; z-index: 60;
+}
+#branch-backdrop.hidden { display: none; }
+#branch-modal {
+  background: var(--bg-alt); border: 1px solid var(--border); border-radius: 12px;
+  padding: 22px; width: 420px; display: flex; flex-direction: column; gap: 14px;
+}
+#branch-modal h3 { margin: 0; }
+#branch-modal label { display: flex; flex-direction: column; gap: 6px; font-size: 13px; color: var(--muted); }
+#branch-modal input {
+  background: var(--panel); border: 1px solid var(--border); color: var(--text);
+  border-radius: 6px; padding: 8px 10px; font-size: 13px;
+}
+#branch-modal input:focus { outline: none; border-color: var(--accent); }
+#branch-list { list-style: none; margin: 0; padding: 0; max-height: 240px; overflow-y: auto; display: flex; flex-direction: column; gap: 2px; }
+#branch-list li {
+  display: flex; align-items: center; gap: 8px; padding: 8px 10px;
+  border-radius: 6px; cursor: pointer; font-size: 13px;
+}
+#branch-list li:hover { background: var(--surface); }
+#branch-list li.current { color: var(--accent-2); font-weight: 600; cursor: default; }
+#branch-list li.current:hover { background: transparent; }
+
+/* Connect-to-GitHub banner (shown in the panel when there's no remote) */
+.git-publish {
+  display: flex; flex-direction: column; gap: 8px;
+  background: var(--surface); border: 1px solid var(--border);
+  border-radius: 8px; padding: 12px;
+}
+.git-publish-text { font-size: 12px; color: var(--muted); line-height: 1.4; }
+.git-publish .primary { width: 100%; }
+
+/* Connect-to-GitHub wizard */
+#gh-backdrop {
+  position: fixed; inset: 0; background: rgba(0,0,0,.55);
+  display: flex; align-items: center; justify-content: center; z-index: 60;
+}
+#gh-backdrop.hidden { display: none; }
+#gh-modal {
+  background: var(--bg-alt); border: 1px solid var(--border); border-radius: 12px;
+  width: 480px; max-width: 92vw; display: flex; flex-direction: column; overflow: hidden;
+}
+.gh-head { display: flex; align-items: center; padding: 14px 14px 14px 18px; border-bottom: 1px solid var(--border); }
+#gh-title { font-weight: 600; font-size: 14px; }
+#gh-body { padding: 18px; display: flex; flex-direction: column; gap: 14px; }
+.gh-intro { margin: 0; font-size: 13px; color: var(--muted); line-height: 1.5; }
+.gh-options { display: flex; flex-direction: column; gap: 10px; }
+.gh-card {
+  text-align: left; background: var(--surface); color: var(--text);
+  border: 1px solid var(--border); border-radius: 8px; padding: 12px 14px;
+  cursor: pointer; display: flex; flex-direction: column; gap: 4px;
+}
+.gh-card:hover { border-color: var(--accent); }
+.gh-card .gh-card-title { font-weight: 600; font-size: 13px; }
+.gh-card .gh-card-desc { font-size: 12px; color: var(--muted); line-height: 1.4; }
+#gh-body label { display: flex; flex-direction: column; gap: 6px; font-size: 13px; color: var(--muted); }
+#gh-body input[type="text"] {
+  background: var(--panel); border: 1px solid var(--border); color: var(--text);
+  border-radius: 6px; padding: 8px 10px; font-size: 13px;
+}
+#gh-body input[type="text"]:focus { outline: none; border-color: var(--accent); }
+.gh-radios { display: flex; gap: 8px; }
+.gh-radio {
+  flex: 1; display: flex; align-items: center; gap: 8px; cursor: pointer;
+  background: var(--panel); border: 1px solid var(--border); color: var(--text);
+  border-radius: 6px; padding: 8px 10px; font-size: 13px;
+}
+.gh-radio.sel { border-color: var(--accent); }
+.gh-radio small { display: block; color: var(--muted); font-size: 11px; }
+.gh-code {
+  background: var(--panel); border: 1px solid var(--border); border-radius: 6px;
+  padding: 8px 10px; font-family: "Cascadia Code", Consolas, monospace; font-size: 12px;
+  color: var(--text); user-select: all; white-space: pre-wrap; word-break: break-all;
+}
+.gh-note { font-size: 12px; color: var(--muted); line-height: 1.5; }
+.gh-actions { display: flex; justify-content: space-between; gap: 8px; margin-top: 4px; }
+.gh-actions .gh-right { display: flex; gap: 8px; margin-left: auto; }
+.gh-actions button {
+  background: var(--surface); color: var(--text); border: none;
+  border-radius: 6px; padding: 8px 14px; font-size: 13px; cursor: pointer;
+}
+.gh-actions button:hover { filter: brightness(1.15); }
+.gh-actions button:disabled { opacity: .4; cursor: not-allowed; }
+.gh-msg {
+  border-top: 1px solid var(--border); padding: 10px 18px;
+  font-size: 12px; max-height: 160px; overflow-y: auto; white-space: pre-wrap;
+  font-family: "Cascadia Code", Consolas, monospace; color: var(--muted);
+}
+.gh-msg.err { color: var(--danger); }
+.gh-msg.ok { color: var(--accent-2); }
+.gh-msg.hidden { display: none; }
 
 .hidden { display: none !important; }

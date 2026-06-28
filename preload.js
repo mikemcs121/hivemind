@@ -26,6 +26,31 @@ contextBridge.exposeInMainWorld('api', {
     return () => ipcRenderer.removeListener('pty:exit', h);
   },
 
+  // Git (Source Control panel). `cwd` is the active board's project directory.
+  git: {
+    status: (cwd) => ipcRenderer.invoke('git:status', { cwd }),
+    diff: (cwd, file, staged, untracked) => ipcRenderer.invoke('git:diff', { cwd, file, staged, untracked }),
+    stage: (cwd, files) => ipcRenderer.invoke('git:stage', { cwd, files }),
+    stageAll: (cwd) => ipcRenderer.invoke('git:stageAll', { cwd }),
+    unstage: (cwd, files) => ipcRenderer.invoke('git:unstage', { cwd, files }),
+    unstageAll: (cwd) => ipcRenderer.invoke('git:unstageAll', { cwd }),
+    discard: (cwd, files) => ipcRenderer.invoke('git:discard', { cwd, files }),
+    commit: (cwd, message) => ipcRenderer.invoke('git:commit', { cwd, message }),
+    branches: (cwd) => ipcRenderer.invoke('git:branches', { cwd }),
+    checkout: (cwd, name) => ipcRenderer.invoke('git:checkout', { cwd, name }),
+    createBranch: (cwd, name) => ipcRenderer.invoke('git:createBranch', { cwd, name }),
+    init: (cwd) => ipcRenderer.invoke('git:init', { cwd }),
+    fetch: (cwd) => ipcRenderer.invoke('git:fetch', { cwd }),
+    pull: (cwd) => ipcRenderer.invoke('git:pull', { cwd }),
+    push: (cwd, branch, setUpstream) => ipcRenderer.invoke('git:push', { cwd, branch, setUpstream }),
+
+    // GitHub connection wizard
+    remoteUrl: (cwd) => ipcRenderer.invoke('git:remoteUrl', { cwd }),
+    setRemote: (cwd, url) => ipcRenderer.invoke('git:setRemote', { cwd, url }),
+    ghCheck: () => ipcRenderer.invoke('gh:check'),
+    ghCreateRepo: (cwd, opts) => ipcRenderer.invoke('gh:createRepo', Object.assign({ cwd }, opts)),
+  },
+
   // Notifications
   notify: (payload) => ipcRenderer.send('notify', payload),
   onFocusPane: (cb) => {
