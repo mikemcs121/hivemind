@@ -1,6 +1,6 @@
 'use strict';
 
-const { app, BrowserWindow, ipcMain, dialog, Notification } = require('electron');
+const { app, BrowserWindow, Menu, MenuItem, ipcMain, dialog, Notification } = require('electron');
 const path = require('path');
 const fs = require('fs');
 const os = require('os');
@@ -110,6 +110,46 @@ function createWindow() {
 
   mainWindow.removeMenu();
   mainWindow.loadFile(path.join(__dirname, 'src', 'index.html'));
+
+  // Spell-check stays inert until a dictionary language is loaded. On Windows
+  // Electron does NOT infer this from the system locale, so without this call
+  // no Hunspell dictionary is downloaded, nothing is flagged, and
+  // dictionarySuggestions always comes back empty. Set it explicitly.
+  try {
+    mainWindow.webContents.session.setSpellCheckerLanguages(['en-US']);
+  } catch (_) {
+    /* language unavailable on this build — leave spell-check off */
+  }
+
+  // Right-click menu for spell-check suggestions on editable fields. The
+  // renderer's <input spellcheck="true"> fields get red squiggles once the
+  // dictionary above is loaded; this surfaces the suggestions + add-to-dictionary action.
+  mainWindow.webContents.on('context-menu', (_e, params) => {
+    if (!params.isEditable && !params.misspelledWord) return;
+    const menu = new Menu();
+
+    for (const suggestion of params.dictionarySuggestions) {
+      menu.append(new MenuItem({
+        label: suggestion,
+        click: () => mainWindow.webContents.replaceMisspelling(suggestion),
+      }));
+    }
+
+    if (params.misspelledWord) {
+      menu.append(new MenuItem({
+        label: 'Add to dictionary',
+        click: () =>
+          mainWindow.webContents.session.addWordToSpellCheckerDictionary(params.misspelledWord),
+      }));
+      menu.append(new MenuItem({ type: 'separator' }));
+    }
+
+    menu.append(new MenuItem({ role: 'cut', enabled: params.editFlags.canCut }));
+    menu.append(new MenuItem({ role: 'copy', enabled: params.editFlags.canCopy }));
+    menu.append(new MenuItem({ role: 'paste', enabled: params.editFlags.canPaste }));
+
+    menu.popup();
+  });
 
   // Stop flashing the taskbar once the user looks at the window.
   mainWindow.on('focus', () => {
