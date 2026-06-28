@@ -120,6 +120,24 @@ html, body {
 }
 .board-item .actions button:hover { color: var(--text); background: var(--bg); }
 
+.sidebar-actions { padding: 8px; border-top: 1px solid var(--border); }
+.sidebar-action-btn {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
+  background: var(--surface);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  font-size: 13px;
+  cursor: pointer;
+}
+.sidebar-action-btn:hover:not(:disabled) { background: var(--accent); color: #11111b; border-color: var(--accent); }
+.sidebar-action-btn.active { background: var(--accent); color: #11111b; border-color: var(--accent); }
+.sidebar-action-btn:disabled { opacity: 0.4; cursor: default; }
+
 .sidebar-footer { padding: 10px 14px; font-size: 11px; color: var(--muted); border-top: 1px solid var(--border); }
 
 /* ---------------- Workspace ---------------- */
@@ -318,16 +336,20 @@ button.icon-btn:disabled { opacity: .4; cursor: not-allowed; }
 .modal-actions { display: flex; justify-content: flex-end; gap: 8px; }
 
 /* ---------------- Source Control (Git) panel ---------------- */
+/* Docked inside the sidebar: fills the board-list area when open. */
 #git-panel {
-  width: 340px;
-  min-width: 340px;
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
   background: var(--bg-alt);
-  border-left: 1px solid var(--border);
+  border-top: 1px solid var(--border);
   display: flex;
   flex-direction: column;
-  min-height: 0;
 }
 #git-panel.hidden { display: none; }
+
+/* When source control is open, the board list yields its space to it. */
+#sidebar.git-open #board-list { display: none; }
 
 .git-header {
   display: flex;

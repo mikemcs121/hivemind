@@ -501,8 +501,9 @@ function createPane(board, col) {
   termWrap.addEventListener('wheel', (e) => {
     if (!e.ctrlKey) return;
     e.preventDefault();
+    e.stopPropagation();
     setPaneFontSize(pane, pane.fontSize + (e.deltaY < 0 ? 1 : -1));
-  }, { passive: false });
+  }, { passive: false, capture: true });
 
   // Spawn the PTY in the board's directory.
   fitAddon.fit();
@@ -693,6 +694,7 @@ function showEmpty() {
     gitToggle.classList.remove('active');
   }
   if (typeof gitPanel !== 'undefined' && gitPanel) gitPanel.classList.add('hidden');
+  const sb = $('sidebar'); if (sb) sb.classList.remove('git-open');
 }
 
 // ---------------------------------------------------------------------------
@@ -796,17 +798,19 @@ function setGitMsg(text, kind) {
 
 function gitPanelOpen() { return gitPanel && !gitPanel.classList.contains('hidden'); }
 
-gitToggle.onclick = () => {
-  const open = gitPanel.classList.toggle('hidden') === false;
+const sidebarEl = $('sidebar');
+function setGitOpen(open) {
+  gitPanel.classList.toggle('hidden', !open);
   gitToggle.classList.toggle('active', open);
+  sidebarEl.classList.toggle('git-open', open); // board list yields its space
+}
+
+gitToggle.onclick = () => {
+  const open = gitPanel.classList.contains('hidden');
+  setGitOpen(open);
   if (open) refreshGit();
-  if (activeBoardId) fitBoard(activeBoardId); // grid width changed
 };
-$('git-close').onclick = () => {
-  gitPanel.classList.add('hidden');
-  gitToggle.classList.remove('active');
-  if (activeBoardId) fitBoard(activeBoardId);
-};
+$('git-close').onclick = () => setGitOpen(false);
 $('git-refresh').onclick = () => refreshGit();
 
 function gitOnBoardChange() {

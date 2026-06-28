@@ -26,6 +26,22 @@
           <button id="add-board" title="New board">＋</button>
         </div>
         <ul id="board-list"></ul>
+
+        <!-- Source Control panel (Git) — docked inside the sidebar -->
+        <aside id="git-panel" class="hidden">
+          <div class="git-header">
+            <span class="git-title">Source Control</span>
+            <div class="spacer"></div>
+            <button id="git-refresh" class="git-icon" title="Refresh">⟳</button>
+            <button id="git-close" class="git-icon" title="Close">✕</button>
+          </div>
+          <div id="git-body"></div>
+          <div id="git-msgbar" class="git-msgbar hidden"></div>
+        </aside>
+
+        <div class="sidebar-actions">
+          <button id="git-toggle" class="sidebar-action-btn" title="Source Control (Git)" disabled>⑂ Source Control</button>
+        </div>
         <div class="sidebar-footer">Hivemind</div>
       </aside>
 
@@ -34,7 +50,6 @@
           <div id="board-title">No board selected</div>
           <div id="board-meta"></div>
           <div class="spacer"></div>
-          <button id="git-toggle" class="icon-btn" title="Source Control (Git)" disabled>⑂</button>
           <button id="broadcast-toggle" class="icon-btn" title="Broadcast input to all threads on this board" disabled>📡</button>
           <button id="mute-toggle" class="icon-btn" title="Notifications">🔔</button>
           <button id="add-term" class="primary" disabled>＋ Thread</button>
@@ -58,18 +73,6 @@
           <button id="empty-add-board" class="primary">Create your first board</button>
         </div>
       </main>
-
-      <!-- Source Control panel (Git) -->
-      <aside id="git-panel" class="hidden">
-        <div class="git-header">
-          <span class="git-title">Source Control</span>
-          <div class="spacer"></div>
-          <button id="git-refresh" class="git-icon" title="Refresh">⟳</button>
-          <button id="git-close" class="git-icon" title="Close">✕</button>
-        </div>
-        <div id="git-body"></div>
-        <div id="git-msgbar" class="git-msgbar hidden"></div>
-      </aside>
     </div>
 
     <!-- Diff viewer -->
