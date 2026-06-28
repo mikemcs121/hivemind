@@ -1,0 +1,78 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta http-equiv="Content-Security-Policy"
+          content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; font-src 'self' data:;" />
+    <title>Hivemind</title>
+    <link rel="stylesheet" href="../node_modules/@xterm/xterm/css/xterm.css" />
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <div id="app">
+      <aside id="sidebar">
+        <div class="sidebar-header">
+          <span class="logo">
+            <svg class="logo-mark" viewBox="0 0 24 24" width="20" height="20" aria-hidden="true">
+              <polygon points="7,2.5 11.76,5.25 11.76,10.75 7,13.5 2.24,10.75 2.24,5.25"
+                       fill="#89b4fa" stroke="#181825" stroke-width="0.8" />
+              <polygon points="16.5,2.5 21.26,5.25 21.26,10.75 16.5,13.5 11.74,10.75 11.74,5.25"
+                       fill="#94e2d5" stroke="#181825" stroke-width="0.8" />
+              <polygon points="11.75,10.75 16.51,13.5 16.51,19 11.75,21.75 6.99,19 6.99,13.5"
+                       fill="#f9e2af" stroke="#181825" stroke-width="0.8" />
+            </svg>
+            <span class="logo-text">Hivemind</span>
+          </span>
+          <button id="add-board" title="New board">＋</button>
+        </div>
+        <ul id="board-list"></ul>
+        <div class="sidebar-footer">Hivemind</div>
+      </aside>
+
+      <main id="workspace">
+        <header id="board-bar">
+          <div id="board-title">No board selected</div>
+          <div id="board-meta"></div>
+          <div class="spacer"></div>
+          <button id="mute-toggle" class="icon-btn" title="Notifications">🔔</button>
+          <button id="add-term" class="primary" disabled>＋ Thread</button>
+        </header>
+        <section id="grid"></section>
+        <div id="empty-state" class="empty">
+          <h2>Welcome 👋</h2>
+          <p>Create a board, point it at a project directory, and open as many
+             Claude threads as you like — they all share that directory.</p>
+          <button id="empty-add-board" class="primary">Create your first board</button>
+        </div>
+      </main>
+    </div>
+
+    <!-- Board create/edit modal -->
+    <div id="modal-backdrop" class="hidden">
+      <div id="modal">
+        <h3 id="modal-title">New board</h3>
+        <label>Board name
+          <input id="modal-name" type="text" placeholder="My project" />
+        </label>
+        <label>Project directory
+          <div class="dir-row">
+            <input id="modal-dir" type="text" placeholder="C:\\path\\to\\project" />
+            <button id="modal-browse">Browse…</button>
+          </div>
+        </label>
+        <label>Startup command
+          <input id="modal-cmd" type="text" placeholder="claude" />
+          <small>Runs automatically in every new thread on this board.</small>
+        </label>
+        <div class="modal-actions">
+          <button id="modal-cancel">Cancel</button>
+          <button id="modal-save" class="primary">Save</button>
+        </div>
+      </div>
+    </div>
+
+    <script src="../node_modules/@xterm/xterm/lib/xterm.js"></script>
+    <script src="../node_modules/@xterm/addon-fit/lib/addon-fit.js"></script>
+    <script src="renderer.js"></script>
+  </body>
+</html>
