@@ -8,6 +8,12 @@ contextBridge.exposeInMainWorld('api', {
   saveBoards: (boards) => ipcRenderer.invoke('boards:save', boards),
   pickDir: () => ipcRenderer.invoke('dialog:pickDir'),
 
+  // Images dragged/pasted into a terminal: persist bytes, get back a path.
+  saveTempImage: (bytes, ext) => ipcRenderer.invoke('image:saveTemp', { bytes, ext }),
+  // A screenshot held on the native clipboard (e.g. Win+Shift+S): persist as
+  // PNG and get back a path, or null if the clipboard holds no image.
+  clipboardImage: () => ipcRenderer.invoke('image:fromClipboard'),
+
   // PTY lifecycle
   spawnPty: (opts) => ipcRenderer.invoke('pty:spawn', opts),
   writePty: (id, data) => ipcRenderer.send('pty:write', { id, data }),
@@ -43,12 +49,32 @@ contextBridge.exposeInMainWorld('api', {
     fetch: (cwd) => ipcRenderer.invoke('git:fetch', { cwd }),
     pull: (cwd) => ipcRenderer.invoke('git:pull', { cwd }),
     push: (cwd, branch, setUpstream) => ipcRenderer.invoke('git:push', { cwd, branch, setUpstream }),
+    resetToRemote: (cwd, branch) => ipcRenderer.invoke('git:resetToRemote', { cwd, branch }),
 
     // GitHub connection wizard
     remoteUrl: (cwd) => ipcRenderer.invoke('git:remoteUrl', { cwd }),
     setRemote: (cwd, url) => ipcRenderer.invoke('git:setRemote', { cwd, url }),
     ghCheck: () => ipcRenderer.invoke('gh:check'),
     ghCreateRepo: (cwd, opts) => ipcRenderer.invoke('gh:createRepo', Object.assign({ cwd }, opts)),
+
+    // Draft a commit message from the current diff via `claude -p`.
+    aiCommitMessage: (cwd) => ipcRenderer.invoke('git:aiCommit', { cwd }),
+  },
+
+  // Filesystem watch on the active board's directory (auto-refresh panels).
+  setWatch: (cwd) => ipcRenderer.send('watch:set', { cwd }),
+  onFsChanged: (cb) => {
+    const h = (_e, payload) => cb(payload);
+    ipcRenderer.on('fs:changed', h);
+    return () => ipcRenderer.removeListener('fs:changed', h);
+  },
+
+  // File Explorer panel. `cwd` is the active board's project directory; `rel`
+  // is a "/"-separated path under it ('' for the root).
+  files: {
+    list: (cwd, rel) => ipcRenderer.invoke('files:list', { cwd, rel }),
+    open: (cwd, rel) => ipcRenderer.invoke('files:open', { cwd, rel }),
+    reveal: (cwd, rel) => ipcRenderer.invoke('files:reveal', { cwd, rel }),
   },
 
   // Notifications

@@ -9,7 +9,7 @@
 // window, so HTTPS push/pull to GitHub keeps working.
 // ---------------------------------------------------------------------------
 
-const { execFile } = require('child_process');
+const { execFile, spawn } = require('child_process');
 const fs = require('fs');
 const path = require('path');
 
@@ -196,6 +196,45 @@ function push(cwd, { branch, setUpstream } = {}) {
   return runGit(cwd, args, { timeout: 120000 });
 }
 
+// Throw away every local change and match the copy on GitHub. Fetches the
+// remote first, hard-resets the current branch onto its upstream (so unpushed
+// commits and uncommitted edits both go), then cleans untracked files so the
+// working tree is byte-for-byte what origin holds. Destructive — the renderer
+// confirms before calling.
+async function resetToRemote(cwd, { branch } = {}) {
+  if (!ok(cwd)) return { code: 1, stdout: '', stderr: 'This board has no project directory set.' };
+
+  // Resolve the upstream ref. Prefer the branch's configured @{u}; fall back to
+  // origin/<branch> when the branch has no upstream set yet.
+  let ref = null;
+  const u = await runGit(cwd, ['rev-parse', '--abbrev-ref', '--symbolic-full-name', '@{u}']);
+  if (u.code === 0 && u.stdout.trim()) {
+    ref = u.stdout.trim();
+  } else if (branch) {
+    ref = `origin/${branch}`;
+  }
+  if (!ref) {
+    return { code: 1, stdout: '', stderr: 'This branch has no GitHub upstream to revert to. Push it first.' };
+  }
+
+  const fetched = await runGit(cwd, ['fetch', 'origin'], { timeout: 120000 });
+  if (fetched.code !== 0) return fetched;
+
+  // Make sure the ref actually exists after fetching before we nuke anything.
+  const verify = await runGit(cwd, ['rev-parse', '--verify', '--quiet', ref + '^{commit}']);
+  if (verify.code !== 0) {
+    return { code: 1, stdout: '', stderr: `Could not find ${ref} on the remote.` };
+  }
+
+  const reset = await runGit(cwd, ['reset', '--hard', ref]);
+  if (reset.code !== 0) return reset;
+
+  const clean = await runGit(cwd, ['clean', '-fd']);
+  if (clean.code !== 0) return clean;
+
+  return { code: 0, stdout: `Reverted working tree to ${ref}.`, stderr: '' };
+}
+
 // ---------------------------------------------------------------------------
 // GitHub connection (used by the "Connect to GitHub" wizard).
 //
@@ -264,8 +303,74 @@ async function ghCreateRepo(cwd, { name, visibility = 'private', push = true } =
   });
 }
 
+// ---------------------------------------------------------------------------
+// AI commit message: feed the current diff to `claude -p` and return the text.
+// Prefers the staged diff; falls back to the full working-tree diff. The
+// instruction is a fixed constant (no user data), so running through a shell is
+// safe; the diff is passed on stdin to dodge command-length limits.
+// ---------------------------------------------------------------------------
+const COMMIT_INSTRUCTION =
+  'Write a git commit message for the staged diff piped on stdin. ' +
+  'Use an imperative subject line under 72 characters, then a blank line and a ' +
+  'short body of bullet points only if the change is non-trivial. ' +
+  'Output ONLY the commit message, with no preamble, quoting, or code fences.';
+
+function runClaudePrompt(cwd, instruction, stdinText, timeout = 120000) {
+  return new Promise((resolve) => {
+    let child;
+    try {
+      // shell:true lets Windows resolve `claude.cmd`/`claude` from PATH the same
+      // way the terminal panes do. instruction is a constant; embed it quoted.
+      const safe = instruction.replace(/"/g, '');
+      child = spawn(`claude -p "${safe}"`, {
+        cwd: cwd || undefined,
+        shell: true,
+        windowsHide: true,
+        env: Object.assign({}, process.env, { GIT_TERMINAL_PROMPT: '0' }),
+      });
+    } catch (e) {
+      resolve({ code: 1, stdout: '', stderr: String(e.message || e) });
+      return;
+    }
+    let out = '', err = '';
+    const timer = setTimeout(() => { try { child.kill(); } catch (_) { /* ignore */ } }, timeout);
+    child.stdout.on('data', (d) => { out += d; });
+    child.stderr.on('data', (d) => { err += d; });
+    child.on('error', (e) => {
+      clearTimeout(timer);
+      resolve({ code: 127, stdout: '', stderr: 'Could not run `claude`. Is Claude Code installed and on PATH?' });
+    });
+    child.on('close', (code) => {
+      clearTimeout(timer);
+      resolve({ code: code === null ? 1 : code, stdout: out, stderr: err });
+    });
+    try { child.stdin.write(stdinText); child.stdin.end(); } catch (_) { /* ignore */ }
+  });
+}
+
+async function aiCommit(cwd) {
+  if (!ok(cwd)) return { code: 1, message: 'This board has no project directory set.' };
+  let d = await runGit(cwd, ['diff', '--staged']);
+  let diffText = d.stdout || '';
+  if (!diffText.trim()) {
+    d = await runGit(cwd, ['diff']);
+    diffText = d.stdout || '';
+  }
+  if (!diffText.trim()) return { code: 1, message: 'No changes to describe.' };
+  // Keep the prompt within a sane size; truncate very large diffs.
+  if (diffText.length > 60000) diffText = diffText.slice(0, 60000) + '\n…(diff truncated)…';
+
+  const res = await runClaudePrompt(cwd, COMMIT_INSTRUCTION, diffText);
+  if (res.code !== 0) {
+    return { code: res.code, message: (res.stderr || 'Claude failed to produce a message.').trim() };
+  }
+  const message = (res.stdout || '').trim();
+  if (!message) return { code: 1, message: 'Claude returned an empty message.' };
+  return { code: 0, message };
+}
+
 module.exports = {
   status, diff, stage, stageAll, unstage, unstageAll, discard,
-  commit, branches, checkout, createBranch, init, fetch, pull, push,
-  getRemoteUrl, setRemoteOrigin, ghCheck, ghCreateRepo,
+  commit, branches, checkout, createBranch, init, fetch, pull, push, resetToRemote,
+  getRemoteUrl, setRemoteOrigin, ghCheck, ghCreateRepo, aiCommit,
 };
