@@ -470,14 +470,6 @@ button.icon-btn:disabled { opacity: .4; cursor: not-allowed; }
 }
 .git-sync-btn:disabled { opacity: .4; cursor: not-allowed; }
 
-.git-commit-actions { display: flex; gap: 6px; margin-top: 6px; }
-.git-commit-actions .primary { flex: 1; }
-.git-commit-actions button:not(.primary) {
-  background: var(--surface); color: var(--text); border: none;
-  border-radius: 6px; padding: 7px 10px; font-size: 12px; cursor: pointer;
-}
-.git-commit-actions button:disabled { opacity: .4; cursor: not-allowed; }
-
 /* Change sections */
 .git-section .git-section-head {
   display: flex; align-items: center; gap: 6px;

@@ -1474,15 +1474,11 @@ function renderBranchBar(st) {
 
   const actions = document.createElement('div');
   actions.className = 'git-remote-actions';
-  const fetchBtn = mkBtn('Fetch', () => gitRun('Fetching', (d) => window.api.git.fetch(d), { okMsg: 'Fetched.' }));
+  // Pull is the only remote button left here — Sync to GitHub (the primary
+  // button below) covers staging, committing, pushing, and first-time publish.
   const pullBtn = mkBtn('Pull ↓', () => gitRun('Pulling', (d) => window.api.git.pull(d), { okMsg: 'Pulled.' }));
-  const pushBtn = mkBtn('Push ↑', doPush);
-  if (!st.hasRemote) {
-    pullBtn.disabled = true;
-    pushBtn.textContent = '⑂ Publish';
-    pushBtn.title = 'Connect this repository to GitHub';
-  }
-  actions.append(fetchBtn, pullBtn, pushBtn);
+  if (!st.hasRemote) pullBtn.disabled = true;
+  actions.append(pullBtn);
 
   // Discard everything local and match GitHub. Only meaningful once connected.
   if (st.hasRemote) {
@@ -1494,13 +1490,6 @@ function renderBranchBar(st) {
 
   bar.append(line, actions);
   return bar;
-}
-
-function doPush() {
-  const st = lastStatus;
-  if (!st || !st.hasRemote) { openGitHubWizard(); return; }
-  const setUpstream = !st.upstream;
-  gitRun('Pushing', (d) => window.api.git.push(d, st.branch, setUpstream), { okMsg: 'Pushed.' });
 }
 
 function doRevertToRemote() {
@@ -1550,11 +1539,11 @@ function renderCommitBox(st) {
 
   const ta = document.createElement('textarea');
   ta.id = 'git-msg';
-  ta.placeholder = 'Commit message (Ctrl+Enter to stage all & commit)';
+  ta.placeholder = 'Commit message (Ctrl+Enter to sync to GitHub)';
   ta.value = gitDraftMsg;
   ta.oninput = () => { gitDraftMsg = ta.value; };
   ta.addEventListener('keydown', (e) => {
-    if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') { e.preventDefault(); doCommit(false); }
+    if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') { e.preventDefault(); doSync(); }
   });
 
   // One button does the whole job: stage everything, commit (auto-drafting a
@@ -1569,14 +1558,7 @@ function renderCommitBox(st) {
     : 'Connect this repository to GitHub, then push everything';
   sync.appendChild(syncBtn);
 
-  // Secondary, for the rare case you want a local commit without pushing.
-  const actions = document.createElement('div');
-  actions.className = 'git-commit-actions';
-  const commitBtn = mkBtn('Commit locally only', () => doCommit(false));
-  commitBtn.title = 'Save a commit on this machine without pushing to GitHub';
-  actions.append(commitBtn);
-
-  wrap.append(msgHead, ta, sync, actions);
+  wrap.append(msgHead, ta, sync);
   return wrap;
 }
 
@@ -1648,34 +1630,6 @@ async function doGenerateCommitMsg(btn) {
     setGitMsg(String((e && e.message) || e), 'err');
   } finally {
     if (btn) { btn.disabled = false; btn.textContent = '✨ Generate'; }
-  }
-}
-
-async function doCommit(thenPush) {
-  const st = lastStatus;
-  const msg = gitDraftMsg.trim();
-  if (!msg) { setGitMsg('Enter a commit message first.', 'err'); return; }
-  if (!st || !st.files.length) {
-    setGitMsg('Nothing to commit — the working tree is clean.', 'err');
-    return;
-  }
-  // "One action" stage + commit: if the user hasn't staged anything, stage every
-  // change first so a single click captures the whole working tree (VS Code-style).
-  if (!st.files.some((f) => f.staged)) {
-    const staged = await gitRun('Staging all', (d) => window.api.git.stageAll(d), { refresh: false });
-    if (!staged || staged.code !== 0) { await refreshGit({ keepMsg: true }); return; }
-  }
-  const res = await gitRun('Committing', (d) => window.api.git.commit(d, msg), { okMsg: 'Committed.', refresh: false });
-  if (res && res.code === 0) {
-    gitDraftMsg = '';
-    if (thenPush) {
-      const setUpstream = !st.upstream;
-      await gitRun('Pushing', (d) => window.api.git.push(d, st.branch, setUpstream), { okMsg: 'Committed and pushed.' });
-    } else {
-      await refreshGit({ keepMsg: true });
-    }
-  } else {
-    await refreshGit({ keepMsg: true });
   }
 }
 
