@@ -8,6 +8,9 @@ contextBridge.exposeInMainWorld('api', {
   saveBoards: (boards) => ipcRenderer.invoke('boards:save', boards),
   pickDir: () => ipcRenderer.invoke('dialog:pickDir'),
 
+  // Images dragged/pasted into a terminal: persist bytes, get back a path.
+  saveTempImage: (bytes, ext) => ipcRenderer.invoke('image:saveTemp', { bytes, ext }),
+
   // PTY lifecycle
   spawnPty: (opts) => ipcRenderer.invoke('pty:spawn', opts),
   writePty: (id, data) => ipcRenderer.send('pty:write', { id, data }),

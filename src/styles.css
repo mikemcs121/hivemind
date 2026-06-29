@@ -246,6 +246,7 @@ button.icon-btn:disabled { opacity: .4; cursor: not-allowed; }
   overflow: hidden;
 }
 .pane.focused { border-color: var(--accent); }
+.pane.drag-over { border-color: var(--accent-2); box-shadow: inset 0 0 0 2px var(--accent-2); }
 
 .pane-header {
   height: 28px;
@@ -276,6 +277,18 @@ button.icon-btn:disabled { opacity: .4; cursor: not-allowed; }
 }
 .pane-header button:hover { color: var(--text); background: var(--surface); }
 .pane-header .font-btn { font-size: 11px; font-weight: 600; padding: 2px 4px; }
+.pane-header .model-select {
+  flex: none;
+  background: var(--surface);
+  color: var(--text);
+  border: 1px solid var(--border, #313244);
+  border-radius: 4px;
+  font-size: 11px;
+  padding: 1px 4px;
+  cursor: pointer;
+  outline: none;
+}
+.pane-header .model-select:hover { border-color: var(--accent, #89b4fa); }
 
 .pane-term { flex: 1; min-height: 0; padding: 4px 6px; }
 .pane-term .xterm { height: 100%; }

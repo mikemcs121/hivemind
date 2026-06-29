@@ -47,7 +47,7 @@ function defaultShell() {
   return process.env.SHELL || 'bash';
 }
 
-function spawnPty({ id, cwd, cols, rows, startupCommand }, win) {
+function spawnPty({ id, cwd, cols, rows, startupCommand, model }, win) {
   const shell = defaultShell();
   let safeCwd = cwd;
   try {
@@ -77,7 +77,13 @@ function spawnPty({ id, cwd, cols, rows, startupCommand }, win) {
   });
 
   // Auto-run the startup command (defaults to `claude`) inside the board's dir.
-  const cmd = (startupCommand && startupCommand.trim()) || 'claude';
+  let cmd = (startupCommand && startupCommand.trim()) || 'claude';
+  // When a specific model is chosen, hand it to Claude Code via `--model` by
+  // inserting the flag right after the `claude` token (so `claude --resume`
+  // etc. still work). Skip for "default" and for non-claude startup commands.
+  if (model && model !== 'default' && /^[a-z0-9-]+$/i.test(model)) {
+    cmd = cmd.replace(/^claude(\.exe)?\b/i, (m) => `${m} --model ${model}`);
+  }
   if (cmd) {
     // Small delay so the shell prompt is ready before we type into it.
     setTimeout(() => {
@@ -207,6 +213,25 @@ app.whenReady().then(() => {
     });
     if (res.canceled || !res.filePaths.length) return null;
     return res.filePaths[0];
+  });
+
+  // -- IPC: images ----------------------------------------------------------
+  // A screenshot pasted or an image dragged into a terminal arrives as raw
+  // bytes. We persist it to a temp file and hand the path back so the renderer
+  // can type it into the pane — Claude Code reads image paths from its prompt.
+  ipcMain.handle('image:saveTemp', (_e, { bytes, ext }) => {
+    try {
+      const dir = path.join(os.tmpdir(), 'hivemind-images');
+      fs.mkdirSync(dir, { recursive: true });
+      const safeExt = (ext || 'png').replace(/[^a-z0-9]/gi, '').toLowerCase() || 'png';
+      const name = `paste-${Date.now()}-${Math.floor(Math.random() * 1e6)}.${safeExt}`;
+      const file = path.join(dir, name);
+      fs.writeFileSync(file, Buffer.from(bytes));
+      return file;
+    } catch (err) {
+      console.error('Failed to save pasted image:', err);
+      return null;
+    }
   });
 
   // -- IPC: ptys ------------------------------------------------------------

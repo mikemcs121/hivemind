@@ -52,6 +52,40 @@ function setPaneFontSize(pane, size) {
 }
 
 // ---------------------------------------------------------------------------
+// Per-thread Claude model
+//
+// Each thread can run a different Claude model. The choice is passed to Claude
+// Code two ways: as `--model <alias>` when the thread first starts, and — when
+// you switch a running thread — by typing the `/model <alias>` slash command
+// into it so it changes mid-session. The last model chosen is remembered as the
+// default for new threads (persisted across sessions).
+// ---------------------------------------------------------------------------
+const MODELS = [
+  { value: 'default', label: 'Default' },
+  { value: 'opus', label: 'Opus' },
+  { value: 'sonnet', label: 'Sonnet' },
+  { value: 'haiku', label: 'Haiku' },
+];
+const isValidModel = (m) => MODELS.some((x) => x.value === m);
+
+let defaultModel = localStorage.getItem('hm.model') || 'default';
+if (!isValidModel(defaultModel)) defaultModel = 'default';
+
+function setPaneModel(pane, model) {
+  if (pane.disposed) return;
+  if (!isValidModel(model)) model = 'default';
+  pane.model = model;
+  defaultModel = model;
+  localStorage.setItem('hm.model', model);
+  if (pane.modelSelect && pane.modelSelect.value !== model) pane.modelSelect.value = model;
+  // Switch a running thread live by driving Claude Code's /model command.
+  if (pane.state !== 'dead') {
+    window.api.writePty(pane.id, `/model ${model}\r`);
+    markActivity(pane, '');
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Terminal status detection
 //
 // Claude Code renders an animated spinner while it works, so the PTY emits a
@@ -192,6 +226,44 @@ function broadcastRaw(boardId, data) {
     window.api.writePty(p.id, data);
     markActivity(p, '');
   }
+}
+
+// Send keystrokes/text to a pane. With mirror-typing on, input from the focused
+// pane fans out to every thread on the board; otherwise it goes only to this one.
+function sendToPane(pane, data) {
+  if (broadcastTyping && pane === focusedPane) broadcastRaw(pane.board.id, data);
+  else window.api.writePty(pane.id, data);
+  markActivity(pane, ''); // typing means this pane is active again
+}
+
+// ---------------------------------------------------------------------------
+// Image drop / paste helpers
+// ---------------------------------------------------------------------------
+const IMAGE_EXT_RE = /\.(png|jpe?g|gif|webp|bmp|svg)$/i;
+
+function isImageFile(f) {
+  return !!f && ((f.type && f.type.startsWith('image/')) || IMAGE_EXT_RE.test(f.name || ''));
+}
+
+// Persist an in-memory image (a pasted screenshot, or a dropped file with no
+// on-disk path) to a temp file and return its absolute path.
+async function persistImage(file) {
+  try {
+    const buf = new Uint8Array(await file.arrayBuffer());
+    const ext = (file.type && file.type.split('/')[1]) ||
+      ((file.name || '').match(IMAGE_EXT_RE) || [])[1] || 'png';
+    return await window.api.saveTempImage(buf, ext);
+  } catch (err) {
+    console.error('Could not persist pasted image:', err);
+    return null;
+  }
+}
+
+// Type an image's path into the pane's prompt so Claude Code can read it.
+// Paths with spaces are quoted; a trailing space lets the user keep typing.
+async function typePathIntoPane(pane, p) {
+  const quoted = /\s/.test(p) ? `"${p}"` : p;
+  sendToPane(pane, quoted + ' ');
 }
 
 function broadcastLine(boardId, text) {
@@ -436,15 +508,22 @@ function createPane(board, col) {
   fontUpBtn.className = 'font-btn';
   fontUpBtn.textContent = 'A+';
   fontUpBtn.title = 'Bigger text (Ctrl+=)';
-  const splitBtn = document.createElement('button');
-  splitBtn.textContent = '⊞';
-  splitBtn.title = 'New thread on this board';
+  const modelSelect = document.createElement('select');
+  modelSelect.className = 'model-select';
+  modelSelect.title = 'Claude model for this thread';
+  for (const m of MODELS) {
+    const opt = document.createElement('option');
+    opt.value = m.value;
+    opt.textContent = m.label;
+    modelSelect.appendChild(opt);
+  }
+  modelSelect.value = defaultModel;
   const statusEl = document.createElement('span');
   statusEl.className = 'status';
   const closeBtn = document.createElement('button');
   closeBtn.textContent = '✕';
   closeBtn.title = 'Close thread';
-  header.append(dot, title, statusEl, fontDownBtn, fontUpBtn, splitBtn, closeBtn);
+  header.append(dot, title, statusEl, modelSelect, fontDownBtn, fontUpBtn, closeBtn);
 
   const termWrap = document.createElement('div');
   termWrap.className = 'pane-term';
@@ -463,25 +542,56 @@ function createPane(board, col) {
   term.open(termWrap);
 
   const pane = {
-    id, el, term, fitAddon, dot, statusEl, flex: 1, col, board, disposed: false,
+    id, el, term, fitAddon, dot, statusEl, modelSelect, flex: 1, col, board, disposed: false,
     name: board.startupCommand || 'claude', state: null, buf: '', idleTimer: null,
-    fontSize: defaultFontSize,
+    fontSize: defaultFontSize, model: defaultModel,
   };
 
   // Wire IO
-  term.onData((data) => {
-    // With mirror-typing on, keystrokes in the focused pane fan out to every
-    // thread on the board; otherwise they go only to this pane.
-    if (broadcastTyping && pane === focusedPane) {
-      broadcastRaw(pane.board.id, data);
-    } else {
-      window.api.writePty(id, data);
-    }
-    markActivity(pane, ''); // typing means this pane is active again
-  });
+  term.onData((data) => sendToPane(pane, data));
   el.addEventListener('mousedown', () => focusPane(pane));
 
-  splitBtn.onclick = (e) => { e.stopPropagation(); addTerminal(board); };
+  // Model dropdown: switch the model this thread runs (live, if it's started).
+  modelSelect.addEventListener('mousedown', (e) => e.stopPropagation());
+  modelSelect.onchange = (e) => { e.stopPropagation(); setPaneModel(pane, modelSelect.value); };
+
+  // Drag-and-drop / paste an image into the pane. We can't feed raw image bytes
+  // through the PTY, so instead we drop the image to a file and type its path
+  // into the prompt — Claude Code picks up image paths from the input line.
+  termWrap.addEventListener('dragover', (e) => {
+    if (e.dataTransfer && Array.from(e.dataTransfer.items || []).some((it) => it.kind === 'file')) {
+      e.preventDefault();
+      el.classList.add('drag-over');
+    }
+  });
+  termWrap.addEventListener('dragleave', () => el.classList.remove('drag-over'));
+  termWrap.addEventListener('drop', async (e) => {
+    el.classList.remove('drag-over');
+    const files = Array.from((e.dataTransfer && e.dataTransfer.files) || []);
+    if (!files.length) return;
+    // Always swallow file drops — otherwise Electron navigates the window to
+    // the dropped file. We only act on the images among them.
+    e.preventDefault();
+    if (!files.some(isImageFile)) return;
+    focusPane(pane);
+    for (const f of files) {
+      if (!isImageFile(f)) continue;
+      // A dragged file already lives on disk — use its real path; only fall
+      // back to copying bytes if Electron didn't expose one.
+      const p = f.path || (await persistImage(f));
+      if (p) await typePathIntoPane(pane, p);
+    }
+  });
+  termWrap.addEventListener('paste', async (e) => {
+    const items = Array.from((e.clipboardData && e.clipboardData.items) || []);
+    const imgItem = items.find((it) => it.kind === 'file' && it.type.startsWith('image/'));
+    if (!imgItem) return; // ordinary text paste — leave it to xterm
+    e.preventDefault();
+    const file = imgItem.getAsFile();
+    const p = file && (await persistImage(file));
+    if (p) await typePathIntoPane(pane, p);
+  });
+
   closeBtn.onclick = (e) => { e.stopPropagation(); closePane(pane); };
 
   // Font sizing: header buttons, Ctrl +/-/0, and Ctrl+scroll.
@@ -513,6 +623,7 @@ function createPane(board, col) {
     cols: term.cols,
     rows: term.rows,
     startupCommand: board.startupCommand || 'claude',
+    model: pane.model,
   });
 
   markActivity(pane, ''); // start out "working" until the first quiet period
@@ -986,18 +1097,24 @@ function renderCommitBox(st) {
   const wrap = document.createElement('div');
   const ta = document.createElement('textarea');
   ta.id = 'git-msg';
-  ta.placeholder = 'Commit message (Ctrl+Enter to commit)';
+  ta.placeholder = 'Commit message (Ctrl+Enter to stage all & commit)';
   ta.value = gitDraftMsg;
   ta.oninput = () => { gitDraftMsg = ta.value; };
   ta.addEventListener('keydown', (e) => {
     if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') { e.preventDefault(); doCommit(false); }
   });
 
+  // When nothing is staged, the commit buttons stage everything first, so label
+  // them accordingly to signal the single-action behavior.
+  const nothingStaged = !st.files.some((f) => f.staged);
+  const commitLabel = nothingStaged ? '✓ Stage All & Commit' : '✓ Commit';
+  const pushLabel = nothingStaged ? 'Stage All, Commit & Push' : 'Commit & Push';
+
   const actions = document.createElement('div');
   actions.className = 'git-commit-actions';
-  const commitBtn = mkBtn('✓ Commit', () => doCommit(false));
+  const commitBtn = mkBtn(commitLabel, () => doCommit(false));
   commitBtn.className = 'primary';
-  const commitPush = mkBtn('Commit & Push', () => doCommit(true));
+  const commitPush = mkBtn(pushLabel, () => doCommit(true));
   if (!st.hasRemote) commitPush.disabled = true;
   actions.append(commitBtn, commitPush);
 
@@ -1011,9 +1128,15 @@ async function doCommit(thenPush) {
   const st = lastStatus;
   const msg = gitDraftMsg.trim();
   if (!msg) { setGitMsg('Enter a commit message first.', 'err'); return; }
-  if (!st || !st.files.some((f) => f.staged)) {
-    setGitMsg('Stage at least one change before committing.', 'err');
+  if (!st || !st.files.length) {
+    setGitMsg('Nothing to commit — the working tree is clean.', 'err');
     return;
+  }
+  // "One action" stage + commit: if the user hasn't staged anything, stage every
+  // change first so a single click captures the whole working tree (VS Code-style).
+  if (!st.files.some((f) => f.staged)) {
+    const staged = await gitRun('Staging all', (d) => window.api.git.stageAll(d), { refresh: false });
+    if (!staged || staged.code !== 0) { await refreshGit({ keepMsg: true }); return; }
   }
   const res = await gitRun('Committing', (d) => window.api.git.commit(d, msg), { okMsg: 'Committed.', refresh: false });
   if (res && res.code === 0) {
