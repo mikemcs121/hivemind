@@ -37,6 +37,41 @@ async function isHivemindProject(cwd) {
   return !!(pkg.build && pkg.build.appId === 'com.mikem.hivemind');
 }
 
+// Resolve the absolute path to the project's locally-installed electron-builder
+// CLI entry (the `electron-builder` bin script). Returns null if the dependency
+// isn't installed in `cwd`. We read the package's own bin field so this keeps
+// working if the entry path changes across versions.
+function resolveBuilderCli(cwd) {
+  try {
+    const pkgJson = require.resolve('electron-builder/package.json', { paths: [cwd] });
+    const dir = path.dirname(pkgJson);
+    const bin = require(pkgJson).bin;
+    const rel = typeof bin === 'string' ? bin : (bin && bin['electron-builder']);
+    if (rel) {
+      const cli = path.resolve(dir, rel);
+      if (fs.existsSync(cli)) return cli;
+    }
+    // Fallback to the conventional entry if the bin field is unexpected.
+    const fallback = path.join(dir, 'out', 'cli', 'cli.js');
+    return fs.existsSync(fallback) ? fallback : null;
+  } catch (_) {
+    return null;
+  }
+}
+
+// Find a real Node.js executable to run electron-builder with. We must NOT use
+// our own Electron binary (even in ELECTRON_RUN_AS_NODE mode): Electron's
+// bundled module loader can't `require()` the ESM dependencies electron-builder
+// pulls in (e.g. @noble/hashes), so it dies with ERR_REQUIRE_ESM before doing
+// any work. `npm_node_execpath` is set when Hivemind itself was launched via an
+// npm script (`npm start`) and points at the exact Node that ran npm. Falling
+// back to `node` on PATH covers other launch paths.
+function resolveNode() {
+  const fromNpm = process.env.npm_node_execpath;
+  if (fromNpm && fs.existsSync(fromNpm)) return fromNpm;
+  return process.platform === 'win32' ? 'node.exe' : 'node';
+}
+
 // Build the portable .exe via electron-builder. `onProgress(line)` receives
 // trimmed output lines as they arrive. Resolves with { ok, code, message }.
 function buildPortable(cwd, onProgress) {
@@ -45,19 +80,35 @@ function buildPortable(cwd, onProgress) {
       return resolve({ ok: false, message: 'No project directory.' });
     }
 
-    // Use the locally-installed electron-builder via npx, run through a shell
-    // so the platform-specific launcher (.cmd on Windows) resolves correctly.
-    const child = spawn('npx', ['electron-builder', '--win', 'portable'], {
+    // Run the locally-installed electron-builder CLI directly with a real Node,
+    // resolved by absolute path. This avoids the previous `npx` invocation,
+    // which failed immediately when Hivemind was launched from a context where
+    // `npx` wasn't on PATH (desktop shortcut, editor, etc.).
+    const cli = resolveBuilderCli(cwd);
+    if (!cli) {
+      return resolve({
+        ok: false,
+        message: 'electron-builder is not installed in this project. Run `npm install` in the Hivemind source first.',
+      });
+    }
+
+    const node = resolveNode();
+    // Run as real Node, not Electron-as-Node: strip ELECTRON_RUN_AS_NODE in case
+    // we inherited it, or electron-builder dies with ERR_REQUIRE_ESM.
+    const childEnv = Object.assign({}, process.env);
+    delete childEnv.ELECTRON_RUN_AS_NODE;
+    const child = spawn(node, [cli, '--win', 'portable'], {
       cwd,
-      shell: true,
       windowsHide: true,
-      env: Object.assign({}, process.env),
+      env: childEnv,
     });
 
-    let tail = '';
+    let full = '';      // complete output, written to a log file for diagnosis
+    let tail = '';       // bounded recent output, used for the failure message
     const onChunk = (buf) => {
       const text = buf.toString();
-      tail = (tail + text).slice(-4000); // keep a bounded tail for error reports
+      full += text;
+      tail = (tail + text).slice(-4000);
       if (typeof onProgress === 'function') {
         for (const line of text.split(/\r?\n/)) {
           const t = line.trim();
@@ -69,13 +120,26 @@ function buildPortable(cwd, onProgress) {
     child.stdout.on('data', onChunk);
     child.stderr.on('data', onChunk);
 
+    // On failure, persist the full build log so the real error is recoverable —
+    // the toast only shows the last few lines.
+    const writeLog = () => {
+      try {
+        fs.writeFileSync(path.join(cwd, 'dist', 'portable-build.log'), full);
+        return path.join('dist', 'portable-build.log');
+      } catch (_) {
+        return null;
+      }
+    };
+
     child.on('error', (err) => {
-      resolve({ ok: false, code: -1, message: err.message });
+      resolve({ ok: false, code: -1, message: `Could not start the build (${node}): ${err.message}` });
     });
 
     child.on('close', (code) => {
-      if (code === 0) resolve({ ok: true, code });
-      else resolve({ ok: false, code, message: tail.split(/\r?\n/).filter(Boolean).slice(-3).join(' ') || `electron-builder exited with code ${code}` });
+      if (code === 0) return resolve({ ok: true, code });
+      const logRel = writeLog();
+      const recent = tail.split(/\r?\n/).filter(Boolean).slice(-3).join(' ') || `electron-builder exited with code ${code}`;
+      resolve({ ok: false, code, message: logRel ? `${recent} (full log: ${logRel})` : recent });
     });
   });
 }
