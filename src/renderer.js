@@ -1361,7 +1361,9 @@ document.addEventListener('keydown', (e) => {
 window.api.onFsChanged(({ cwd }) => {
   const dir = activeDir();
   if (!dir || dir !== cwd) return;
-  if (typeof gitPanelOpen === 'function' && gitPanelOpen() && !gitBusy) {
+  // Don't rebuild the panel while the ⋯ menu is open — that would tear the open
+  // menu out of the DOM mid-interaction (looks like it "disappears on hover").
+  if (typeof gitPanelOpen === 'function' && gitPanelOpen() && !gitBusy && !gitMenuOpen) {
     refreshGit({ keepMsg: true });
   }
 });
@@ -1417,6 +1419,7 @@ const gitPanel = $('git-panel');
 const gitBody = $('git-body');
 const gitMsgbar = $('git-msgbar');
 let gitBusy = false;
+let gitMenuOpen = false; // the ⋯ overflow menu is open; suppress auto-refresh so it isn't wiped
 let lastStatus = null;
 
 function activeBoard() { return boards.find((b) => b.id === activeBoardId) || null; }
@@ -1571,6 +1574,7 @@ async function refreshGit(opts = {}) {
 }
 
 function renderGitState(st, opts = {}) {
+  gitMenuOpen = false; // any prior overflow menu is about to be torn out of the DOM
   gitBody.innerHTML = '';
   if (!opts.keepMsg) setGitMsg('');
 
@@ -1698,11 +1702,12 @@ function renderCommitBox(st) {
     if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') { e.preventDefault(); doPush(); }
   });
 
-  // Three remote actions, side by side:
+  // Remote actions, side by side:
   //   Pull  — bring GitHub's commits down into this branch.
   //   Push  — stage everything, commit (auto-drafting a message if the box is
   //           empty), then push. Publishes to GitHub the first time.
-  // Revert (below, full width) discards all local work and matches GitHub.
+  //   ⋯     — a small overflow menu for rare/destructive actions (Revert),
+  //           kept out of the way so it isn't an easy mis-click.
   const actions = document.createElement('div');
   actions.className = 'git-actions';
 
@@ -1718,16 +1723,55 @@ function renderCommitBox(st) {
     : 'Connect this repository to GitHub, then push everything';
 
   actions.append(pullBtn, pushBtn);
-  wrap.append(msgHead, ta, actions);
 
-  // Discard everything local and match GitHub. Only meaningful once connected.
+  // Overflow menu holds the destructive "Revert to GitHub" action so it stays
+  // tucked away. Only meaningful once the repo is connected to GitHub.
   if (st.hasRemote) {
-    const revertBtn = mkBtn('Revert to GitHub', doRevertToRemote);
-    revertBtn.className = 'git-revert-btn';
-    revertBtn.title = 'Discard all local changes and reset this branch to what is on GitHub';
-    wrap.appendChild(revertBtn);
+    const moreWrap = document.createElement('div');
+    moreWrap.className = 'git-more-wrap';
+
+    const moreBtn = mkBtn('⋯', null);
+    moreBtn.className = 'git-more-btn';
+    moreBtn.title = 'More actions';
+    moreBtn.setAttribute('aria-label', 'More actions');
+
+    const menu = document.createElement('div');
+    menu.className = 'git-more-menu hidden';
+    const revertItem = mkBtn('Revert to GitHub', () => { closeMenu(); doRevertToRemote(); });
+    revertItem.className = 'git-more-item danger';
+    revertItem.title = 'Discard all local changes and reset this branch to what is on GitHub';
+    menu.appendChild(revertItem);
+
+    function onOutside(e) { if (!moreWrap.contains(e.target)) closeMenu(); }
+    function closeMenu() {
+      gitMenuOpen = false;
+      menu.classList.add('hidden');
+      document.removeEventListener('mousedown', onOutside);
+      gitBody.removeEventListener('scroll', closeMenu, true);
+    }
+    moreBtn.onclick = (e) => {
+      e.stopPropagation();
+      if (menu.classList.contains('hidden')) {
+        // Unhide first so we can measure the menu, then anchor it above the
+        // button (right edges aligned). Fixed positioning keeps it clear of
+        // #git-body's overflow clipping.
+        gitMenuOpen = true; // suppress FS-triggered re-renders that would wipe the menu
+        menu.classList.remove('hidden');
+        const r = moreBtn.getBoundingClientRect();
+        menu.style.top = (r.top - menu.offsetHeight - 6) + 'px';
+        menu.style.left = (r.right - menu.offsetWidth) + 'px';
+        document.addEventListener('mousedown', onOutside);
+        gitBody.addEventListener('scroll', closeMenu, true);
+      } else {
+        closeMenu();
+      }
+    };
+
+    moreWrap.append(moreBtn, menu);
+    actions.append(moreWrap);
   }
 
+  wrap.append(msgHead, ta, actions);
   return wrap;
 }
 

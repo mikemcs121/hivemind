@@ -500,14 +500,30 @@ button.pill-btn.building {
 .git-actions .git-pull { background: var(--surface); color: var(--text); }
 .git-actions .git-pull:hover:not(:disabled) { filter: brightness(1.15); }
 
-/* Destructive: reset the working tree to the GitHub copy. */
-.git-revert-btn {
-  width: 100%; margin-top: 6px; border: none; border-radius: 6px;
-  padding: 8px; font-size: 12px; cursor: pointer;
-  background: transparent; color: var(--danger);
-  box-shadow: inset 0 0 0 1px var(--danger);
+/* Overflow menu (⋯) for rare/destructive remote actions. */
+.git-more-wrap { position: relative; flex: 0 0 auto; }
+.git-more-btn {
+  background: var(--surface); color: var(--muted);
+  padding: 9px 10px !important; line-height: 1; flex: 0 0 auto !important;
 }
-.git-revert-btn:hover { background: var(--danger); color: #fff; }
+.git-more-btn:hover { filter: brightness(1.15); color: var(--text); }
+
+.git-more-menu {
+  /* Fixed (viewport-relative) so the scrolling #git-body can't clip it.
+     Coordinates are set in JS from the button's position when it opens. */
+  position: fixed; z-index: 1000;
+  min-width: 160px; padding: 4px;
+  background: var(--panel); border: 1px solid var(--border); border-radius: 8px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, .4);
+}
+.git-more-menu.hidden { display: none; }
+.git-more-menu .git-more-item {
+  display: block; width: 100%; text-align: left; border: none; border-radius: 6px;
+  padding: 8px 10px; font-size: 13px; cursor: pointer;
+  background: transparent; color: var(--text);
+}
+.git-more-menu .git-more-item.danger { color: var(--danger); }
+.git-more-menu .git-more-item.danger:hover { background: var(--danger); color: #fff; }
 
 /* Change sections */
 .git-section .git-section-head {
