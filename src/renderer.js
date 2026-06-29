@@ -695,6 +695,20 @@ function addTerminal(board, opts = {}) {
   col.panes.push(pane);
   layout(board.id);
   focusPane(pane);
+  // createPane() spawned the PTY while the pane was still detached from the DOM,
+  // so its fit() measured a zero-size element and xterm fell back to 80x24 — the
+  // PTY (and Claude Code's TUI) then run at the wrong width. layout() above just
+  // attached the pane, so re-fit now that it has real dimensions and push the
+  // true size to the PTY. This runs well before the 600ms startup-command delay,
+  // so Claude starts at the correct width; skipping it leaves the TUI redrawing
+  // at the wrong width, which strands phantom characters you can't backspace over.
+  requestAnimationFrame(() => {
+    if (pane.disposed) return;
+    try {
+      pane.fitAddon.fit();
+      window.api.resizePty(pane.id, pane.term.cols, pane.term.rows);
+    } catch (_) { /* terminal not ready */ }
+  });
   persistLayout(board.id);
   return pane;
 }
