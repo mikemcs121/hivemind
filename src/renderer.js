@@ -99,6 +99,7 @@ const IDLE_MS = 1000; // quiet period before a terminal is no longer "busy"
 const STATE_LABEL = {
   busy: 'working…',
   attention: 'needs you',
+  error: 'error',
   idle: 'ready',
   dead: 'exited',
 };
@@ -113,6 +114,23 @@ const ATTENTION_PATTERNS = [
   /\[y\/n\]/i,
   /press\s+enter\s+to\s+continue/i,
   /Continue\?\s*$/im,
+];
+
+// Patterns that mean a thread hit a wall and won't make progress on its own —
+// API/usage errors that otherwise read as "ready" and never pull you back.
+const ERROR_PATTERNS = [
+  /usage limit reached|reached your (usage|daily) limit|rate limit/i,
+  /\b(overloaded_error|api_error|authentication_error|invalid_request_error)\b/i,
+  /\b5\d\d\s+(Internal Server Error|Service Unavailable|Bad Gateway)\b/i,
+  /Request timed out|ECONNRESET|ETIMEDOUT|fetch failed/i,
+  /\b(401|403)\b[^\n]{0,40}(unauthorized|forbidden|invalid api key)/i,
+];
+
+// The shell couldn't launch the startup command — usually `claude` isn't on PATH.
+const CMD_MISSING_PATTERNS = [
+  /is not recognized as (an internal or external command|the name of a cmdlet)/i,
+  /command not found/i,
+  /CommandNotFoundException/i,
 ];
 
 // Strip ANSI escape / OSC sequences so the pattern scan sees plain text.
@@ -132,6 +150,25 @@ function markActivity(pane, data) {
 function evaluateIdle(pane) {
   if (pane.disposed || pane.state === 'dead') return;
   const buf = pane.buf || '';
+
+  // A failed startup command: hint once, right in the terminal.
+  if (!pane.hintShown && CMD_MISSING_PATTERNS.some((re) => re.test(buf))) {
+    pane.hintShown = true;
+    const cmd = pane.board.startupCommand || 'claude';
+    try {
+      pane.term.write(
+        `\r\n\x1b[33m[Hivemind] "${cmd}" wasn't found on PATH. ` +
+        `Install it (or fix the hive's startup command in ✎ Edit hive), ` +
+        `then open a new thread.\x1b[0m\r\n`);
+    } catch (_) { /* ignore */ }
+  }
+
+  if (ERROR_PATTERNS.some((re) => re.test(buf))) {
+    pane.errored = true;
+    setPaneState(pane, 'error');
+    return;
+  }
+  pane.errored = false;
   const needsYou = ATTENTION_PATTERNS.some((re) => re.test(buf));
   setPaneState(pane, needsYou ? 'attention' : 'idle');
 }
@@ -149,10 +186,12 @@ function setPaneState(pane, state) {
   updateBoardStatus(pane.board.id);
 
   // Notify on the transitions that pull a human back: a terminal asking for
-  // input, or one finishing a turn while the window is in the background.
+  // input, hitting an error, or finishing a turn while the window is backgrounded.
   const focusedHere = pane === focusedPane && document.hasFocus();
-  if (notifyMuted || focusedHere) return;
-  if (state === 'attention') {
+  if (notifyMuted || (pane.board && pane.board.muted) || focusedHere) return;
+  if (state === 'error') {
+    notify(pane, 'hit an error');
+  } else if (state === 'attention') {
     notify(pane, 'needs your input');
   } else if (state === 'idle' && prev === 'busy' && !document.hasFocus()) {
     notify(pane, 'finished its turn');
@@ -169,7 +208,7 @@ function notify(pane, what) {
 }
 
 function boardStatus(boardId) {
-  const s = { attention: 0, busy: 0, idle: 0, dead: 0, total: 0 };
+  const s = { attention: 0, error: 0, busy: 0, idle: 0, dead: 0, total: 0 };
   const g = grids.get(boardId);
   if (!g) return s;
   for (const col of g.columns) {
@@ -190,15 +229,17 @@ function updateBoardStatus(boardId) {
   const s = boardStatus(boardId);
 
   let summary = 'none';
-  if (s.attention > 0) summary = 'attention';
+  if (s.error > 0) summary = 'error';
+  else if (s.attention > 0) summary = 'attention';
   else if (s.busy > 0) summary = 'busy';
   else if (s.idle > 0) summary = 'idle';
   else if (s.dead > 0) summary = 'dead';
   if (sdot) sdot.className = 'status-dot ' + summary;
 
+  const waiting = s.attention + s.error;
   if (badge) {
-    if (s.attention > 0) {
-      badge.textContent = String(s.attention);
+    if (waiting > 0) {
+      badge.textContent = String(waiting);
       badge.classList.add('show');
     } else {
       badge.classList.remove('show');
@@ -221,18 +262,33 @@ function liveBoardPanes(boardId) {
   return out;
 }
 
+// Broadcast targets: live panes the user hasn't excluded via the 📡 toggle.
+function liveBroadcastPanes(boardId) {
+  return liveBoardPanes(boardId).filter((p) => p.bcInclude !== false);
+}
+
 function broadcastRaw(boardId, data) {
-  for (const p of liveBoardPanes(boardId)) {
+  for (const p of liveBroadcastPanes(boardId)) {
     window.api.writePty(p.id, data);
     markActivity(p, '');
   }
 }
 
 // Send keystrokes/text to a pane. With mirror-typing on, input from the focused
-// pane fans out to every thread on the board; otherwise it goes only to this one.
+// pane fans out to every included thread on the board; otherwise it goes only to
+// this one. The focused pane always receives its own input even if it's excluded
+// from broadcast, so typing never silently vanishes.
 function sendToPane(pane, data) {
-  if (broadcastTyping && pane === focusedPane) broadcastRaw(pane.board.id, data);
-  else window.api.writePty(pane.id, data);
+  if (broadcastTyping && pane === focusedPane) {
+    window.api.writePty(pane.id, data);
+    for (const p of liveBroadcastPanes(pane.board.id)) {
+      if (p === pane) continue;
+      window.api.writePty(p.id, data);
+      markActivity(p, '');
+    }
+  } else {
+    window.api.writePty(pane.id, data);
+  }
   markActivity(pane, ''); // typing means this pane is active again
 }
 
@@ -287,7 +343,58 @@ const addTermBtn = $('add-term');
 async function persist() {
   await window.api.saveBoards(boards.map((b) => ({
     id: b.id, name: b.name, dir: b.dir, startupCommand: b.startupCommand,
+    resumeOnStart: !!b.resumeOnStart, muted: !!b.muted,
+    layout: grids.has(b.id) ? serializeLayout(b.id) : (b.layout || null),
   })));
+}
+
+// Capture the live grid (columns, splits, per-pane name/model/font) so a board's
+// whole workspace can be rebuilt on next launch. PTYs aren't serializable — only
+// the shape and thread metadata are saved.
+function serializeLayout(boardId) {
+  const g = grids.get(boardId);
+  if (!g) return null;
+  const cols = g.columns.map((col) => ({
+    flex: col.flex,
+    panes: col.panes.filter((p) => !p.disposed).map((p) => ({
+      name: p.name, model: p.model, fontSize: p.fontSize,
+      flex: p.flex, bcInclude: p.bcInclude !== false,
+    })),
+  })).filter((c) => c.panes.length);
+  return cols.length ? cols : null;
+}
+
+// Update one board's saved layout from its live grid, then persist everything.
+function persistLayout(boardId) {
+  const b = boards.find((x) => x.id === boardId);
+  if (b && grids.has(boardId)) b.layout = serializeLayout(boardId);
+  persist();
+}
+
+// Recreate a board's columns/panes from a saved layout. Threads start fresh
+// (with `claude --continue` when the board opts into resume).
+function rebuildFromLayout(board) {
+  const g = grids.get(board.id);
+  if (!g) return;
+  let maxNum = 0;
+  for (const col of board.layout) {
+    const colObj = { el: document.createElement('div'), flex: col.flex || 1, panes: [] };
+    colObj.el.className = 'column';
+    g.columns.push(colObj);
+    for (const pd of (col.panes || [])) {
+      const pane = createPane(board, colObj, {
+        name: pd.name, model: pd.model, fontSize: pd.fontSize,
+        flex: pd.flex, bcInclude: pd.bcInclude, resume: !!board.resumeOnStart,
+      });
+      colObj.panes.push(pane);
+      const m = /(\d+)\s*$/.exec(pd.name || '');
+      if (m) maxNum = Math.max(maxNum, parseInt(m[1], 10));
+    }
+  }
+  board._seq = maxNum;
+  layout(board.id);
+  const first = g.columns[0] && g.columns[0].panes[0];
+  if (first) focusPane(first);
 }
 
 // ---------------------------------------------------------------------------
@@ -320,11 +427,11 @@ function renderBoardList() {
     actions.className = 'actions';
     const edit = document.createElement('button');
     edit.textContent = '✎';
-    edit.title = 'Edit board';
+    edit.title = 'Edit hive';
     edit.onclick = (e) => { e.stopPropagation(); openModal(b); };
     const del = document.createElement('button');
     del.textContent = '🗑';
-    del.title = 'Delete board';
+    del.title = 'Delete hive';
     del.onclick = (e) => { e.stopPropagation(); deleteBoard(b); };
     actions.append(edit, del);
     row.append(nameWrap, badge, actions);
@@ -336,10 +443,46 @@ function renderBoardList() {
 
     li.append(row, dir);
     li.onclick = () => selectBoard(b.id);
+
+    // Drag to reorder hives.
+    li.draggable = true;
+    li.addEventListener('dragstart', (e) => {
+      dragBoardId = b.id;
+      li.classList.add('dragging');
+      e.dataTransfer.effectAllowed = 'move';
+    });
+    li.addEventListener('dragend', () => li.classList.remove('dragging'));
+    li.addEventListener('dragover', (e) => {
+      if (!dragBoardId || dragBoardId === b.id) return;
+      e.preventDefault();
+      e.dataTransfer.dropEffect = 'move';
+      li.classList.add('drop-target');
+    });
+    li.addEventListener('dragleave', () => li.classList.remove('drop-target'));
+    li.addEventListener('drop', (e) => {
+      e.preventDefault();
+      li.classList.remove('drop-target');
+      reorderBoards(dragBoardId, b.id);
+      dragBoardId = null;
+    });
+
     boardListEl.appendChild(li);
   }
   // Repaint status dots / badges for any board that already has terminals.
   for (const b of boards) updateBoardStatus(b.id);
+}
+
+// Reorder: drop the dragged hive into the target hive's slot, then persist.
+let dragBoardId = null;
+function reorderBoards(srcId, targetId) {
+  if (!srcId || srcId === targetId) return;
+  const from = boards.findIndex((b) => b.id === srcId);
+  const to = boards.findIndex((b) => b.id === targetId);
+  if (from < 0 || to < 0) return;
+  const [moved] = boards.splice(from, 1);
+  boards.splice(to, 0, moved);
+  persist();
+  renderBoardList();
 }
 
 // ---------------------------------------------------------------------------
@@ -354,9 +497,13 @@ function selectBoard(id) {
   gridEl.classList.remove('hidden');
   addTermBtn.disabled = false;
   broadcastToggle.disabled = false;
+  if (typeof voiceToggleBtn !== 'undefined' && voiceToggleBtn) voiceToggleBtn.disabled = false;
 
   boardTitle.textContent = board.name;
   boardMeta.textContent = board.dir || '';
+
+  // Watch this board's directory so the Git/Files panels can auto-refresh.
+  window.api.setWatch(board.dir || null);
 
   // Build the grid lazily the first time a board is opened.
   if (!grids.has(id)) {
@@ -365,7 +512,11 @@ function selectBoard(id) {
     g.el.style.cssText = 'display:flex;flex:1;min-height:0;min-width:0;width:100%;';
     gridEl.appendChild(g.el);
     grids.set(id, g);
-    addTerminal(board); // open the first terminal automatically
+    if (board.layout && board.layout.length) {
+      rebuildFromLayout(board); // restore last session's threads + splits
+    } else {
+      addTerminal(board); // open the first terminal automatically
+    }
   }
 
   // Show the active grid, hide the rest.
@@ -376,6 +527,8 @@ function selectBoard(id) {
   updateBcCount();
   if (typeof gitToggle !== 'undefined' && gitToggle) gitToggle.disabled = false;
   if (typeof gitOnBoardChange === 'function') gitOnBoardChange();
+  if (typeof filesToggle !== 'undefined' && filesToggle) filesToggle.disabled = false;
+  if (typeof filesOnBoardChange === 'function') filesOnBoardChange();
   fitBoard(id);
 }
 
@@ -386,6 +539,18 @@ function layout(boardId) {
   const g = grids.get(boardId);
   if (!g) return;
   g.el.innerHTML = '';
+
+  // Zoom (tmux-style): if a pane is zoomed and still alive, show only it.
+  if (g.zoomed && !g.zoomed.disposed) {
+    const pane = g.zoomed;
+    pane.el.style.flexGrow = 1;
+    pane.el.style.flexBasis = '0';
+    pane.el.classList.add('zoomed');
+    g.el.appendChild(pane.el);
+    fitBoard(boardId);
+    return;
+  }
+  if (g.zoomed) g.zoomed = null; // zoomed pane went away
 
   g.columns.forEach((col, ci) => {
     // Rebuild a column's inner pane list with row-gutters.
@@ -406,6 +571,23 @@ function layout(boardId) {
     }
   });
   fitBoard(boardId);
+}
+
+// Toggle a pane between maximized (fills the grid) and tiled. PTYs are never
+// touched — only which elements are mounted — so background threads keep running.
+function toggleZoom(pane) {
+  if (!pane || pane.disposed) return;
+  const g = grids.get(pane.board.id);
+  if (!g) return;
+  if (g.zoomed === pane) {
+    g.zoomed = null;
+    pane.el.classList.remove('zoomed');
+  } else {
+    if (g.zoomed) g.zoomed.el.classList.remove('zoomed');
+    g.zoomed = pane;
+  }
+  layout(pane.board.id);
+  focusPane(pane);
 }
 
 function makeGutter(kind, boardId, index, subIndex) {
@@ -455,6 +637,7 @@ function startDrag(e, kind, boardId, index, subIndex) {
     document.removeEventListener('mouseup', onUp);
     document.body.style.userSelect = '';
     fitBoard(boardId);
+    persistLayout(boardId); // remember the new split sizes
   };
   document.body.style.userSelect = 'none';
   document.addEventListener('mousemove', onMove);
@@ -464,9 +647,10 @@ function startDrag(e, kind, boardId, index, subIndex) {
 // ---------------------------------------------------------------------------
 // Panes / terminals
 // ---------------------------------------------------------------------------
-function addTerminal(board) {
+function addTerminal(board, opts = {}) {
   const g = grids.get(board.id);
   if (!g) return;
+  if (g.zoomed) { g.zoomed.el.classList.remove('zoomed'); g.zoomed = null; } // show the new pane
 
   // Tiling: grow columns up to 4 across, then stack into the shortest column.
   const total = g.columns.reduce((s, c) => s + c.panes.length, 0) + 1;
@@ -481,15 +665,24 @@ function addTerminal(board) {
     col = g.columns.reduce((min, c) => (c.panes.length < min.panes.length ? c : min), g.columns[0]);
   }
 
-  const pane = createPane(board, col);
+  if (!opts.name) {
+    board._seq = (board._seq || 0) + 1;
+    opts = Object.assign({ name: `${board.startupCommand || 'claude'} ${board._seq}` }, opts);
+  }
+  const pane = createPane(board, col, opts);
   col.panes.push(pane);
   layout(board.id);
   focusPane(pane);
   updateBcCount();
+  persistLayout(board.id);
+  return pane;
 }
 
-function createPane(board, col) {
+function createPane(board, col, opts = {}) {
   const id = nextId('term');
+  const startName = opts.name || board.startupCommand || 'claude';
+  const startModel = isValidModel(opts.model) ? opts.model : defaultModel;
+  const startFont = opts.fontSize ? clampFont(opts.fontSize) : defaultFontSize;
   const el = document.createElement('div');
   el.className = 'pane';
 
@@ -497,9 +690,18 @@ function createPane(board, col) {
   header.className = 'pane-header';
   const dot = document.createElement('span');
   dot.className = 'dot';
+
+  // Editable thread name — double-click to rename so panes are distinguishable.
   const title = document.createElement('span');
   title.className = 'title';
-  title.textContent = board.startupCommand || 'claude';
+  title.textContent = startName;
+  title.title = 'Double-click to rename this thread';
+
+  // Include this thread in broadcast / mirror-typing (on by default).
+  const bcBtn = document.createElement('button');
+  bcBtn.className = 'bc-include-btn';
+  bcBtn.textContent = '📡';
+
   const fontDownBtn = document.createElement('button');
   fontDownBtn.className = 'font-btn';
   fontDownBtn.textContent = 'A−';
@@ -508,6 +710,10 @@ function createPane(board, col) {
   fontUpBtn.className = 'font-btn';
   fontUpBtn.textContent = 'A+';
   fontUpBtn.title = 'Bigger text (Ctrl+=)';
+  const zoomBtn = document.createElement('button');
+  zoomBtn.className = 'zoom-btn';
+  zoomBtn.textContent = '⛶';
+  zoomBtn.title = 'Maximize this thread (Ctrl+Enter)';
   const modelSelect = document.createElement('select');
   modelSelect.className = 'model-select';
   modelSelect.title = 'Claude model for this thread';
@@ -517,21 +723,37 @@ function createPane(board, col) {
     opt.textContent = m.label;
     modelSelect.appendChild(opt);
   }
-  modelSelect.value = defaultModel;
+  modelSelect.value = startModel;
   const statusEl = document.createElement('span');
   statusEl.className = 'status';
   const closeBtn = document.createElement('button');
   closeBtn.textContent = '✕';
   closeBtn.title = 'Close thread';
-  header.append(dot, title, statusEl, modelSelect, fontDownBtn, fontUpBtn, closeBtn);
+  header.append(dot, title, statusEl, bcBtn, modelSelect, fontDownBtn, fontUpBtn, zoomBtn, closeBtn);
 
   const termWrap = document.createElement('div');
   termWrap.className = 'pane-term';
-  el.append(header, termWrap);
+
+  // Per-pane find bar (Ctrl+F). Hidden until opened.
+  const findBar = document.createElement('div');
+  findBar.className = 'find-bar hidden';
+  const findInput = document.createElement('input');
+  findInput.type = 'text';
+  findInput.placeholder = 'Find in scrollback…';
+  findInput.spellcheck = false;
+  const findPrev = document.createElement('button');
+  findPrev.textContent = '↑'; findPrev.title = 'Previous (Shift+Enter)';
+  const findNext = document.createElement('button');
+  findNext.textContent = '↓'; findNext.title = 'Next (Enter)';
+  const findClose = document.createElement('button');
+  findClose.textContent = '✕'; findClose.title = 'Close (Esc)';
+  findBar.append(findInput, findPrev, findNext, findClose);
+
+  el.append(header, findBar, termWrap);
 
   const term = new Terminal({
     fontFamily: 'Cascadia Code, Consolas, monospace',
-    fontSize: defaultFontSize,
+    fontSize: startFont,
     cursorBlink: true,
     allowProposedApi: true,
     theme: THEME,
@@ -539,21 +761,66 @@ function createPane(board, col) {
   });
   const fitAddon = new FitAddon.FitAddon();
   term.loadAddon(fitAddon);
+  // Scrollback search (optional — only if the addon loaded).
+  let searchAddon = null;
+  try {
+    if (window.SearchAddon && window.SearchAddon.SearchAddon) {
+      searchAddon = new window.SearchAddon.SearchAddon();
+      term.loadAddon(searchAddon);
+    }
+  } catch (_) { /* search unavailable */ }
   term.open(termWrap);
 
   const pane = {
-    id, el, term, fitAddon, dot, statusEl, modelSelect, flex: 1, col, board, disposed: false,
-    name: board.startupCommand || 'claude', state: null, buf: '', idleTimer: null,
-    fontSize: defaultFontSize, model: defaultModel,
+    id, el, term, fitAddon, searchAddon, dot, statusEl, modelSelect, title,
+    bcBtn, findBar, findInput, flex: opts.flex || 1, col, board, disposed: false,
+    name: startName, state: null, buf: '', idleTimer: null,
+    fontSize: startFont, model: startModel,
+    bcInclude: opts.bcInclude !== false, errored: false, hintShown: false,
   };
+
+  applyBcIncludeBtn(pane);
 
   // Wire IO
   term.onData((data) => sendToPane(pane, data));
   el.addEventListener('mousedown', () => focusPane(pane));
 
+  // Double-click the title to rename the thread (single click still focuses).
+  title.addEventListener('dblclick', (e) => { e.stopPropagation(); beginRename(pane); });
+
+  // Broadcast-include toggle.
+  bcBtn.addEventListener('mousedown', (e) => e.stopPropagation());
+  bcBtn.onclick = (e) => {
+    e.stopPropagation();
+    pane.bcInclude = !pane.bcInclude;
+    applyBcIncludeBtn(pane);
+    updateBcCount();
+    persistLayout(board.id);
+  };
+
+  // Zoom / maximize.
+  zoomBtn.addEventListener('mousedown', (e) => e.stopPropagation());
+  zoomBtn.onclick = (e) => { e.stopPropagation(); toggleZoom(pane); };
+
+  // Find bar wiring.
+  const runFind = (back) => {
+    if (!pane.searchAddon || !findInput.value) return;
+    try {
+      back ? pane.searchAddon.findPrevious(findInput.value)
+           : pane.searchAddon.findNext(findInput.value);
+    } catch (_) { /* ignore */ }
+  };
+  findInput.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') { e.preventDefault(); runFind(e.shiftKey); }
+    else if (e.key === 'Escape') { e.preventDefault(); closeFind(pane); }
+  });
+  findNext.onclick = () => runFind(false);
+  findPrev.onclick = () => runFind(true);
+  findClose.onclick = () => closeFind(pane);
+
   // Model dropdown: switch the model this thread runs (live, if it's started).
   modelSelect.addEventListener('mousedown', (e) => e.stopPropagation());
-  modelSelect.onchange = (e) => { e.stopPropagation(); setPaneModel(pane, modelSelect.value); };
+  modelSelect.onchange = (e) => { e.stopPropagation(); setPaneModel(pane, modelSelect.value); persistLayout(board.id); };
 
   // Drag-and-drop / paste an image into the pane. We can't feed raw image bytes
   // through the PTY, so instead we drop the image to a file and type its path
@@ -582,23 +849,63 @@ function createPane(board, col) {
       if (p) await typePathIntoPane(pane, p);
     }
   });
+  // Capture phase: this must run before xterm's own paste handler, which would
+  // otherwise consume the event before it bubbles up to us.
   termWrap.addEventListener('paste', async (e) => {
-    const items = Array.from((e.clipboardData && e.clipboardData.items) || []);
+    const cd = e.clipboardData;
+    const items = Array.from((cd && cd.items) || []);
+    const types = Array.from((cd && cd.types) || []);
     const imgItem = items.find((it) => it.kind === 'file' && it.type.startsWith('image/'));
-    if (!imgItem) return; // ordinary text paste — leave it to xterm
+
+    if (imgItem) {
+      // Screenshot exposed as a DataTransfer file — read it straight from there.
+      e.preventDefault();
+      e.stopPropagation();
+      const file = imgItem.getAsFile();
+      const p = file && (await persistImage(file));
+      if (p) await typePathIntoPane(pane, p);
+      return;
+    }
+
+    // A real text paste: hand it back to xterm untouched.
+    if (types.includes('text/plain')) return;
+
+    // Otherwise the clipboard may hold a raw bitmap (e.g. a Win+Shift+S
+    // screenshot) that never surfaces as a DataTransfer file. This isn't a text
+    // paste, so stop xterm now — preventDefault is ignored once we await — then
+    // pull the bitmap from the native clipboard via the main process.
     e.preventDefault();
-    const file = imgItem.getAsFile();
-    const p = file && (await persistImage(file));
+    e.stopPropagation();
+    const p = await window.api.clipboardImage();
     if (p) await typePathIntoPane(pane, p);
-  });
+  }, true);
 
   closeBtn.onclick = (e) => { e.stopPropagation(); closePane(pane); };
 
   // Font sizing: header buttons, Ctrl +/-/0, and Ctrl+scroll.
   fontDownBtn.onclick = (e) => { e.stopPropagation(); setPaneFontSize(pane, pane.fontSize - 1); };
   fontUpBtn.onclick = (e) => { e.stopPropagation(); setPaneFontSize(pane, pane.fontSize + 1); };
+  // One custom key handler covers every shortcut. xterm stores a SINGLE handler
+  // (calling attachCustomKeyEventHandler twice overwrites), so paste-passthrough,
+  // font sizing, find, and pane nav all live here.
   term.attachCustomKeyEventHandler((e) => {
-    if (e.type !== 'keydown' || !(e.ctrlKey || e.metaKey)) return true;
+    if (e.type !== 'keydown') return true;
+    const mod = e.ctrlKey || e.metaKey;
+
+    // Let the browser handle Ctrl+V natively so our `paste` listener (image +
+    // text) fires; otherwise xterm swallows it as a literal ^V.
+    if (mod && !e.altKey && (e.key === 'v' || e.key === 'V')) return false;
+
+    // Ctrl+F opens this pane's find bar instead of sending ^F to the shell.
+    if (mod && !e.altKey && !e.shiftKey && (e.key === 'f' || e.key === 'F')) {
+      e.preventDefault();
+      openFind(pane);
+      return false;
+    }
+
+    if (!mod) return true;
+
+    // Font sizing: Ctrl +/-/0.
     let delta = null;
     if (e.key === '=' || e.key === '+') delta = pane.fontSize + 1;
     else if (e.key === '-' || e.key === '_') delta = pane.fontSize - 1;
@@ -624,11 +931,63 @@ function createPane(board, col) {
     rows: term.rows,
     startupCommand: board.startupCommand || 'claude',
     model: pane.model,
+    resume: !!opts.resume,
   });
 
   markActivity(pane, ''); // start out "working" until the first quiet period
 
   return pane;
+}
+
+// Swap the title span for an input to rename a thread; commit on Enter/blur.
+function beginRename(pane) {
+  if (pane.disposed) return;
+  const span = pane.title;
+  const input = document.createElement('input');
+  input.className = 'title-edit';
+  input.value = pane.name;
+  input.spellcheck = false;
+  span.replaceWith(input);
+  input.focus();
+  input.select();
+  const commit = () => {
+    const v = input.value.trim();
+    pane.name = v || pane.name;
+    span.textContent = pane.name;
+    input.replaceWith(span);
+    persistLayout(pane.board.id);
+  };
+  input.addEventListener('keydown', (e) => {
+    e.stopPropagation();
+    if (e.key === 'Enter') { e.preventDefault(); commit(); }
+    else if (e.key === 'Escape') { e.preventDefault(); input.replaceWith(span); }
+  });
+  input.addEventListener('mousedown', (e) => e.stopPropagation());
+  input.addEventListener('blur', commit);
+}
+
+// Paint the per-pane broadcast-include button to reflect its state.
+function applyBcIncludeBtn(pane) {
+  if (!pane.bcBtn) return;
+  pane.bcBtn.classList.toggle('off', !pane.bcInclude);
+  pane.bcBtn.title = pane.bcInclude
+    ? 'Included in broadcast — click to exclude this thread'
+    : 'Excluded from broadcast — click to include this thread';
+}
+
+// -- Find bar --------------------------------------------------------------
+function openFind(pane) {
+  if (!pane || pane.disposed) return;
+  if (!pane.searchAddon) return; // search addon not available in this build
+  pane.findBar.classList.remove('hidden');
+  pane.findInput.focus();
+  pane.findInput.select();
+}
+function closeFind(pane) {
+  if (!pane) return;
+  pane.findBar.classList.add('hidden');
+  try { if (pane.searchAddon) pane.searchAddon.clearDecorations(); } catch (_) { /* ignore */ }
+  try { pane.term.focus(); } catch (_) { /* ignore */ }
 }
 
 function closePane(pane) {
@@ -639,6 +998,7 @@ function closePane(pane) {
   try { pane.term.dispose(); } catch (_) { /* ignore */ }
 
   const g = grids.get(pane.board.id);
+  if (g.zoomed === pane) g.zoomed = null; // un-zoom if the maximized pane closed
   const col = pane.col;
   col.panes = col.panes.filter((p) => p !== pane);
   if (col.panes.length === 0) {
@@ -653,6 +1013,7 @@ function closePane(pane) {
     addTerminal(pane.board);
   } else {
     layout(pane.board.id);
+    persistLayout(pane.board.id);
   }
 }
 
@@ -724,13 +1085,17 @@ const backdrop = $('modal-backdrop');
 const mName = $('modal-name');
 const mDir = $('modal-dir');
 const mCmd = $('modal-cmd');
+const mResume = $('modal-resume');
+const mMuted = $('modal-muted');
 
 function openModal(board) {
   editingBoard = board || null;
-  $('modal-title').textContent = board ? 'Edit board' : 'New board';
+  $('modal-title').textContent = board ? 'Edit hive' : 'New hive';
   mName.value = board ? board.name : '';
   mDir.value = board ? board.dir : '';
   mCmd.value = board ? (board.startupCommand || '') : 'claude';
+  if (mResume) mResume.checked = board ? !!board.resumeOnStart : false;
+  if (mMuted) mMuted.checked = board ? !!board.muted : false;
   backdrop.classList.remove('hidden');
   mName.focus();
 }
@@ -743,15 +1108,19 @@ $('modal-browse').onclick = async () => {
 
 $('modal-cancel').onclick = closeModal;
 $('modal-save').onclick = async () => {
-  const name = mName.value.trim() || 'Untitled board';
+  const name = mName.value.trim() || 'Untitled hive';
   const dir = mDir.value.trim();
   const cmd = mCmd.value.trim() || 'claude';
+  const resumeOnStart = !!(mResume && mResume.checked);
+  const muted = !!(mMuted && mMuted.checked);
   if (editingBoard) {
     editingBoard.name = name;
     editingBoard.dir = dir;
     editingBoard.startupCommand = cmd;
+    editingBoard.resumeOnStart = resumeOnStart;
+    editingBoard.muted = muted;
   } else {
-    const b = { id: nextId('board'), name, dir, startupCommand: cmd };
+    const b = { id: nextId('board'), name, dir, startupCommand: cmd, resumeOnStart, muted };
     boards.push(b);
     activeBoardId = b.id;
   }
@@ -768,7 +1137,7 @@ $('modal-save').onclick = async () => {
 };
 
 async function deleteBoard(board) {
-  if (!confirm(`Delete board "${board.name}"? Its threads will be closed.`)) return;
+  if (!confirm(`Delete hive "${board.name}"? Its threads will be closed.`)) return;
   const g = grids.get(board.id);
   if (g) {
     for (const col of g.columns) {
@@ -798,14 +1167,22 @@ function showEmpty() {
   broadcastToggle.disabled = true;
   broadcastBar.classList.add('hidden');
   broadcastToggle.classList.remove('active');
-  boardTitle.textContent = 'No board selected';
+  if (typeof voiceToggleBtn !== 'undefined' && voiceToggleBtn) voiceToggleBtn.disabled = true;
+  if (typeof stopVoice === 'function') stopVoice();
+  window.api.setWatch(null); // nothing active to watch
+  boardTitle.textContent = 'No hive selected';
   boardMeta.textContent = '';
   if (typeof gitToggle !== 'undefined' && gitToggle) {
     gitToggle.disabled = true;
     gitToggle.classList.remove('active');
   }
   if (typeof gitPanel !== 'undefined' && gitPanel) gitPanel.classList.add('hidden');
-  const sb = $('sidebar'); if (sb) sb.classList.remove('git-open');
+  if (typeof filesToggle !== 'undefined' && filesToggle) {
+    filesToggle.disabled = true;
+    filesToggle.classList.remove('active');
+  }
+  if (typeof filesPanel !== 'undefined' && filesPanel) filesPanel.classList.add('hidden');
+  const sb = $('sidebar'); if (sb) sb.classList.remove('git-open', 'files-open');
 }
 
 // ---------------------------------------------------------------------------
@@ -844,6 +1221,68 @@ window.api.onFocusPane(({ paneId, boardId }) => {
 });
 
 // ---------------------------------------------------------------------------
+// Keyboard pane navigation
+//   Ctrl+1..9        focus the Nth thread on the active hive
+//   Ctrl+Shift+] / [ cycle focus forward / back
+//   Ctrl+Enter       maximize / restore the focused thread
+// A capture-phase listener runs before xterm consumes the key. Ctrl+Shift+[/]
+// is used for cycling (not Ctrl+[/]) so terminal apps keep Ctrl+[ as ESC.
+// ---------------------------------------------------------------------------
+function orderedPanes(boardId) {
+  const g = grids.get(boardId);
+  if (!g) return [];
+  const out = [];
+  for (const col of g.columns) for (const p of col.panes) if (!p.disposed) out.push(p);
+  return out;
+}
+function focusPaneByIndex(i) {
+  const ps = orderedPanes(activeBoardId);
+  if (ps[i]) focusPane(ps[i]);
+}
+function cycleFocus(dir) {
+  const ps = orderedPanes(activeBoardId);
+  if (!ps.length) return;
+  let idx = ps.indexOf(focusedPane);
+  if (idx < 0) idx = 0;
+  focusPane(ps[(idx + dir + ps.length) % ps.length]);
+}
+document.addEventListener('keydown', (e) => {
+  if (!(e.ctrlKey || e.metaKey) || e.altKey) return;
+  const t = e.target;
+  const isXterm = t && t.classList && t.classList.contains('xterm-helper-textarea');
+  const editable = t && !isXterm && (
+    t.isContentEditable || t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.tagName === 'SELECT'
+  );
+  if (editable) return; // don't hijack our own text fields
+  if (!activeBoardId) return;
+
+  if (e.key === 'Enter' && !e.shiftKey) {
+    if (focusedPane) { e.preventDefault(); e.stopImmediatePropagation(); toggleZoom(focusedPane); }
+    return;
+  }
+  if (e.shiftKey && (e.code === 'BracketRight' || e.code === 'BracketLeft')) {
+    e.preventDefault(); e.stopImmediatePropagation();
+    cycleFocus(e.code === 'BracketRight' ? 1 : -1);
+    return;
+  }
+  if (!e.shiftKey && /^Digit[1-9]$/.test(e.code)) {
+    e.preventDefault(); e.stopImmediatePropagation();
+    focusPaneByIndex(parseInt(e.code.slice(5), 10) - 1);
+  }
+}, true);
+
+// Files on disk changed (a thread edited something) — refresh the Source Control
+// panel live. The File Explorer is left to its manual ⟳ so expanded folders don't
+// collapse out from under you on every keystroke a thread makes.
+window.api.onFsChanged(({ cwd }) => {
+  const dir = activeDir();
+  if (!dir || dir !== cwd) return;
+  if (typeof gitPanelOpen === 'function' && gitPanelOpen() && !gitBusy) {
+    refreshGit({ keepMsg: true });
+  }
+});
+
+// ---------------------------------------------------------------------------
 // Broadcast bar wiring
 // ---------------------------------------------------------------------------
 const broadcastToggle = $('broadcast-toggle');
@@ -853,7 +1292,7 @@ const bcCount = $('bc-count');
 const bcMirror = $('bc-mirror');
 
 function updateBcCount() {
-  if (bcCount) bcCount.textContent = String(activeBoardId ? liveBoardPanes(activeBoardId).length : 0);
+  if (bcCount) bcCount.textContent = String(activeBoardId ? liveBroadcastPanes(activeBoardId).length : 0);
 }
 
 broadcastToggle.onclick = () => {
@@ -911,6 +1350,7 @@ function gitPanelOpen() { return gitPanel && !gitPanel.classList.contains('hidde
 
 const sidebarEl = $('sidebar');
 function setGitOpen(open) {
+  if (open && typeof setFilesOpen === 'function') setFilesOpen(false); // one panel at a time
   gitPanel.classList.toggle('hidden', !open);
   gitToggle.classList.toggle('active', open);
   sidebarEl.classList.toggle('git-open', open); // board list yields its space
@@ -932,7 +1372,7 @@ function gitOnBoardChange() {
 async function gitRun(label, fn, { refresh = true, okMsg } = {}) {
   if (gitBusy) return;
   const dir = activeDir();
-  if (!dir) { setGitMsg('This board has no project directory set.', 'err'); return; }
+  if (!dir) { setGitMsg('This hive has no project directory set.', 'err'); return; }
   gitBusy = true;
   setGitMsg(label + '…');
   try {
@@ -972,7 +1412,7 @@ function renderGitState(st, opts = {}) {
     const wrap = document.createElement('div');
     wrap.className = 'git-empty';
     if (!st || st.reason === 'no-dir') {
-      wrap.textContent = 'This board has no project directory set. Edit the board to choose one.';
+      wrap.textContent = 'This hive has no project directory set. Edit the hive to choose one.';
     } else if (st.reason === 'no-git') {
       wrap.textContent = st.message || 'git was not found on PATH. Install Git for Windows and reopen Hivemind.';
     } else if (st.reason === 'not-repo') {
@@ -1095,6 +1535,19 @@ function renderPublishBanner() {
 
 function renderCommitBox(st) {
   const wrap = document.createElement('div');
+
+  // Header row with the AI "draft for me" action.
+  const msgHead = document.createElement('div');
+  msgHead.className = 'git-msg-head';
+  const lbl = document.createElement('span');
+  lbl.textContent = 'Message';
+  const genBtn = mkBtn('✨ Generate', () => doGenerateCommitMsg(genBtn));
+  genBtn.className = 'git-gen-btn';
+  genBtn.title = 'Draft a commit message from the current diff using Claude';
+  const spc = document.createElement('span');
+  spc.className = 'spacer';
+  msgHead.append(lbl, spc, genBtn);
+
   const ta = document.createElement('textarea');
   ta.id = 'git-msg';
   ta.placeholder = 'Commit message (Ctrl+Enter to stage all & commit)';
@@ -1118,11 +1571,36 @@ function renderCommitBox(st) {
   if (!st.hasRemote) commitPush.disabled = true;
   actions.append(commitBtn, commitPush);
 
-  wrap.append(ta, actions);
+  wrap.append(msgHead, ta, actions);
   return wrap;
 }
 
 let gitDraftMsg = '';
+
+// Ask Claude to draft a commit message from the current diff and drop it into
+// the message box. Reuses the focused thread's terminal? No — runs a one-shot
+// `claude -p` in the project dir via the main process.
+async function doGenerateCommitMsg(btn) {
+  const dir = activeDir();
+  if (!dir) { setGitMsg('This hive has no project directory set.', 'err'); return; }
+  if (btn) { btn.disabled = true; btn.textContent = '✨ Drafting…'; }
+  setGitMsg('Asking Claude to draft a commit message…');
+  try {
+    const res = await window.api.git.aiCommitMessage(dir);
+    if (!res || res.code !== 0) {
+      setGitMsg((res && res.message) || 'Could not draft a message.', 'err');
+      return;
+    }
+    gitDraftMsg = res.message;
+    const ta = $('git-msg');
+    if (ta) { ta.value = res.message; ta.focus(); }
+    setGitMsg('Drafted a commit message — review and edit before committing.', 'ok');
+  } catch (e) {
+    setGitMsg(String((e && e.message) || e), 'err');
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = '✨ Generate'; }
+  }
+}
 
 async function doCommit(thenPush) {
   const st = lastStatus;
@@ -1227,6 +1705,161 @@ function renderFileRow(f, staged) {
   return li;
 }
 
+// ---------------------------------------------------------------------------
+// File Explorer panel
+//
+// Mirrors the Source Control panel: docked inside the sidebar, operates on the
+// active board's project directory. Shows a lazy file tree — folders expand on
+// click. Clicking a file opens it in the OS default app; per-row actions insert
+// its path into the focused thread or reveal it in the OS file manager.
+// ---------------------------------------------------------------------------
+const filesToggle = $('files-toggle');
+const filesPanel = $('files-panel');
+const filesBody = $('files-body');
+const filesMsgbar = $('files-msgbar');
+
+function filesPanelOpen() { return filesPanel && !filesPanel.classList.contains('hidden'); }
+
+function setFilesMsg(text, kind) {
+  if (!text) { filesMsgbar.classList.add('hidden'); filesMsgbar.textContent = ''; return; }
+  filesMsgbar.textContent = text;
+  filesMsgbar.className = 'git-msgbar' + (kind ? ' ' + kind : '');
+}
+
+function setFilesOpen(open) {
+  if (open) setGitOpen(false); // one panel at a time
+  filesPanel.classList.toggle('hidden', !open);
+  filesToggle.classList.toggle('active', open);
+  sidebarEl.classList.toggle('files-open', open); // board list yields its space
+}
+
+filesToggle.onclick = () => {
+  const open = filesPanel.classList.contains('hidden');
+  setFilesOpen(open);
+  if (open) refreshFiles();
+};
+$('files-close').onclick = () => setFilesOpen(false);
+$('files-refresh').onclick = () => refreshFiles();
+
+function filesOnBoardChange() {
+  if (filesPanelOpen()) refreshFiles();
+}
+
+async function refreshFiles() {
+  if (!filesPanelOpen()) return;
+  setFilesMsg('');
+  const dir = activeDir();
+  if (!dir) { renderFilesState({ ok: false, reason: 'no-dir' }); return; }
+  const res = await window.api.files.list(dir, '');
+  renderFilesState(res);
+}
+
+function renderFilesState(res) {
+  filesBody.innerHTML = '';
+  if (!res || !res.ok) {
+    const wrap = document.createElement('div');
+    wrap.className = 'git-empty';
+    if (!res || res.reason === 'no-dir') {
+      wrap.textContent = 'This hive has no project directory set. Edit the hive to choose one.';
+    } else if (res.reason === 'not-found') {
+      wrap.textContent = 'This directory no longer exists.';
+    } else {
+      wrap.textContent = (res.message || 'Could not read this directory.').trim();
+    }
+    filesBody.appendChild(wrap);
+    return;
+  }
+  if (!res.entries.length) {
+    const wrap = document.createElement('div');
+    wrap.className = 'git-empty';
+    wrap.textContent = 'This folder is empty.';
+    filesBody.appendChild(wrap);
+    return;
+  }
+  const ul = document.createElement('ul');
+  ul.className = 'fx-tree';
+  for (const e of res.entries) ul.appendChild(renderFxItem(e, 0));
+  filesBody.appendChild(ul);
+}
+
+function renderFxItem(entry, depth) {
+  const li = document.createElement('li');
+  const row = document.createElement('div');
+  row.className = 'fx-item';
+  row.style.paddingLeft = (6 + depth * 12) + 'px';
+
+  const twisty = document.createElement('span');
+  twisty.className = 'fx-twisty';
+  twisty.textContent = entry.isDir ? '▸' : '';
+  const icon = document.createElement('span');
+  icon.className = 'fx-icon';
+  icon.textContent = entry.isDir ? '📁' : '📄';
+  const name = document.createElement('span');
+  name.className = 'fx-name';
+  name.textContent = entry.name;
+  name.title = entry.path;
+  row.append(twisty, icon, name);
+  li.appendChild(row);
+
+  if (entry.isDir) {
+    let childUl = null; // null = collapsed
+    row.onclick = async () => {
+      if (childUl) {
+        childUl.remove();
+        childUl = null;
+        twisty.textContent = '▸';
+        icon.textContent = '📁';
+        return;
+      }
+      const dir = activeDir();
+      if (!dir) return;
+      const res = await window.api.files.list(dir, entry.path);
+      if (!res || !res.ok) {
+        setFilesMsg((res && res.message) || 'Could not open this folder.', 'err');
+        return;
+      }
+      childUl = document.createElement('ul');
+      childUl.className = 'fx-children';
+      for (const e of res.entries) childUl.appendChild(renderFxItem(e, depth + 1));
+      li.appendChild(childUl);
+      twisty.textContent = '▾';
+      icon.textContent = '📂';
+    };
+  } else {
+    const act = document.createElement('div');
+    act.className = 'fx-act';
+    act.appendChild(mkMini('⤓', 'Insert path into focused thread', (e) => {
+      e.stopPropagation();
+      insertPathIntoPane(entry.path);
+    }));
+    act.appendChild(mkMini('⧉', 'Reveal in file manager', (e) => {
+      e.stopPropagation();
+      window.api.files.reveal(activeDir(), entry.path);
+    }));
+    row.appendChild(act);
+    row.onclick = () => openFile(entry.path);
+  }
+  return li;
+}
+
+async function openFile(rel) {
+  const dir = activeDir();
+  if (!dir) return;
+  const res = await window.api.files.open(dir, rel);
+  if (res && !res.ok) setFilesMsg(res.message || 'Could not open this file.', 'err');
+}
+
+function insertPathIntoPane(rel) {
+  const pane = focusedPane;
+  if (!pane || pane.disposed || pane.state === 'dead') {
+    setFilesMsg('Click a thread first, then insert the path.', 'err');
+    return;
+  }
+  const text = /\s/.test(rel) ? `"${rel}"` : rel;
+  sendToPane(pane, text);
+  setFilesMsg('Inserted ' + rel + ' into the focused thread.', 'ok');
+}
+
 // -- Diff viewer ------------------------------------------------------------
 const diffBackdrop = $('diff-backdrop');
 const diffBody = $('diff-body');
@@ -1307,6 +1940,7 @@ document.addEventListener('keydown', (e) => {
   if (!diffBackdrop.classList.contains('hidden')) diffBackdrop.classList.add('hidden');
   else if (!branchBackdrop.classList.contains('hidden')) branchBackdrop.classList.add('hidden');
   else if (!ghBackdrop.classList.contains('hidden')) closeWizard();
+  else { const sb = document.getElementById('settings-backdrop'); if (sb && !sb.classList.contains('hidden')) sb.classList.add('hidden'); }
 });
 
 // ---------------------------------------------------------------------------
@@ -1332,7 +1966,7 @@ function closeWizard() { ghBackdrop.classList.add('hidden'); ghSetMsg(''); }
 
 function openGitHubWizard() {
   const dir = activeDir();
-  if (!dir) { setGitMsg('This board has no project directory set.', 'err'); return; }
+  if (!dir) { setGitMsg('This hive has no project directory set.', 'err'); return; }
   if (lastStatus && lastStatus.reason === 'not-repo') {
     setGitMsg('Initialize a Git repository first, then connect it to GitHub.', 'err');
     return;
@@ -1348,7 +1982,7 @@ ghBackdrop.addEventListener('mousedown', (e) => { if (e.target === ghBackdrop) c
 // -- Step 1: choose a path --------------------------------------------------
 function renderWizardChoice() {
   ghBody.innerHTML = '';
-  ghBody.appendChild(el('p', 'gh-intro', "Link this board's project to a GitHub repository."));
+  ghBody.appendChild(el('p', 'gh-intro', "Link this hive's project to a GitHub repository."));
   const opts = document.createElement('div');
   opts.className = 'gh-options';
   opts.append(
@@ -1396,7 +2030,7 @@ function renderGhMissing() {
 function renderGhSignin() {
   ghBody.innerHTML = '';
   ghBody.appendChild(el('p', 'gh-intro', "You're not signed in to GitHub yet."));
-  ghBody.appendChild(el('p', 'gh-note', 'Open a thread on this board and run the command below, follow the browser prompts, then click “I’ve signed in”.'));
+  ghBody.appendChild(el('p', 'gh-note', 'Open a thread on this hive and run the command below, follow the browser prompts, then click “I’ve signed in”.'));
   ghBody.appendChild(el('div', 'gh-code', 'gh auth login'));
   ghBody.appendChild(wizardActions({
     backTo: renderWizardChoice,
@@ -1571,6 +2205,430 @@ function el(tag, cls, text) {
 }
 function mkBtn(text, onclick) { const b = document.createElement('button'); b.textContent = text; b.onclick = onclick; return b; }
 function mkMini(text, title, onclick) { const b = document.createElement('button'); b.textContent = text; b.title = title; b.onclick = onclick; return b; }
+
+// ---------------------------------------------------------------------------
+// Voice typing
+//
+// Dictate straight into the focused thread. The browser's Web Speech API turns
+// speech into text; each *final* phrase is run through a user-editable
+// dictionary (to fix words it keeps mishearing) and then written to the target
+// pane's PTY — so it lands at the terminal cursor exactly like typing. The ~ key
+// toggles listening from anywhere in the app. Recognition is kept alive across
+// the API's idle-stops by restarting it, so a session stays "always listening"
+// until you toggle it off.
+// ---------------------------------------------------------------------------
+const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+
+// -- Persisted settings + dictionary ----------------------------------------
+const VOICE_DEFAULT_DICT = [
+  { from: 'cloud code', to: 'Claude Code' },
+  { from: 'claude code', to: 'Claude Code' },
+  { from: 'get hub', to: 'GitHub' },
+  { from: 'git hub', to: 'GitHub' },
+  { from: 'hive mind', to: 'Hivemind' },
+];
+
+function loadVoiceDict() {
+  try {
+    const raw = localStorage.getItem('hm.voiceDict');
+    if (raw) {
+      const arr = JSON.parse(raw);
+      if (Array.isArray(arr)) return arr.filter((e) => e && typeof e.from === 'string' && e.from);
+    }
+  } catch (_) { /* fall through to defaults */ }
+  return VOICE_DEFAULT_DICT.slice();
+}
+
+let voiceDict = loadVoiceDict();
+let voiceLang = localStorage.getItem('hm.voiceLang') || 'en-US';
+let voiceHotkeyEnabled = localStorage.getItem('hm.voiceHotkey') !== '0';   // default on
+let voiceAutoEnter = localStorage.getItem('hm.voiceAutoEnter') === '1';    // default off
+let voiceAutoSpace = localStorage.getItem('hm.voiceAutoSpace') !== '0';    // default on
+
+function saveVoiceDict() {
+  try { localStorage.setItem('hm.voiceDict', JSON.stringify(voiceDict)); } catch (_) { /* quota */ }
+}
+
+// Phrases that, said on their own, submit the line instead of being typed.
+const VOICE_ENTER_RE = /^\s*(new ?line|press enter|hit enter|submit|send it)\s*[.!?]?\s*$/i;
+
+// -- Recognition state -------------------------------------------------------
+let recognition = null;
+let voiceActive = false;        // the user wants to be listening
+let voiceStarting = false;      // a start() is in flight
+let voiceSessionStarted = false;// onstart fired for the current session
+let voiceNoStartStreak = 0;     // consecutive sessions that ended before starting
+let voiceErrorCount = 0;        // consecutive hard errors
+let voiceRestartTimer = null;
+let voiceTargetPane = null;     // pane that receives this dictation session
+
+const voiceToggleBtn = $('voice-toggle');
+const VOICE_BTN_TITLE = voiceToggleBtn ? voiceToggleBtn.title : '';
+const voiceHud = $('voice-hud');
+const voiceHudText = $('voice-hud-text');
+const voiceHudTarget = $('voice-hud-target');
+
+// -- Dictionary application --------------------------------------------------
+function escapeRegex(s) { return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
+
+function applyVoiceDict(text) {
+  let out = text;
+  for (const { from, to } of voiceDict) {
+    if (!from) continue;
+    // Whole word/phrase, case-insensitive. \b anchors at the alnum edges, so
+    // "cloud code" matches as a unit without clobbering longer words.
+    const re = new RegExp('\\b' + escapeRegex(from) + '\\b', 'gi');
+    out = out.replace(re, to == null ? '' : to);
+  }
+  // Collapse any double spaces a removal-entry might have left behind.
+  return out.replace(/ {2,}/g, ' ').trim();
+}
+
+// The pane dictation flows into: the one focused when voice started, falling
+// back to whatever is focused now if that one has gone away.
+function currentVoicePane() {
+  if (voiceTargetPane && !voiceTargetPane.disposed && voiceTargetPane.state !== 'dead') return voiceTargetPane;
+  if (focusedPane && !focusedPane.disposed && focusedPane.state !== 'dead') {
+    voiceTargetPane = focusedPane;
+    return focusedPane;
+  }
+  return null;
+}
+
+function commitVoiceText(raw) {
+  const trimmed = (raw || '').trim();
+  if (!trimmed) return;
+
+  // A bare command phrase submits the line rather than typing the words.
+  if (voiceAutoEnter && VOICE_ENTER_RE.test(trimmed)) {
+    const pane = currentVoicePane();
+    if (pane) sendToPane(pane, '\r');
+    return;
+  }
+
+  let text = applyVoiceDict(trimmed);
+  if (!text) return;
+  if (voiceAutoSpace) text += ' ';
+
+  const pane = currentVoicePane();
+  if (!pane) { flagVoiceError('No live thread to type into — click a thread and try again.'); return; }
+  sendToPane(pane, text);
+  updateVoiceHudTarget();
+}
+
+// -- Engine ------------------------------------------------------------------
+function ensureRecognition() {
+  if (recognition || !SpeechRecognition) return recognition;
+  const rec = new SpeechRecognition();
+  rec.continuous = true;
+  rec.interimResults = true;
+  rec.maxAlternatives = 1;
+  rec.lang = voiceLang;
+
+  rec.onstart = () => {
+    voiceStarting = false;
+    voiceSessionStarted = true;
+    voiceNoStartStreak = 0;
+    voiceErrorCount = 0;
+    clearVoiceError();
+  };
+
+  rec.onresult = (event) => {
+    let interim = '';
+    for (let i = event.resultIndex; i < event.results.length; i++) {
+      const res = event.results[i];
+      const phrase = (res[0] && res[0].transcript) || '';
+      if (res.isFinal) commitVoiceText(phrase);
+      else interim += phrase;
+    }
+    setVoiceHudText(interim);
+  };
+
+  rec.onerror = (event) => {
+    const err = event.error;
+    if (err === 'not-allowed' || err === 'service-not-allowed') {
+      stopVoice();
+      flagVoiceError('Microphone access was blocked. Allow the mic for Hivemind, then toggle voice again.');
+    } else if (err === 'audio-capture') {
+      stopVoice();
+      flagVoiceError('No microphone was found.');
+    } else if (err === 'no-speech' || err === 'aborted' || err === 'network') {
+      /* transient — onend restarts us if still active */
+    } else {
+      voiceErrorCount++;
+    }
+  };
+
+  rec.onend = () => {
+    voiceStarting = false;
+    setVoiceHudText('');
+    if (!voiceActive) return;
+    if (voiceErrorCount > 5) {
+      stopVoice();
+      flagVoiceError('Voice recognition kept failing, so it was stopped.');
+      return;
+    }
+    // The session ended without ever starting — likely no engine / no mic.
+    if (!voiceSessionStarted) {
+      voiceNoStartStreak++;
+      if (voiceNoStartStreak > 5) {
+        stopVoice();
+        flagVoiceError('Could not start the microphone. Check mic access and that a speech engine is available in this build.');
+        return;
+      }
+    }
+    voiceSessionStarted = false;
+    // Web Speech stops itself after a pause; restart to stay continuous.
+    voiceRestartTimer = setTimeout(startRecognition, 300);
+  };
+
+  recognition = rec;
+  return rec;
+}
+
+function startRecognition() {
+  const rec = ensureRecognition();
+  if (!rec || voiceStarting) return;
+  rec.lang = voiceLang;
+  voiceStarting = true;
+  voiceSessionStarted = false;
+  try {
+    rec.start();
+  } catch (_) {
+    // start() throws if a session is still winding down — onend will retry.
+    voiceStarting = false;
+  }
+}
+
+// -- Public controls ---------------------------------------------------------
+function startVoice() {
+  if (voiceActive) return;
+  if (!SpeechRecognition) { flagVoiceError('This build has no speech recognition engine.'); return; }
+  const pane = focusedPane && !focusedPane.disposed && focusedPane.state !== 'dead' ? focusedPane : null;
+  if (!pane) { flagVoiceError('Open or click a thread first, then start voice typing.'); return; }
+  voiceTargetPane = pane;
+  voiceActive = true;
+  voiceErrorCount = 0;
+  voiceNoStartStreak = 0;
+  clearVoiceError();
+  renderVoiceState();
+  startRecognition();
+}
+
+function stopVoice() {
+  voiceActive = false;
+  clearTimeout(voiceRestartTimer);
+  if (recognition) { try { recognition.stop(); } catch (_) { /* not running */ } }
+  setVoiceHudText('');
+  renderVoiceState();
+}
+
+function toggleVoice() { if (voiceActive) stopVoice(); else startVoice(); }
+
+// -- HUD / button state ------------------------------------------------------
+function renderVoiceState() {
+  if (voiceToggleBtn) voiceToggleBtn.classList.toggle('listening', voiceActive);
+  if (!voiceHud) return;
+  voiceHud.classList.toggle('hidden', !voiceActive);
+  if (voiceActive) updateVoiceHudTarget();
+}
+function updateVoiceHudTarget() {
+  if (!voiceHudTarget) return;
+  const pane = currentVoicePane();
+  voiceHudTarget.textContent = pane ? '→ ' + (pane.name || 'thread') : '→ (no thread)';
+}
+function setVoiceHudText(t) { if (voiceHudText) voiceHudText.textContent = t || ''; }
+
+function flagVoiceError(msg) {
+  if (voiceToggleBtn) { voiceToggleBtn.classList.add('error'); voiceToggleBtn.title = msg; }
+  setVoiceModalMsg(msg, 'err');
+  console.warn('[voice]', msg);
+}
+function clearVoiceError() {
+  if (voiceToggleBtn) { voiceToggleBtn.classList.remove('error'); voiceToggleBtn.title = VOICE_BTN_TITLE; }
+}
+
+// -- Hotkey: the ~ (backquote) key toggles listening ------------------------
+// A single capture-phase listener covers the whole app, terminals included, so
+// it fires before xterm consumes the key. We let the backquote through only
+// when the user is typing into one of our own text fields (so a literal ` can
+// still be entered there); inside a thread it toggles voice.
+document.addEventListener('keydown', (e) => {
+  if (!voiceHotkeyEnabled) return;
+  if (e.code !== 'Backquote' || e.ctrlKey || e.altKey || e.metaKey) return;
+  const t = e.target;
+  const isXtermInput = t && t.classList && t.classList.contains('xterm-helper-textarea');
+  const editable = t && !isXtermInput && (
+    t.isContentEditable ||
+    t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.tagName === 'SELECT'
+  );
+  if (editable) return; // let UI fields receive a literal backtick
+  e.preventDefault();
+  e.stopImmediatePropagation();
+  toggleVoice();
+}, true);
+
+// -- Settings + dictionary modal --------------------------------------------
+const settingsBackdrop = $('settings-backdrop');
+const voiceModalMsg = $('voice-modal-msg');
+const vLang = $('voice-lang');
+const vHotkey = $('voice-hotkey-enabled');
+const vAutoEnter = $('voice-auto-enter');
+const vAutoSpace = $('voice-auto-space');
+const vFrom = $('voice-dict-from');
+const vTo = $('voice-dict-to');
+const vDictList = $('voice-dict-list');
+const vDictEmpty = $('voice-dict-empty');
+
+function setVoiceModalMsg(text, kind) {
+  if (!voiceModalMsg) return;
+  if (!text) { voiceModalMsg.classList.add('hidden'); voiceModalMsg.textContent = ''; return; }
+  voiceModalMsg.textContent = text;
+  voiceModalMsg.className = 'voice-msg' + (kind ? ' ' + kind : '');
+}
+
+function renderVoiceDict() {
+  if (!vDictList) return;
+  vDictList.innerHTML = '';
+  if (!voiceDict.length) { vDictEmpty.classList.remove('hidden'); return; }
+  vDictEmpty.classList.add('hidden');
+  voiceDict.forEach((entry, i) => {
+    const li = document.createElement('li');
+    const from = el('span', 'vd-from', entry.from);
+    const arrow = el('span', 'vd-arrow', '→');
+    const to = el('span', 'vd-to', entry.to ? entry.to : '(remove)');
+    const del = document.createElement('button');
+    del.className = 'vd-del';
+    del.textContent = '🗑';
+    del.title = 'Remove this correction';
+    del.onclick = () => { voiceDict.splice(i, 1); saveVoiceDict(); renderVoiceDict(); };
+    li.append(from, arrow, to, del);
+    vDictList.appendChild(li);
+  });
+}
+
+function addVoiceDictEntry() {
+  const from = vFrom.value.trim();
+  const to = vTo.value.trim();
+  if (!from) { setVoiceModalMsg('Type the word or phrase voice keeps mishearing.', 'err'); vFrom.focus(); return; }
+  const idx = voiceDict.findIndex((e) => e.from.toLowerCase() === from.toLowerCase());
+  if (idx >= 0) voiceDict[idx] = { from, to };
+  else voiceDict.push({ from, to });
+  saveVoiceDict();
+  renderVoiceDict();
+  vFrom.value = '';
+  vTo.value = '';
+  vFrom.focus();
+  setVoiceModalMsg('Saved.', 'ok');
+}
+
+// -- Settings modal (tabbed: General + Voice) -------------------------------
+// Switch the visible tab + panel.
+function setSettingsTab(tab) {
+  document.querySelectorAll('.settings-tab').forEach((b) => {
+    b.classList.toggle('active', b.dataset.tab === tab);
+  });
+  document.querySelectorAll('.settings-panel').forEach((p) => {
+    p.classList.toggle('hidden', p.dataset.panel !== tab);
+  });
+}
+
+// Populate the voice tab's fields from the persisted settings.
+function syncVoiceFields() {
+  vLang.value = voiceLang;
+  vHotkey.checked = voiceHotkeyEnabled;
+  vAutoEnter.checked = voiceAutoEnter;
+  vAutoSpace.checked = voiceAutoSpace;
+  renderVoiceDict();
+  if (!SpeechRecognition) {
+    setVoiceModalMsg('No speech recognition engine is available in this build, so dictation can’t start. Your dictionary and settings still save.', 'err');
+  } else {
+    setVoiceModalMsg('');
+  }
+}
+
+// Populate the general tab's fields from the current defaults.
+function syncGeneralFields() {
+  const sm = $('set-default-model');
+  if (sm && !sm.options.length) {
+    for (const m of MODELS) {
+      const opt = document.createElement('option');
+      opt.value = m.value; opt.textContent = m.label;
+      sm.appendChild(opt);
+    }
+  }
+  if (sm) sm.value = defaultModel;
+  const sf = $('set-default-font');
+  if (sf) sf.value = String(defaultFontSize);
+  const sn = $('set-notify');
+  if (sn) sn.checked = !notifyMuted;
+}
+
+function openSettings(tab) {
+  syncGeneralFields();
+  syncVoiceFields();
+  setSettingsTab(tab || 'general');
+  settingsBackdrop.classList.remove('hidden');
+}
+function closeSettings() { settingsBackdrop.classList.add('hidden'); }
+
+// Back-compat alias: the 📖 button opens straight to the Voice tab.
+function openVoiceModal() { openSettings('voice'); setTimeout(() => vFrom.focus(), 0); }
+function closeVoiceModal() { closeSettings(); }
+
+// -- Wire it all up ----------------------------------------------------------
+if (voiceToggleBtn) voiceToggleBtn.onclick = toggleVoice;
+$('voice-settings').onclick = openVoiceModal;
+const settingsBtn = $('settings-btn');
+if (settingsBtn) settingsBtn.onclick = () => openSettings('general');
+$('settings-close').onclick = closeSettings;
+$('voice-hud-stop').onclick = stopVoice;
+settingsBackdrop.addEventListener('mousedown', (e) => { if (e.target === settingsBackdrop) closeSettings(); });
+document.querySelectorAll('.settings-tab').forEach((b) => {
+  b.onclick = () => setSettingsTab(b.dataset.tab);
+});
+
+// General-tab controls.
+const setModelSel = $('set-default-model');
+if (setModelSel) setModelSel.addEventListener('change', () => {
+  if (isValidModel(setModelSel.value)) {
+    defaultModel = setModelSel.value;
+    localStorage.setItem('hm.model', defaultModel);
+  }
+});
+const setFontInput = $('set-default-font');
+if (setFontInput) setFontInput.addEventListener('change', () => {
+  defaultFontSize = clampFont(parseInt(setFontInput.value, 10) || FONT_DEFAULT);
+  setFontInput.value = String(defaultFontSize);
+  localStorage.setItem('hm.fontSize', String(defaultFontSize));
+});
+const setNotify = $('set-notify');
+if (setNotify) setNotify.addEventListener('change', () => {
+  notifyMuted = !setNotify.checked;
+  localStorage.setItem('hm.muteNotifications', notifyMuted ? '1' : '0');
+  if (typeof renderMuteBtn === 'function') renderMuteBtn();
+});
+
+$('voice-dict-add').onclick = addVoiceDictEntry;
+vFrom.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); vTo.focus(); } });
+vTo.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); addVoiceDictEntry(); } });
+vLang.addEventListener('change', () => {
+  voiceLang = vLang.value.trim() || 'en-US';
+  localStorage.setItem('hm.voiceLang', voiceLang);
+  if (recognition) recognition.lang = voiceLang;
+});
+vHotkey.addEventListener('change', () => {
+  voiceHotkeyEnabled = vHotkey.checked;
+  localStorage.setItem('hm.voiceHotkey', voiceHotkeyEnabled ? '1' : '0');
+});
+vAutoEnter.addEventListener('change', () => {
+  voiceAutoEnter = vAutoEnter.checked;
+  localStorage.setItem('hm.voiceAutoEnter', voiceAutoEnter ? '1' : '0');
+});
+vAutoSpace.addEventListener('change', () => {
+  voiceAutoSpace = vAutoSpace.checked;
+  localStorage.setItem('hm.voiceAutoSpace', voiceAutoSpace ? '1' : '0');
+});
 
 // ---------------------------------------------------------------------------
 // Init

@@ -23,9 +23,21 @@
             </svg>
             <span class="logo-text">Hivemind</span>
           </span>
-          <button id="add-board" title="New board">＋</button>
+          <button id="add-board" title="New hive">＋</button>
         </div>
         <ul id="board-list"></ul>
+
+        <!-- File Explorer panel — docked inside the sidebar -->
+        <aside id="files-panel" class="hidden">
+          <div class="git-header">
+            <span class="git-title">Explorer</span>
+            <div class="spacer"></div>
+            <button id="files-refresh" class="git-icon" title="Refresh">⟳</button>
+            <button id="files-close" class="git-icon" title="Close">✕</button>
+          </div>
+          <div id="files-body"></div>
+          <div id="files-msgbar" class="git-msgbar hidden"></div>
+        </aside>
 
         <!-- Source Control panel (Git) — docked inside the sidebar -->
         <aside id="git-panel" class="hidden">
@@ -40,25 +52,38 @@
         </aside>
 
         <div class="sidebar-actions">
-          <button id="git-toggle" class="sidebar-action-btn" title="Source Control (Git)" disabled>⑂ Source Control</button>
+          <button id="files-toggle" class="sidebar-action-btn" title="File Explorer" aria-label="File Explorer" disabled>🗂</button>
+          <button id="git-toggle" class="sidebar-action-btn" title="Source Control (Git)" aria-label="Source Control (Git)" disabled>⑂</button>
         </div>
         <div class="sidebar-footer">Hivemind</div>
       </aside>
 
       <main id="workspace">
         <header id="board-bar">
-          <div id="board-title">No board selected</div>
+          <div id="board-title">No hive selected</div>
           <div id="board-meta"></div>
           <div class="spacer"></div>
-          <button id="broadcast-toggle" class="icon-btn" title="Broadcast input to all threads on this board" disabled>📡</button>
+          <button id="voice-toggle" class="icon-btn" title="Voice typing — dictate into the focused thread (toggle with the ~ key)" disabled>🎤</button>
+          <button id="voice-settings" class="icon-btn" title="Voice dictionary &amp; settings">📖</button>
+          <button id="broadcast-toggle" class="icon-btn" title="Broadcast input to all threads on this hive" disabled>📡</button>
           <button id="mute-toggle" class="icon-btn" title="Notifications">🔔</button>
+          <button id="settings-btn" class="icon-btn" title="Settings">⚙</button>
           <button id="add-term" class="primary" disabled>＋ Thread</button>
         </header>
         <section id="grid"></section>
+
+        <!-- Live voice status / interim transcript overlay (shown while listening) -->
+        <div id="voice-hud" class="hidden">
+          <span class="vh-mic">🎙️</span>
+          <span class="vh-state">Listening…</span>
+          <span class="vh-text" id="voice-hud-text"></span>
+          <span class="vh-target" id="voice-hud-target"></span>
+          <button id="voice-hud-stop" title="Stop voice typing (~)">✕</button>
+        </div>
         <div id="broadcast-bar" class="hidden">
           <span class="bc-label">📡 Send to <span id="bc-count">0</span> threads</span>
           <input id="bc-input" type="text" spellcheck="true"
-                 placeholder="Type a command and press Enter to send it to every thread on this board…" />
+                 placeholder="Type a command and press Enter to send it to every thread on this hive…" />
           <label class="bc-mirror" title="Mirror every keystroke from the focused thread to all threads">
             <input type="checkbox" id="bc-mirror" /> mirror typing
           </label>
@@ -68,9 +93,9 @@
         </div>
         <div id="empty-state" class="empty">
           <h2>Welcome 👋</h2>
-          <p>Create a board, point it at a project directory, and open as many
+          <p>Create a hive, point it at a project directory, and open as many
              Claude threads as you like — they all share that directory.</p>
-          <button id="empty-add-board" class="primary">Create your first board</button>
+          <button id="empty-add-board" class="primary">Create your first hive</button>
         </div>
       </main>
     </div>
@@ -117,11 +142,101 @@
       </div>
     </div>
 
+    <!-- Settings (tabbed) — consolidates app preferences in one place -->
+    <div id="settings-backdrop" class="hidden">
+      <div id="settings-modal">
+        <div class="settings-head">
+          <span id="settings-title">⚙ Settings</span>
+          <div class="spacer"></div>
+          <button id="settings-close" class="git-icon" title="Close">✕</button>
+        </div>
+
+        <div class="settings-tabs" role="tablist">
+          <button class="settings-tab active" data-tab="general">General</button>
+          <button class="settings-tab" data-tab="voice">Voice</button>
+        </div>
+
+        <div id="settings-body">
+          <!-- General tab ------------------------------------------------- -->
+          <section class="settings-panel" data-panel="general">
+            <div class="settings-group">
+              <div class="settings-group-title">Defaults for new threads</div>
+              <label>Claude model
+                <select id="set-default-model"></select>
+              </label>
+              <label>Font size
+                <input id="set-default-font" type="number" min="8" max="32" step="1" />
+              </label>
+              <small>Applies to threads you open from now on. Existing threads keep
+                their own model and size — change those from the thread header, or with
+                A−/A+ and Ctrl+scroll.</small>
+            </div>
+
+            <div class="settings-group">
+              <div class="settings-group-title">Notifications</div>
+              <label class="settings-check">
+                <input type="checkbox" id="set-notify" />
+                <span>Notify me when a thread needs input or finishes its turn while
+                  Hivemind is in the background</span>
+              </label>
+            </div>
+          </section>
+
+          <!-- Voice tab (moved here, same element IDs) -------------------- -->
+          <section class="settings-panel hidden" data-panel="voice">
+            <p class="voice-intro">
+              Dictate straight into the focused thread — recognized text is typed at
+              the cursor. Press the <kbd>~</kbd> key any time to start or stop
+              listening.
+            </p>
+
+            <div class="voice-settings-grid">
+              <label>Recognition language
+                <input id="voice-lang" type="text" placeholder="en-US" spellcheck="false" />
+              </label>
+              <label class="voice-check">
+                <input type="checkbox" id="voice-hotkey-enabled" />
+                <span>The <kbd>~</kbd> key toggles listening (off lets you type a literal backtick)</span>
+              </label>
+              <label class="voice-check">
+                <input type="checkbox" id="voice-auto-enter" />
+                <span>Saying “new line”, “press enter”, or “submit” sends Enter ⏎</span>
+              </label>
+              <label class="voice-check">
+                <input type="checkbox" id="voice-auto-space" />
+                <span>Add a space after each phrase</span>
+              </label>
+            </div>
+
+            <div class="voice-dict-head">
+              <span class="voice-dict-title">User dictionary</span>
+              <small>Fix words speech keeps mishearing. Each phrase you say on the
+                left is replaced with the text on the right before it is typed.</small>
+            </div>
+
+            <div class="voice-dict-addrow">
+              <input id="voice-dict-from" type="text" placeholder="heard… (e.g. cloud code)" spellcheck="false" />
+              <span class="voice-dict-arrow">→</span>
+              <input id="voice-dict-to" type="text" placeholder="typed… (e.g. Claude Code)" spellcheck="false" />
+              <button id="voice-dict-add" class="primary">Add</button>
+            </div>
+
+            <ul id="voice-dict-list"></ul>
+            <div id="voice-dict-empty" class="voice-dict-empty hidden">
+              No entries yet. Add a correction above.
+            </div>
+          </section>
+        </div>
+
+        <div id="voice-modal-msg" class="voice-msg hidden"></div>
+      </div>
+    </div>
+
     <!-- Board create/edit modal -->
     <div id="modal-backdrop" class="hidden">
       <div id="modal">
-        <h3 id="modal-title">New board</h3>
-        <label>Board name
+        <h3 id="modal-title">New hive</h3>
+        <label>Hive name
           <input id="modal-name" type="text" placeholder="My project" />
         </label>
         <label>Project directory
@@ -132,7 +247,17 @@
         </label>
         <label>Startup command
           <input id="modal-cmd" type="text" placeholder="claude" />
-          <small>Runs automatically in every new thread on this board.</small>
+          <small>Runs automatically in every new thread on this hive.</small>
+        </label>
+        <label class="modal-check">
+          <input type="checkbox" id="modal-resume" />
+          <span>Resume Claude conversations on restart (adds <code>--continue</code>).
+            Best with one thread per hive — multiple threads all continue the most
+            recent conversation in this folder.</span>
+        </label>
+        <label class="modal-check">
+          <input type="checkbox" id="modal-muted" />
+          <span>Mute attention notifications for this hive</span>
         </label>
         <div class="modal-actions">
           <button id="modal-cancel">Cancel</button>
@@ -143,6 +268,7 @@
 
     <script src="../node_modules/@xterm/xterm/lib/xterm.js"></script>
     <script src="../node_modules/@xterm/addon-fit/lib/addon-fit.js"></script>
+    <script src="../node_modules/@xterm/addon-search/lib/addon-search.js"></script>
     <script src="renderer.js"></script>
   </body>
 </html>

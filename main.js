@@ -1,11 +1,12 @@
 'use strict';
 
-const { app, BrowserWindow, Menu, MenuItem, ipcMain, dialog, Notification } = require('electron');
+const { app, BrowserWindow, Menu, MenuItem, ipcMain, dialog, Notification, clipboard } = require('electron');
 const path = require('path');
 const fs = require('fs');
 const os = require('os');
 const pty = require('@homebridge/node-pty-prebuilt-multiarch');
 const git = require('./git');
+const files = require('./files');
 
 // ---------------------------------------------------------------------------
 // Persistence: boards are stored as JSON in the app's userData directory.
@@ -47,7 +48,7 @@ function defaultShell() {
   return process.env.SHELL || 'bash';
 }
 
-function spawnPty({ id, cwd, cols, rows, startupCommand, model }, win) {
+function spawnPty({ id, cwd, cols, rows, startupCommand, model, resume }, win) {
   const shell = defaultShell();
   let safeCwd = cwd;
   try {
@@ -84,6 +85,11 @@ function spawnPty({ id, cwd, cols, rows, startupCommand, model }, win) {
   if (model && model !== 'default' && /^[a-z0-9-]+$/i.test(model)) {
     cmd = cmd.replace(/^claude(\.exe)?\b/i, (m) => `${m} --model ${model}`);
   }
+  // Restoring a saved session: continue the most recent conversation in this
+  // directory. Only meaningful for the `claude` command.
+  if (resume && /^claude(\.exe)?\b/i.test(cmd) && !/--continue\b|--resume\b/.test(cmd)) {
+    cmd = cmd.replace(/^claude(\.exe)?\b/i, (m) => `${m} --continue`);
+  }
   if (cmd) {
     // Small delay so the shell prompt is ready before we type into it.
     setTimeout(() => {
@@ -93,6 +99,43 @@ function spawnPty({ id, cwd, cols, rows, startupCommand, model }, win) {
   }
 
   return { id };
+}
+
+// ---------------------------------------------------------------------------
+// Filesystem watcher: a single recursive watch on the active board's directory.
+// Debounced so a burst of writes (e.g. a build) collapses into one refresh.
+// ---------------------------------------------------------------------------
+let fsWatcher = null;
+let fsWatchDebounce = null;
+let fsWatchedDir = null;
+
+function clearWatch() {
+  if (fsWatcher) {
+    try { fsWatcher.close(); } catch (_) { /* ignore */ }
+    fsWatcher = null;
+  }
+  clearTimeout(fsWatchDebounce);
+  fsWatchedDir = null;
+}
+
+function setWatch(cwd) {
+  if (cwd === fsWatchedDir) return; // already watching this directory
+  clearWatch();
+  if (!cwd) return;
+  try {
+    fsWatchedDir = cwd;
+    fsWatcher = fs.watch(cwd, { recursive: true }, () => {
+      clearTimeout(fsWatchDebounce);
+      fsWatchDebounce = setTimeout(() => {
+        if (mainWindow && !mainWindow.isDestroyed()) {
+          mainWindow.webContents.send('fs:changed', { cwd });
+        }
+      }, 600);
+    });
+    fsWatcher.on('error', () => clearWatch());
+  } catch (_) {
+    fsWatchedDir = null; // recursive watch unsupported here — panels stay manual
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -116,6 +159,30 @@ function createWindow() {
 
   mainWindow.removeMenu();
   mainWindow.loadFile(path.join(__dirname, 'src', 'index.html'));
+
+  // Microphone access for the voice-to-text control. The renderer drives speech
+  // recognition (Web Speech API), which opens the mic via getUserMedia; without
+  // these handlers Chromium denies the request and recognition never starts.
+  // This is a local, trusted app, so we grant audio capture outright and leave
+  // every other permission to Chromium's default (denied).
+  try {
+    const ses = mainWindow.webContents.session;
+    const isMic = (p) => p === 'media' || p === 'microphone' || p === 'audioCapture';
+    ses.setPermissionRequestHandler((_wc, permission, callback, details) => {
+      if (isMic(permission)) {
+        // For 'media', only approve when audio was actually requested.
+        if (permission === 'media' && details && details.mediaTypes &&
+            !details.mediaTypes.includes('audio')) {
+          return callback(false);
+        }
+        return callback(true);
+      }
+      callback(false);
+    });
+    ses.setPermissionCheckHandler((_wc, permission) => isMic(permission));
+  } catch (_) {
+    /* older Electron without session permission handlers — best effort */
+  }
 
   // Spell-check stays inert until a dictionary language is loaded. On Windows
   // Electron does NOT infer this from the system locale, so without this call
@@ -209,7 +276,7 @@ app.whenReady().then(() => {
   ipcMain.handle('dialog:pickDir', async () => {
     const res = await dialog.showOpenDialog(mainWindow, {
       properties: ['openDirectory', 'createDirectory'],
-      title: 'Choose project directory for this board',
+      title: 'Choose project directory for this hive',
     });
     if (res.canceled || !res.filePaths.length) return null;
     return res.filePaths[0];
@@ -230,6 +297,26 @@ app.whenReady().then(() => {
       return file;
     } catch (err) {
       console.error('Failed to save pasted image:', err);
+      return null;
+    }
+  });
+
+  // A screenshot captured to the clipboard (Win+Shift+S, Snipping Tool, etc.)
+  // lives there as a raw bitmap, not a file — so the renderer's DataTransfer
+  // paste path never sees it. Read it straight from the native clipboard here,
+  // persist it as a PNG, and hand back the path (or null if no image is held).
+  ipcMain.handle('image:fromClipboard', () => {
+    try {
+      const img = clipboard.readImage();
+      if (!img || img.isEmpty()) return null;
+      const dir = path.join(os.tmpdir(), 'hivemind-images');
+      fs.mkdirSync(dir, { recursive: true });
+      const name = `clip-${Date.now()}-${Math.floor(Math.random() * 1e6)}.png`;
+      const file = path.join(dir, name);
+      fs.writeFileSync(file, img.toPNG());
+      return file;
+    } catch (err) {
+      console.error('Failed to read clipboard image:', err);
       return null;
     }
   });
@@ -290,6 +377,21 @@ app.whenReady().then(() => {
   ipcMain.handle('git:setRemote', (_e, { cwd, url }) => git.setRemoteOrigin(cwd, url));
   ipcMain.handle('gh:check', () => git.ghCheck());
   ipcMain.handle('gh:createRepo', (_e, { cwd, name, visibility, push }) => git.ghCreateRepo(cwd, { name, visibility, push }));
+  ipcMain.handle('git:aiCommit', (_e, { cwd }) => git.aiCommit(cwd));
+
+  // -- IPC: filesystem watcher ----------------------------------------------
+  // Watch the active board's project directory so the Source Control and File
+  // Explorer panels can refresh themselves when threads change files on disk.
+  // One watcher at a time (the active board); bursts are debounced in the
+  // renderer-facing event.
+  ipcMain.on('watch:set', (_e, { cwd }) => setWatch(cwd));
+
+  // -- IPC: file explorer ---------------------------------------------------
+  // Operate inside the active board's project directory. `rel` is empty for the
+  // root and a "/"-separated path under it for nested entries.
+  ipcMain.handle('files:list', (_e, { cwd, rel }) => files.list(cwd, rel));
+  ipcMain.handle('files:open', (_e, { cwd, rel }) => files.open(cwd, rel));
+  ipcMain.handle('files:reveal', (_e, { cwd, rel }) => files.reveal(cwd, rel));
 
   createWindow();
 

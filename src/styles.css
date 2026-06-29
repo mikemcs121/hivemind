@@ -120,18 +120,20 @@ html, body {
 }
 .board-item .actions button:hover { color: var(--text); background: var(--bg); }
 
-.sidebar-actions { padding: 8px; border-top: 1px solid var(--border); }
+.sidebar-actions { padding: 8px; border-top: 1px solid var(--border); display: flex; gap: 8px; }
 .sidebar-action-btn {
-  width: 100%;
   display: flex;
   align-items: center;
-  gap: 8px;
-  padding: 8px 10px;
+  justify-content: center;
+  width: 34px;
+  height: 34px;
+  padding: 0;
   background: var(--surface);
   color: var(--text);
   border: 1px solid var(--border);
   border-radius: 7px;
-  font-size: 13px;
+  font-size: 16px;
+  line-height: 1;
   cursor: pointer;
 }
 .sidebar-action-btn:hover:not(:disabled) { background: var(--accent); color: #11111b; border-color: var(--accent); }
@@ -347,6 +349,46 @@ button.icon-btn:disabled { opacity: .4; cursor: not-allowed; }
 }
 .dir-row button:hover, .modal-actions button:hover { filter: brightness(1.15); }
 .modal-actions { display: flex; justify-content: flex-end; gap: 8px; }
+
+/* ---------------- File Explorer panel ---------------- */
+/* Docked inside the sidebar, just like Source Control. */
+#files-panel {
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  background: var(--bg-alt);
+  border-top: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+}
+#files-panel.hidden { display: none; }
+
+/* When the explorer is open, the board list yields its space to it. */
+#sidebar.files-open #board-list { display: none; }
+
+#files-body { flex: 1; overflow-y: auto; padding: 6px 6px; }
+
+.fx-tree, .fx-children { list-style: none; margin: 0; padding: 0; }
+
+.fx-item {
+  display: flex; align-items: center; gap: 6px;
+  padding: 4px 6px; border-radius: 5px; cursor: pointer; font-size: 13px;
+  white-space: nowrap; overflow: hidden;
+}
+.fx-item:hover { background: var(--surface); }
+.fx-twisty {
+  flex: none; width: 12px; text-align: center; color: var(--muted);
+  font-size: 10px; line-height: 1;
+}
+.fx-icon { flex: none; font-size: 13px; }
+.fx-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.fx-act { display: none; gap: 2px; }
+.fx-item:hover .fx-act { display: flex; }
+.fx-act button {
+  background: transparent; border: none; color: var(--muted);
+  cursor: pointer; font-size: 13px; padding: 1px 4px; border-radius: 4px;
+}
+.fx-act button:hover { color: var(--text); background: var(--bg); }
 
 /* ---------------- Source Control (Git) panel ---------------- */
 /* Docked inside the sidebar: fills the board-list area when open. */
@@ -599,5 +641,233 @@ button.icon-btn:disabled { opacity: .4; cursor: not-allowed; }
 .gh-msg.err { color: var(--danger); }
 .gh-msg.ok { color: var(--accent-2); }
 .gh-msg.hidden { display: none; }
+
+/* ---------------- Voice typing ---------------- */
+/* Mic toggle in the board bar: red + pulsing while actively listening. */
+@keyframes hm-mic-pulse {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(243,139,168,.55); }
+  50%      { box-shadow: 0 0 0 6px rgba(243,139,168,0); }
+}
+#voice-toggle.listening {
+  background: var(--danger);
+  color: #11111b;
+  animation: hm-mic-pulse 1.4s ease-out infinite;
+}
+#voice-toggle.error { box-shadow: inset 0 0 0 1px var(--danger); }
+
+/* Live transcript HUD, floating above the grid while listening. */
+#voice-hud {
+  position: absolute;
+  left: 50%;
+  bottom: 18px;
+  transform: translateX(-50%);
+  max-width: min(78%, 900px);
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 12px;
+  background: var(--bg-alt);
+  border: 1px solid var(--danger);
+  border-radius: 10px;
+  box-shadow: 0 8px 24px rgba(0,0,0,.45);
+  font-size: 13px;
+  z-index: 40;
+}
+#voice-hud.hidden { display: none; }
+#voice-hud .vh-mic { animation: hm-pulse 1.1s ease-in-out infinite; }
+#voice-hud .vh-state { color: var(--danger); font-weight: 600; white-space: nowrap; }
+#voice-hud .vh-text {
+  flex: 1; min-width: 0; color: var(--text);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  font-family: "Cascadia Code", Consolas, monospace;
+}
+#voice-hud .vh-text:empty::before { content: "…"; color: var(--muted); }
+#voice-hud .vh-target { color: var(--muted); font-size: 11px; white-space: nowrap; }
+#voice-hud #voice-hud-stop {
+  background: transparent; border: none; color: var(--muted);
+  cursor: pointer; font-size: 13px; padding: 2px 6px; border-radius: 4px; flex: none;
+}
+#voice-hud #voice-hud-stop:hover { color: var(--text); background: var(--surface); }
+
+/* Workspace must be the positioning context for the absolute HUD. */
+#workspace { position: relative; }
+
+/* Voice settings + dictionary modal */
+#voice-backdrop {
+  position: fixed; inset: 0; background: rgba(0,0,0,.55);
+  display: flex; align-items: center; justify-content: center; z-index: 60;
+}
+#voice-backdrop.hidden { display: none; }
+#voice-modal {
+  background: var(--bg-alt); border: 1px solid var(--border); border-radius: 12px;
+  width: 560px; max-width: 94vw; max-height: 88vh;
+  display: flex; flex-direction: column; overflow: hidden;
+}
+.voice-head { display: flex; align-items: center; padding: 14px 14px 14px 18px; border-bottom: 1px solid var(--border); }
+#voice-title { font-weight: 600; font-size: 14px; }
+#voice-modal-body { padding: 18px; overflow-y: auto; display: flex; flex-direction: column; gap: 14px; }
+.voice-intro { margin: 0; font-size: 13px; color: var(--muted); line-height: 1.5; }
+.voice-intro kbd, .voice-check kbd {
+  background: var(--panel); border: 1px solid var(--border); border-bottom-width: 2px;
+  border-radius: 4px; padding: 0 5px; font-family: "Cascadia Code", Consolas, monospace; font-size: 12px;
+}
+
+.voice-settings-grid { display: flex; flex-direction: column; gap: 10px; }
+.voice-settings-grid > label { display: flex; flex-direction: column; gap: 6px; font-size: 13px; color: var(--muted); }
+.voice-settings-grid input[type="text"] {
+  background: var(--panel); border: 1px solid var(--border); color: var(--text);
+  border-radius: 6px; padding: 8px 10px; font-size: 13px; font-family: "Cascadia Code", Consolas, monospace;
+}
+.voice-settings-grid input[type="text"]:focus { outline: none; border-color: var(--accent); }
+.voice-check { flex-direction: row !important; align-items: center; gap: 8px !important; cursor: pointer; }
+.voice-check input { cursor: pointer; flex: none; }
+.voice-check span { line-height: 1.4; }
+
+.voice-dict-head { display: flex; flex-direction: column; gap: 3px; border-top: 1px solid var(--border); padding-top: 14px; }
+.voice-dict-title { font-weight: 600; font-size: 13px; color: var(--text); }
+.voice-dict-head small { color: var(--muted); font-size: 11px; line-height: 1.5; }
+
+.voice-dict-addrow { display: flex; align-items: center; gap: 8px; }
+.voice-dict-addrow input {
+  flex: 1; min-width: 0; background: var(--panel); border: 1px solid var(--border); color: var(--text);
+  border-radius: 6px; padding: 8px 10px; font-size: 13px; font-family: "Cascadia Code", Consolas, monospace;
+}
+.voice-dict-addrow input:focus { outline: none; border-color: var(--accent); }
+.voice-dict-arrow { color: var(--muted); flex: none; }
+.voice-dict-addrow .primary { flex: none; }
+
+#voice-dict-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 4px; max-height: 240px; overflow-y: auto; }
+#voice-dict-list li {
+  display: flex; align-items: center; gap: 8px; padding: 7px 10px;
+  background: var(--panel); border: 1px solid var(--border); border-radius: 6px; font-size: 13px;
+}
+#voice-dict-list .vd-from { color: var(--text); font-family: "Cascadia Code", Consolas, monospace; }
+#voice-dict-list .vd-arrow { color: var(--muted); }
+#voice-dict-list .vd-to { flex: 1; min-width: 0; color: var(--accent-2); font-family: "Cascadia Code", Consolas, monospace; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+#voice-dict-list .vd-del {
+  background: transparent; border: none; color: var(--muted);
+  cursor: pointer; font-size: 14px; padding: 2px 6px; border-radius: 4px; flex: none;
+}
+#voice-dict-list .vd-del:hover { color: var(--danger); background: var(--surface); }
+.voice-dict-empty { color: var(--muted); font-size: 12px; text-align: center; padding: 14px; }
+.voice-dict-empty.hidden { display: none; }
+
+.voice-msg {
+  border-top: 1px solid var(--border); padding: 10px 18px; font-size: 12px;
+  white-space: pre-wrap; color: var(--muted); font-family: "Cascadia Code", Consolas, monospace;
+}
+.voice-msg.err { color: var(--danger); }
+.voice-msg.ok { color: var(--accent-2); }
+.voice-msg.hidden { display: none; }
+
+/* ---------------- Added features ---------------- */
+
+/* Error state (a thread hit an API/usage error): pulsing red, distinct from the
+   static red of an exited thread. */
+.pane-header .dot.error { background: var(--danger); animation: hm-pulse 1.1s ease-in-out infinite; }
+.pane-header .status.error { color: var(--danger); font-weight: 600; }
+.board-item .status-dot.error { background: var(--danger); animation: hm-pulse 1.1s ease-in-out infinite; }
+
+/* Pane header: zoom + broadcast-include + rename input */
+.pane-header .zoom-btn { font-size: 12px; }
+.pane-header .bc-include-btn { font-size: 11px; padding: 2px 4px; }
+.pane-header .bc-include-btn.off { opacity: .3; filter: grayscale(1); }
+.pane-header .title-edit {
+  flex: 1; min-width: 0;
+  background: var(--panel); border: 1px solid var(--accent); color: var(--text);
+  border-radius: 4px; padding: 1px 5px; font-size: 12px; font-family: inherit;
+}
+.pane-header .title-edit:focus { outline: none; }
+
+/* A maximized pane gets a faint accent edge so it's clear you're zoomed in. */
+.pane.zoomed { border-color: var(--accent); }
+
+/* Per-pane find bar (Ctrl+F) */
+.find-bar {
+  display: flex; align-items: center; gap: 4px;
+  padding: 4px 6px; background: var(--bg-alt); border-bottom: 1px solid var(--border);
+}
+.find-bar.hidden { display: none; }
+.find-bar input {
+  flex: 1; min-width: 0;
+  background: var(--panel); border: 1px solid var(--border); color: var(--text);
+  border-radius: 4px; padding: 3px 6px; font-size: 12px;
+  font-family: "Cascadia Code", Consolas, monospace;
+}
+.find-bar input:focus { outline: none; border-color: var(--accent); }
+.find-bar button {
+  background: transparent; border: none; color: var(--muted);
+  cursor: pointer; font-size: 12px; padding: 2px 5px; border-radius: 4px;
+}
+.find-bar button:hover { color: var(--text); background: var(--surface); }
+
+/* Modal checkboxes (resume / mute on the hive editor) */
+.modal-check {
+  flex-direction: row !important; align-items: flex-start; gap: 8px !important;
+  cursor: pointer; font-size: 12px;
+}
+.modal-check input { cursor: pointer; flex: none; margin-top: 2px; }
+.modal-check span { line-height: 1.4; }
+.modal-check code {
+  background: var(--panel); border: 1px solid var(--border);
+  border-radius: 3px; padding: 0 3px; font-size: 11px;
+}
+
+/* Commit message header + AI generate button */
+.git-msg-head {
+  display: flex; align-items: center; gap: 6px;
+  font-size: 11px; text-transform: uppercase; letter-spacing: .4px;
+  color: var(--muted); margin-bottom: 5px;
+}
+.git-msg-head .spacer { flex: 1; }
+.git-gen-btn {
+  background: var(--surface); color: var(--text); border: none;
+  border-radius: 6px; padding: 4px 9px; font-size: 11px; cursor: pointer;
+  text-transform: none; letter-spacing: 0;
+}
+.git-gen-btn:hover { filter: brightness(1.15); }
+.git-gen-btn:disabled { opacity: .5; cursor: default; }
+
+/* Board reorder drag feedback */
+.board-item.dragging { opacity: .5; }
+.board-item.drop-target { border-color: var(--accent); box-shadow: inset 0 2px 0 var(--accent); }
+
+/* ---------------- Settings modal (tabbed) ---------------- */
+#settings-backdrop {
+  position: fixed; inset: 0; background: rgba(0,0,0,.55);
+  display: flex; align-items: center; justify-content: center; z-index: 60;
+}
+#settings-backdrop.hidden { display: none; }
+#settings-modal {
+  background: var(--bg-alt); border: 1px solid var(--border); border-radius: 12px;
+  width: 560px; max-width: 94vw; max-height: 88vh;
+  display: flex; flex-direction: column; overflow: hidden;
+}
+.settings-head { display: flex; align-items: center; padding: 14px 14px 14px 18px; border-bottom: 1px solid var(--border); }
+#settings-title { font-weight: 600; font-size: 14px; }
+.settings-tabs { display: flex; gap: 4px; padding: 8px 12px 0; border-bottom: 1px solid var(--border); }
+.settings-tab {
+  background: transparent; border: none; color: var(--muted);
+  cursor: pointer; font-size: 13px; padding: 8px 14px; border-radius: 6px 6px 0 0;
+  border-bottom: 2px solid transparent;
+}
+.settings-tab:hover { color: var(--text); }
+.settings-tab.active { color: var(--text); border-bottom-color: var(--accent); }
+#settings-body { padding: 18px; overflow-y: auto; }
+.settings-panel { display: flex; flex-direction: column; gap: 14px; }
+.settings-panel.hidden { display: none; }
+.settings-group { display: flex; flex-direction: column; gap: 10px; border-bottom: 1px solid var(--border); padding-bottom: 14px; }
+.settings-group:last-child { border-bottom: none; padding-bottom: 0; }
+.settings-group-title { font-weight: 600; font-size: 13px; color: var(--text); }
+.settings-group > label { display: flex; flex-direction: column; gap: 6px; font-size: 13px; color: var(--muted); }
+.settings-group > small { color: var(--muted); font-size: 11px; line-height: 1.5; }
+.settings-group select, .settings-group input[type="number"] {
+  background: var(--panel); border: 1px solid var(--border); color: var(--text);
+  border-radius: 6px; padding: 7px 10px; font-size: 13px;
+}
+.settings-group select:focus, .settings-group input:focus { outline: none; border-color: var(--accent); }
+.settings-check { flex-direction: row !important; align-items: flex-start; gap: 8px !important; cursor: pointer; }
+.settings-check input { cursor: pointer; flex: none; margin-top: 2px; }
+.settings-check span { line-height: 1.4; }
 
 .hidden { display: none !important; }
