@@ -462,6 +462,14 @@ button.icon-btn:disabled { opacity: .4; cursor: not-allowed; }
   font-family: "Segoe UI", system-ui, sans-serif;
 }
 #git-msg:focus { outline: none; border-color: var(--accent); }
+/* One-click sync — the primary, can't-miss action in the commit box */
+.git-sync-row { margin-top: 8px; }
+.git-sync-btn {
+  width: 100%; padding: 10px; font-size: 13px; font-weight: 600;
+  border-radius: 6px; cursor: pointer;
+}
+.git-sync-btn:disabled { opacity: .4; cursor: not-allowed; }
+
 .git-commit-actions { display: flex; gap: 6px; margin-top: 6px; }
 .git-commit-actions .primary { flex: 1; }
 .git-commit-actions button:not(.primary) {

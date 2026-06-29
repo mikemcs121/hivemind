@@ -1557,22 +1557,71 @@ function renderCommitBox(st) {
     if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') { e.preventDefault(); doCommit(false); }
   });
 
-  // When nothing is staged, the commit buttons stage everything first, so label
-  // them accordingly to signal the single-action behavior.
-  const nothingStaged = !st.files.some((f) => f.staged);
-  const commitLabel = nothingStaged ? '✓ Stage All & Commit' : '✓ Commit';
-  const pushLabel = nothingStaged ? 'Stage All, Commit & Push' : 'Commit & Push';
+  // One button does the whole job: stage everything, commit (auto-drafting a
+  // message if the box is empty), then push — publishing to GitHub the first
+  // time. This is the button to use to "make my other machine see this copy."
+  const sync = document.createElement('div');
+  sync.className = 'git-sync-row';
+  const syncBtn = mkBtn('⟳ Sync to GitHub', doSync);
+  syncBtn.className = 'primary git-sync-btn';
+  syncBtn.title = st.hasRemote
+    ? 'Stage all changes, commit, and push to GitHub in one step'
+    : 'Connect this repository to GitHub, then push everything';
+  sync.appendChild(syncBtn);
 
+  // Secondary, for the rare case you want a local commit without pushing.
   const actions = document.createElement('div');
   actions.className = 'git-commit-actions';
-  const commitBtn = mkBtn(commitLabel, () => doCommit(false));
-  commitBtn.className = 'primary';
-  const commitPush = mkBtn(pushLabel, () => doCommit(true));
-  if (!st.hasRemote) commitPush.disabled = true;
-  actions.append(commitBtn, commitPush);
+  const commitBtn = mkBtn('Commit locally only', () => doCommit(false));
+  commitBtn.title = 'Save a commit on this machine without pushing to GitHub';
+  actions.append(commitBtn);
 
-  wrap.append(msgHead, ta, actions);
+  wrap.append(msgHead, ta, sync, actions);
   return wrap;
+}
+
+// One-click sync: stage → commit (auto-message if none) → push, publishing the
+// repo to GitHub if it isn't connected yet. Whatever it takes so the same work
+// shows up when you pull on another machine.
+async function doSync() {
+  const st = lastStatus;
+  if (!st || !st.ok) { setGitMsg('No repository to sync here.', 'err'); return; }
+
+  // Not connected to GitHub yet → run the publish wizard (create or link a repo;
+  // it pushes the current branch as part of finishing).
+  if (!st.hasRemote) { openGitHubWizard(); return; }
+
+  const dir = activeDir();
+  const hasChanges = st.files && st.files.length > 0;
+
+  // 1) Commit any working-tree changes.
+  if (hasChanges) {
+    let msg = gitDraftMsg.trim();
+    if (!msg) {
+      // No typed message — draft one so the single click needs no extra input.
+      setGitMsg('Drafting a commit message…');
+      try {
+        const r = await window.api.git.aiCommitMessage(dir);
+        if (r && r.code === 0 && r.message) msg = r.message.trim();
+      } catch { /* fall through to a default */ }
+      if (!msg) msg = 'Update from Hivemind';
+    }
+    if (!st.files.some((f) => f.staged)) {
+      const staged = await gitRun('Staging all', (d) => window.api.git.stageAll(d), { refresh: false });
+      if (!staged || staged.code !== 0) { await refreshGit({ keepMsg: true }); return; }
+    }
+    const res = await gitRun('Committing', (d) => window.api.git.commit(d, msg), { refresh: false });
+    if (!res || res.code !== 0) { await refreshGit({ keepMsg: true }); return; }
+    gitDraftMsg = '';
+  }
+
+  // 2) Push (setting the upstream the first time the branch is published).
+  const setUpstream = !st.upstream;
+  await gitRun(
+    'Syncing to GitHub',
+    (d) => window.api.git.push(d, st.branch, setUpstream),
+    { okMsg: 'Synced to GitHub. Pull on your other machine to see this copy.' },
+  );
 }
 
 let gitDraftMsg = '';
