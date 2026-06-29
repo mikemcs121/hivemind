@@ -2,8 +2,10 @@
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
+    <!-- hm: serves the offline speech-to-text assets; wasm-unsafe-eval + blob:
+         are needed to run the Whisper ONNX runtime and its worker. -->
     <meta http-equiv="Content-Security-Policy"
-          content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; font-src 'self' data:;" />
+          content="default-src 'self'; script-src 'self' 'wasm-unsafe-eval' blob: hm:; worker-src 'self' blob: hm:; connect-src 'self' hm: blob: data:; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self' data:;" />
     <title>Hivemind</title>
     <link rel="stylesheet" href="../node_modules/@xterm/xterm/css/xterm.css" />
     <link rel="stylesheet" href="styles.css" />
@@ -63,6 +65,7 @@
           <div id="board-title">No hive selected</div>
           <div id="board-meta"></div>
           <div class="spacer"></div>
+          <button id="build-portable" class="pill-btn hidden" title="Build a portable copy of Hivemind from this checkout">📦 Build Portable</button>
           <button id="voice-toggle" class="icon-btn" title="Voice typing — dictate into the focused thread (toggle with the ~ key)" disabled>🎤</button>
           <button id="broadcast-toggle" class="icon-btn" title="Broadcast input to all threads on this hive" disabled>📡</button>
           <button id="settings-btn" class="icon-btn" title="Settings">⚙</button>
@@ -184,15 +187,12 @@
           <!-- Voice tab (moved here, same element IDs) -------------------- -->
           <section class="settings-panel hidden" data-panel="voice">
             <p class="voice-intro">
-              Dictate straight into the focused thread — recognized text is typed at
-              the cursor. Press the <kbd>~</kbd> key any time to start or stop
-              listening.
+              Dictate straight into the focused thread — transcribed text is typed at
+              the cursor. Speech is recognized on-device by Whisper (English), fully
+              offline. Press the <kbd>~</kbd> key any time to start or stop listening.
             </p>
 
             <div class="voice-settings-grid">
-              <label>Recognition language
-                <input id="voice-lang" type="text" placeholder="en-US" spellcheck="false" />
-              </label>
               <label class="voice-check">
                 <input type="checkbox" id="voice-hotkey-enabled" />
                 <span>The <kbd>~</kbd> key toggles listening (off lets you type a literal backtick)</span>
@@ -253,7 +253,8 @@
             <div class="settings-group-title">Threads &amp; broadcast</div>
             <ul class="help-list">
               <li><strong>📡 Broadcast</strong> — send the same command (or mirror your typing) to every thread on the hive.</li>
-              <li><strong>🎤 Voice typing</strong> — dictate into the focused thread. Toggle with the <kbd>~</kbd> key.</li>
+              <li><strong>🎤 Voice typing</strong> — dictate into the focused thread; speech is transcribed on-device by Whisper (English, fully offline) and typed at the cursor when you pause. Toggle with the <kbd>~</kbd> key. Use the user dictionary in <strong>⚙ Settings → Voice</strong> to fix words it mishears.</li>
+              <li>Each thread's header shows a <strong>caption</strong> built from the last prompt you send it, so you can see what every thread is working on at a glance. Double-click the name to rename a thread.</li>
               <li>Change a thread's model or font from its header, or with <kbd>A−</kbd>/<kbd>A+</kbd> and <kbd>Ctrl</kbd>+scroll.</li>
             </ul>
           </div>
@@ -261,8 +262,8 @@
           <div class="settings-group">
             <div class="settings-group-title">Source Control (Git)</div>
             <ul class="help-list">
-              <li><strong>⟳ Sync to GitHub</strong> — the one button that does it all: stages every change, commits (auto-drafting a message if you left the box empty), and pushes to GitHub. The first time, it connects the repo to GitHub for you. Use this to make your work show up when you pull on another machine. <em>(Ctrl+Enter in the commit message box does the same thing.)</em></li>
-              <li><strong>Pull ↓</strong> — brings down commits made on another machine (Sync only pushes up, so use this to receive changes).</li>
+              <li><strong>Push ↑</strong> — stages every change, commits (auto-drafting a message if you left the box empty), then pushes your work up to GitHub. The first time, it connects the repo to GitHub for you. <em>(Ctrl+Enter in the commit message box does the same thing.)</em> If the push is rejected because GitHub has newer commits, Pull first.</li>
+              <li><strong>Pull ↓</strong> — brings down commits made on GitHub (or another machine) and merges them into your branch.</li>
               <li><strong>Revert to GitHub</strong> — discards all local changes and resets the branch to match GitHub. Cannot be undone.</li>
             </ul>
           </div>
@@ -275,6 +276,15 @@
               <li><kbd>A−</kbd> / <kbd>A+</kbd> or <kbd>Ctrl</kbd>+scroll — change the focused thread's font size</li>
               <li><kbd>Esc</kbd> — close the open dialog</li>
             </ul>
+          </div>
+
+          <div class="settings-group">
+            <div class="settings-group-title">Building Hivemind</div>
+            <p class="help-note"><strong>📦 Build Portable</strong> appears in the toolbar only when the active
+              hive is pointed at the Hivemind source checkout. It runs electron-builder's portable target to
+              produce a single self-contained <code>.exe</code>, then opens the <code>dist</code> folder when
+              it finishes. While it runs, the button shows the current build stage and a live elapsed timer
+              (a portable build typically takes a few minutes); hover it to see the latest build output line.</p>
           </div>
 
           <div class="settings-group">

@@ -61,7 +61,7 @@ const HEXES = [
   { c: [16.5, 8],   color: [148, 226, 213], pts: [[16.5, 2.5], [21.26, 5.25], [21.26, 10.75], [16.5, 13.5], [11.74, 10.75], [11.74, 5.25]] },
   { c: [11.75, 16.25], color: [249, 226, 175], pts: [[11.75, 10.75], [16.51, 13.5], [16.51, 19], [11.75, 21.75], [6.99, 19], [6.99, 13.5]] },
 ];
-const BG = [24, 24, 37]; // #181825 rounded tile
+const OUTLINE = [24, 24, 37]; // #181825 hexagon outline (background stays transparent)
 
 function pointInPoly(x, y, poly) {
   let inside = false;
@@ -79,26 +79,16 @@ function render(N) {
   const scale = (N * 0.72) / 19.25;     // fit design bbox into ~72% of the icon
   const map = (x, y) => [ (x - 11.75) * scale + N / 2, (y - 12.125) * scale + N / 2 ];
 
-  // Shrink each cell toward its centroid (creates honeycomb gaps), then map.
-  const cells = HEXES.map((h) => ({
+  // Build mapped polygons shrunk toward each cell's centroid. We draw two passes:
+  // a slightly larger `outline` poly (dark) and a smaller `fill` poly (color),
+  // which leaves a dark ring around each hexagon. The canvas itself stays
+  // transparent — there is no background tile.
+  const mk = (shrink) => HEXES.map((h) => ({
     color: h.color,
-    poly: h.pts.map(([x, y]) => {
-      const sx = h.c[0] + (x - h.c[0]) * 0.9;
-      const sy = h.c[1] + (y - h.c[1]) * 0.9;
-      return map(sx, sy);
-    }),
+    poly: h.pts.map(([x, y]) => map(h.c[0] + (x - h.c[0]) * shrink, h.c[1] + (y - h.c[1]) * shrink)),
   }));
-
-  const radius = N * 0.18;
-  const inTile = (x, y) => {
-    const minX = 0, minY = 0, maxX = N, maxY = N;
-    if (x < minX || y < minY || x > maxX || y > maxY) return false;
-    const rx = Math.min(x - minX, maxX - x);
-    const ry = Math.min(y - minY, maxY - y);
-    if (rx >= radius || ry >= radius) return true;
-    const dx = radius - rx, dy = radius - ry;
-    return dx * dx + dy * dy <= radius * radius;
-  };
+  const outline = mk(0.97);
+  const fill = mk(0.84);
 
   for (let py = 0; py < N; py++) {
     for (let px = 0; px < N; px++) {
@@ -107,11 +97,16 @@ function render(N) {
         for (let sj = 0; sj < SS; sj++) {
           const sx = px + (sj + 0.5) / SS;
           const sy = py + (si + 0.5) / SS;
-          if (!inTile(sx, sy)) continue; // transparent outside rounded tile
-          let col = BG;
-          for (const cell of cells) {
+          let col = null;
+          for (const cell of fill) {
             if (pointInPoly(sx, sy, cell.poly)) { col = cell.color; break; }
           }
+          if (!col) {
+            for (const cell of outline) {
+              if (pointInPoly(sx, sy, cell.poly)) { col = OUTLINE; break; }
+            }
+          }
+          if (!col) continue; // transparent
           r += col[0]; g += col[1]; b += col[2]; a += 255;
         }
       }

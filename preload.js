@@ -77,6 +77,17 @@ contextBridge.exposeInMainWorld('api', {
     reveal: (cwd, rel) => ipcRenderer.invoke('files:reveal', { cwd, rel }),
   },
 
+  // Portable build (only meaningful when the hive points at the Hivemind source).
+  build: {
+    isHivemind: (cwd) => ipcRenderer.invoke('build:isHivemind', { cwd }),
+    portable: (cwd) => ipcRenderer.invoke('build:portable', { cwd }),
+  },
+  onBuildProgress: (cb) => {
+    const h = (_e, payload) => cb(payload);
+    ipcRenderer.on('build:progress', h);
+    return () => ipcRenderer.removeListener('build:progress', h);
+  },
+
   // Notifications
   notify: (payload) => ipcRenderer.send('notify', payload),
   onFocusPane: (cb) => {

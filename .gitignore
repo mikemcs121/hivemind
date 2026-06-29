@@ -5,6 +5,9 @@ node_modules/
 dist/
 out/
 
+# Downloaded Whisper models (reproduced via `npm run fetch-model`, bundled at build time)
+models/
+
 # Logs
 *.log
 npm-debug.log*

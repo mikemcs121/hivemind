@@ -270,8 +270,68 @@ function liveBroadcastPanes(boardId) {
 function broadcastRaw(boardId, data) {
   for (const p of liveBroadcastPanes(boardId)) {
     window.api.writePty(p.id, data);
+    feedCaptionInput(p, data);
     markActivity(p, '');
   }
+}
+
+// ---------------------------------------------------------------------------
+// Thread captions
+//
+// To label each thread with what it's working on, we watch the raw keystrokes
+// flowing into a pane, rebuild the current input line, and when the user hits
+// Enter we use that line as the thread's caption. It's a heuristic — terminal
+// input has no clean "prompt submitted" event — but the latest real prompt wins,
+// so the header stays a useful summary of the thread's current task.
+// ---------------------------------------------------------------------------
+function feedCaptionInput(pane, data) {
+  if (!pane || !data) return;
+  let buf = pane.capBuf || '';
+  for (let i = 0; i < data.length; i++) {
+    const ch = data[i];
+    const code = data.charCodeAt(i);
+    if (ch === '\r' || ch === '\n') {
+      commitCaption(pane, buf);
+      buf = '';
+    } else if (code === 0x1b) {
+      // Skip an escape sequence (arrow keys, history nav…) so it can't pollute
+      // the line. Consume the CSI/SS3 introducer and its final byte.
+      if (data[i + 1] === '[' || data[i + 1] === 'O') {
+        i += 1;
+        while (i + 1 < data.length) {
+          const c = data.charCodeAt(i + 1);
+          i += 1;
+          if (c >= 0x40 && c <= 0x7e) break;
+        }
+      }
+    } else if (code === 0x7f || code === 0x08) {
+      buf = buf.slice(0, -1); // backspace / delete
+    } else if (code === 0x03 || code === 0x15) {
+      buf = ''; // Ctrl-C / Ctrl-U abandon the current line
+    } else if (code >= 0x20) {
+      buf += ch;
+    }
+  }
+  pane.capBuf = buf;
+}
+
+function commitCaption(pane, line) {
+  const text = (line || '').trim();
+  if (!text) return;                 // a bare Enter keeps the existing caption
+  if (text.startsWith('/')) return;  // slash commands are controls, not tasks
+  setPaneCaption(pane, text);
+}
+
+// Set a thread's caption (truncated for display, full text on hover).
+function setPaneCaption(pane, text, { persist = true } = {}) {
+  if (!pane) return;
+  const full = String(text || '').replace(/\s+/g, ' ').trim();
+  pane.captionText = full;
+  if (pane.caption) {
+    pane.caption.textContent = full.length > 80 ? full.slice(0, 79) + '…' : full;
+    pane.caption.title = full;
+  }
+  if (persist) persistLayout(pane.board.id);
 }
 
 // Send keystrokes/text to a pane. With mirror-typing on, input from the focused
@@ -281,13 +341,16 @@ function broadcastRaw(boardId, data) {
 function sendToPane(pane, data) {
   if (broadcastTyping && pane === focusedPane) {
     window.api.writePty(pane.id, data);
+    feedCaptionInput(pane, data);
     for (const p of liveBroadcastPanes(pane.board.id)) {
       if (p === pane) continue;
       window.api.writePty(p.id, data);
+      feedCaptionInput(p, data);
       markActivity(p, '');
     }
   } else {
     window.api.writePty(pane.id, data);
+    feedCaptionInput(pane, data);
   }
   markActivity(pane, ''); // typing means this pane is active again
 }
@@ -336,6 +399,9 @@ const emptyState = $('empty-state');
 const boardTitle = $('board-title');
 const boardMeta = $('board-meta');
 const addTermBtn = $('add-term');
+const buildBtn = $('build-portable');
+const BUILD_BTN_TEXT = buildBtn ? buildBtn.textContent : '';
+const BUILD_BTN_TITLE = buildBtn ? buildBtn.title : '';
 
 // ---------------------------------------------------------------------------
 // Persistence helpers
@@ -359,6 +425,7 @@ function serializeLayout(boardId) {
     panes: col.panes.filter((p) => !p.disposed).map((p) => ({
       name: p.name, model: p.model, fontSize: p.fontSize,
       flex: p.flex, bcInclude: p.bcInclude !== false,
+      caption: p.captionText || '',
     })),
   })).filter((c) => c.panes.length);
   return cols.length ? cols : null;
@@ -384,7 +451,8 @@ function rebuildFromLayout(board) {
     for (const pd of (col.panes || [])) {
       const pane = createPane(board, colObj, {
         name: pd.name, model: pd.model, fontSize: pd.fontSize,
-        flex: pd.flex, bcInclude: pd.bcInclude, resume: !!board.resumeOnStart,
+        flex: pd.flex, bcInclude: pd.bcInclude, caption: pd.caption,
+        resume: !!board.resumeOnStart,
       });
       colObj.panes.push(pane);
       const m = /(\d+)\s*$/.exec(pd.name || '');
@@ -504,6 +572,9 @@ function selectBoard(id) {
 
   // Watch this board's directory so the Git/Files panels can auto-refresh.
   window.api.setWatch(board.dir || null);
+
+  // Show the "Build Portable" button only when this hive is the Hivemind source.
+  updateBuildButton(board);
 
   // Build the grid lazily the first time a board is opened.
   if (!grids.has(id)) {
@@ -697,6 +768,16 @@ function createPane(board, col, opts = {}) {
   title.textContent = startName;
   title.title = 'Double-click to rename this thread';
 
+  // Caption — a short summary of the last prompt sent to this thread, so the
+  // header tells you at a glance what the thread is working on.
+  const caption = document.createElement('span');
+  caption.className = 'caption';
+
+  // Name + caption share the left of the header; the caption ellipsizes.
+  const titleWrap = document.createElement('span');
+  titleWrap.className = 'title-wrap';
+  titleWrap.append(title, caption);
+
   // Include this thread in broadcast / mirror-typing (on by default).
   const bcBtn = document.createElement('button');
   bcBtn.className = 'bc-include-btn';
@@ -729,7 +810,7 @@ function createPane(board, col, opts = {}) {
   const closeBtn = document.createElement('button');
   closeBtn.textContent = '✕';
   closeBtn.title = 'Close thread';
-  header.append(dot, title, statusEl, bcBtn, modelSelect, fontDownBtn, fontUpBtn, zoomBtn, closeBtn);
+  header.append(dot, titleWrap, statusEl, bcBtn, modelSelect, fontDownBtn, fontUpBtn, zoomBtn, closeBtn);
 
   const termWrap = document.createElement('div');
   termWrap.className = 'pane-term';
@@ -772,14 +853,15 @@ function createPane(board, col, opts = {}) {
   term.open(termWrap);
 
   const pane = {
-    id, el, term, fitAddon, searchAddon, dot, statusEl, modelSelect, title,
+    id, el, term, fitAddon, searchAddon, dot, statusEl, modelSelect, title, caption,
     bcBtn, findBar, findInput, flex: opts.flex || 1, col, board, disposed: false,
     name: startName, state: null, buf: '', idleTimer: null,
-    fontSize: startFont, model: startModel,
+    fontSize: startFont, model: startModel, captionText: '', capBuf: '',
     bcInclude: opts.bcInclude !== false, errored: false, hintShown: false,
   };
 
   applyBcIncludeBtn(pane);
+  if (opts.caption) setPaneCaption(pane, opts.caption, { persist: false });
 
   // Wire IO
   term.onData((data) => sendToPane(pane, data));
@@ -1131,6 +1213,7 @@ $('modal-save').onclick = async () => {
     if (editingBoard.id === activeBoardId) {
       boardTitle.textContent = editingBoard.name;
       boardMeta.textContent = editingBoard.dir || '';
+      updateBuildButton(editingBoard); // directory may have changed
     }
   }
   closeModal();
@@ -1170,6 +1253,7 @@ function showEmpty() {
   if (typeof voiceToggleBtn !== 'undefined' && voiceToggleBtn) voiceToggleBtn.disabled = true;
   if (typeof stopVoice === 'function') stopVoice();
   window.api.setWatch(null); // nothing active to watch
+  if (buildBtn) buildBtn.classList.add('hidden');
   boardTitle.textContent = 'No hive selected';
   boardMeta.textContent = '';
   if (typeof gitToggle !== 'undefined' && gitToggle) {
@@ -1340,6 +1424,88 @@ function activeDir() { const b = activeBoard(); return b && b.dir ? b.dir : null
 const baseName = (p) => p.replace(/\/$/, '').split('/').pop();
 const dirName = (p) => { const i = p.replace(/\/$/, '').lastIndexOf('/'); return i >= 0 ? p.slice(0, i) : ''; };
 
+// ---------------------------------------------------------------------------
+// "Build Portable" — only shown when the active hive points at the Hivemind
+// source checkout. Runs electron-builder's portable target, streams progress
+// into the button (stage label + live elapsed timer), then reveals the dist
+// folder and notifies on finish.
+// ---------------------------------------------------------------------------
+let buildCheckToken = 0; // ignore stale async checks when boards switch quickly
+
+async function updateBuildButton(board) {
+  if (!buildBtn) return;
+  buildBtn.classList.add('hidden');
+  const dir = board && board.dir;
+  if (!dir) return;
+  const token = ++buildCheckToken;
+  let isHivemind = false;
+  try { isHivemind = await window.api.build.isHivemind(dir); } catch (_) { /* hide */ }
+  if (token !== buildCheckToken) return; // a different board was selected meanwhile
+  buildBtn.classList.toggle('hidden', !isHivemind);
+}
+
+// electron-builder doesn't emit a real percentage, so map its log lines to a
+// short, friendly stage name. We surface the stage rather than a misleading
+// number; the always-incrementing elapsed timer signals liveness.
+function buildStageLabel(line) {
+  const l = line.toLowerCase();
+  if (l.includes('downloading')) return 'Downloading Electron';
+  if (l.includes('rebuilding') || l.includes('install')) return 'Preparing';
+  if (l.includes('packaging')) return 'Packaging';
+  if (l.includes('signing') || l.includes('signtool')) return 'Signing';
+  if (l.includes('block map')) return 'Finalizing';
+  if (l.includes('target=portable') || l.includes('building')) return 'Compressing';
+  return null;
+}
+
+if (buildBtn) {
+  let buildStage = 'Building';
+  let buildStart = 0;
+  let buildTimer = null;
+
+  const paintBuildBtn = () => {
+    const secs = Math.max(0, Math.round((Date.now() - buildStart) / 1000));
+    const mm = Math.floor(secs / 60);
+    const ss = String(secs % 60).padStart(2, '0');
+    buildBtn.textContent = `⏳ ${buildStage}… ${mm}:${ss}`;
+  };
+
+  buildBtn.onclick = async () => {
+    const dir = activeDir();
+    if (!dir || buildBtn.dataset.busy) return;
+    buildBtn.dataset.busy = '1';
+    buildBtn.disabled = true;
+    buildBtn.classList.add('building');
+    buildStage = 'Building';
+    buildStart = Date.now();
+    paintBuildBtn();
+    buildTimer = setInterval(paintBuildBtn, 1000);
+    const res = await window.api.build.portable(dir);
+    clearInterval(buildTimer);
+    buildTimer = null;
+    delete buildBtn.dataset.busy;
+    buildBtn.disabled = false;
+    buildBtn.classList.remove('building');
+    buildBtn.textContent = BUILD_BTN_TEXT;
+    buildBtn.title = BUILD_BTN_TITLE;
+    if (res && res.ok) {
+      window.api.notify({ title: 'Hivemind', body: 'Portable build finished — opening the dist folder.' });
+      window.api.files.reveal(dir, 'dist');
+    } else {
+      window.api.notify({ title: 'Hivemind', body: 'Portable build failed: ' + ((res && res.message) || 'see terminal output') });
+    }
+  };
+
+  if (window.api.onBuildProgress) {
+    window.api.onBuildProgress(({ line }) => {
+      if (!buildBtn.dataset.busy || !line) return;
+      buildBtn.title = line.slice(0, 200); // full line still available on hover
+      const stage = buildStageLabel(line);
+      if (stage) { buildStage = stage; paintBuildBtn(); }
+    });
+  }
+}
+
 function setGitMsg(text, kind) {
   if (!text) { gitMsgbar.classList.add('hidden'); gitMsgbar.textContent = ''; return; }
   gitMsgbar.textContent = text;
@@ -1472,23 +1638,9 @@ function renderBranchBar(st) {
   }
   line.append(branchBtn, counts);
 
-  const actions = document.createElement('div');
-  actions.className = 'git-remote-actions';
-  // Pull is the only remote button left here — Sync to GitHub (the primary
-  // button below) covers staging, committing, pushing, and first-time publish.
-  const pullBtn = mkBtn('Pull ↓', () => gitRun('Pulling', (d) => window.api.git.pull(d), { okMsg: 'Pulled.' }));
-  if (!st.hasRemote) pullBtn.disabled = true;
-  actions.append(pullBtn);
-
-  // Discard everything local and match GitHub. Only meaningful once connected.
-  if (st.hasRemote) {
-    const revertBtn = mkBtn('Revert to GitHub', doRevertToRemote);
-    revertBtn.className = 'git-revert';
-    revertBtn.title = 'Discard all local changes and reset this branch to what is on GitHub';
-    actions.appendChild(revertBtn);
-  }
-
-  bar.append(line, actions);
+  // Remote actions (Pull / Push / Revert) live in the commit box below, next to
+  // the message they act on. The branch bar is just the branch picker + counts.
+  bar.append(line);
   return bar;
 }
 
@@ -1539,35 +1691,60 @@ function renderCommitBox(st) {
 
   const ta = document.createElement('textarea');
   ta.id = 'git-msg';
-  ta.placeholder = 'Commit message (Ctrl+Enter to sync to GitHub)';
+  ta.placeholder = 'Commit message (Ctrl+Enter to push)';
   ta.value = gitDraftMsg;
   ta.oninput = () => { gitDraftMsg = ta.value; };
   ta.addEventListener('keydown', (e) => {
-    if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') { e.preventDefault(); doSync(); }
+    if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') { e.preventDefault(); doPush(); }
   });
 
-  // One button does the whole job: stage everything, commit (auto-drafting a
-  // message if the box is empty), then push — publishing to GitHub the first
-  // time. This is the button to use to "make my other machine see this copy."
-  const sync = document.createElement('div');
-  sync.className = 'git-sync-row';
-  const syncBtn = mkBtn('⟳ Sync to GitHub', doSync);
-  syncBtn.className = 'primary git-sync-btn';
-  syncBtn.title = st.hasRemote
-    ? 'Stage all changes, commit, and push to GitHub in one step'
-    : 'Connect this repository to GitHub, then push everything';
-  sync.appendChild(syncBtn);
+  // Three remote actions, side by side:
+  //   Pull  — bring GitHub's commits down into this branch.
+  //   Push  — stage everything, commit (auto-drafting a message if the box is
+  //           empty), then push. Publishes to GitHub the first time.
+  // Revert (below, full width) discards all local work and matches GitHub.
+  const actions = document.createElement('div');
+  actions.className = 'git-actions';
 
-  wrap.append(msgHead, ta, sync);
+  const pullBtn = mkBtn('Pull ↓', doPull);
+  pullBtn.className = 'git-pull';
+  pullBtn.title = 'Bring down commits made on GitHub and merge them into this branch';
+  if (!st.hasRemote) pullBtn.disabled = true;
+
+  const pushBtn = mkBtn('Push ↑', doPush);
+  pushBtn.className = 'primary git-push';
+  pushBtn.title = st.hasRemote
+    ? 'Commit your changes and push them up to GitHub'
+    : 'Connect this repository to GitHub, then push everything';
+
+  actions.append(pullBtn, pushBtn);
+  wrap.append(msgHead, ta, actions);
+
+  // Discard everything local and match GitHub. Only meaningful once connected.
+  if (st.hasRemote) {
+    const revertBtn = mkBtn('Revert to GitHub', doRevertToRemote);
+    revertBtn.className = 'git-revert-btn';
+    revertBtn.title = 'Discard all local changes and reset this branch to what is on GitHub';
+    wrap.appendChild(revertBtn);
+  }
+
   return wrap;
 }
 
-// One-click sync: stage → commit (auto-message if none) → push, publishing the
-// repo to GitHub if it isn't connected yet. Whatever it takes so the same work
-// shows up when you pull on another machine.
-async function doSync() {
+// Pull GitHub's commits down into the current branch.
+function doPull() {
   const st = lastStatus;
-  if (!st || !st.ok) { setGitMsg('No repository to sync here.', 'err'); return; }
+  if (!st || !st.hasRemote) { setGitMsg('This repository is not connected to GitHub yet.', 'err'); return; }
+  gitRun('Pulling from GitHub', (d) => window.api.git.pull(d), { okMsg: 'Pulled the latest from GitHub.' });
+}
+
+// Commit, then push. Stages everything and commits any working-tree changes
+// (auto-drafting a message if the box is empty), then pushes — publishing the
+// repo to GitHub if it isn't connected yet. Does NOT pull; if the push is
+// rejected because the branch is behind, use Pull first.
+async function doPush() {
+  const st = lastStatus;
+  if (!st || !st.ok) { setGitMsg('No repository here.', 'err'); return; }
 
   // Not connected to GitHub yet → run the publish wizard (create or link a repo;
   // it pushes the current branch as part of finishing).
@@ -1580,7 +1757,7 @@ async function doSync() {
   if (hasChanges) {
     let msg = gitDraftMsg.trim();
     if (!msg) {
-      // No typed message — draft one so the single click needs no extra input.
+      // No typed message — draft one so the push needs no extra input.
       setGitMsg('Drafting a commit message…');
       try {
         const r = await window.api.git.aiCommitMessage(dir);
@@ -1600,9 +1777,9 @@ async function doSync() {
   // 2) Push (setting the upstream the first time the branch is published).
   const setUpstream = !st.upstream;
   await gitRun(
-    'Syncing to GitHub',
+    'Pushing to GitHub',
     (d) => window.api.git.push(d, st.branch, setUpstream),
-    { okMsg: 'Synced to GitHub. Pull on your other machine to see this copy.' },
+    { okMsg: 'Pushed your changes to GitHub.' },
   );
 }
 
@@ -2212,15 +2389,16 @@ function mkMini(text, title, onclick) { const b = document.createElement('button
 // ---------------------------------------------------------------------------
 // Voice typing
 //
-// Dictate straight into the focused thread. The browser's Web Speech API turns
-// speech into text; each *final* phrase is run through a user-editable
-// dictionary (to fix words it keeps mishearing) and then written to the target
-// pane's PTY — so it lands at the terminal cursor exactly like typing. The ~ key
-// toggles listening from anywhere in the app. Recognition is kept alive across
-// the API's idle-stops by restarting it, so a session stays "always listening"
-// until you toggle it off.
+// Dictate straight into the focused thread. Speech is transcribed locally and
+// offline by OpenAI Whisper running in a worker (see voice-worker.js) — the
+// browser's Web Speech API is unusable in Electron (it relies on a Google
+// speech key that ships only in Chrome). We capture the mic, detect utterance
+// boundaries with a simple energy gate, and hand each spoken segment to the
+// worker. Whatever text comes back is run through a user-editable dictionary
+// (to fix words it keeps mishearing) and then written to the target pane's PTY
+// — so it lands at the terminal cursor exactly like typing. The ~ key toggles
+// listening from anywhere in the app.
 // ---------------------------------------------------------------------------
-const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
 
 // -- Persisted settings + dictionary ----------------------------------------
 const VOICE_DEFAULT_DICT = [
@@ -2243,7 +2421,6 @@ function loadVoiceDict() {
 }
 
 let voiceDict = loadVoiceDict();
-let voiceLang = localStorage.getItem('hm.voiceLang') || 'en-US';
 let voiceHotkeyEnabled = localStorage.getItem('hm.voiceHotkey') !== '0';   // default on
 let voiceAutoEnter = localStorage.getItem('hm.voiceAutoEnter') === '1';    // default off
 let voiceAutoSpace = localStorage.getItem('hm.voiceAutoSpace') !== '0';    // default on
@@ -2255,15 +2432,38 @@ function saveVoiceDict() {
 // Phrases that, said on their own, submit the line instead of being typed.
 const VOICE_ENTER_RE = /^\s*(new ?line|press enter|hit enter|submit|send it)\s*[.!?]?\s*$/i;
 
-// -- Recognition state -------------------------------------------------------
-let recognition = null;
+// -- Engine state ------------------------------------------------------------
 let voiceActive = false;        // the user wants to be listening
-let voiceStarting = false;      // a start() is in flight
-let voiceSessionStarted = false;// onstart fired for the current session
-let voiceNoStartStreak = 0;     // consecutive sessions that ended before starting
-let voiceErrorCount = 0;        // consecutive hard errors
-let voiceRestartTimer = null;
 let voiceTargetPane = null;     // pane that receives this dictation session
+
+// Whisper worker + its load lifecycle. The worker is created lazily on first
+// use and kept alive after that, so the model only loads once per app run.
+let sttWorker = null;
+let sttReady = false;           // model finished loading
+let sttLoadPromise = null;      // in-flight load(), resolves on 'ready'
+let sttSegId = 0;               // ids correlate transcribe requests/results
+let sttInFlight = 0;            // segments currently being transcribed
+
+// Mic capture graph (built on start, torn down on stop).
+let micStream = null;
+let audioCtx = null;
+let micSource = null;
+let micProcessor = null;
+let micSink = null;
+
+// Energy-gate VAD. We accumulate audio while you're speaking and flush a
+// segment to the worker once you pause (or the segment gets long). 16 kHz mono
+// is what Whisper wants, so we run the AudioContext at that rate directly.
+const STT_SAMPLE_RATE = 16000;
+const VAD_RMS_THRESHOLD = 0.012;   // above this a frame counts as speech
+const VAD_SILENCE_MS = 700;        // trailing quiet that ends an utterance
+const VAD_MIN_SPEECH_MS = 300;     // ignore blips shorter than this
+const VAD_MAX_SEGMENT_MS = 15000;  // force a flush so long talk still lands
+let vadFrames = [];                // Float32Array frames of the current segment
+let vadSpeechMs = 0;
+let vadSilenceMs = 0;
+let vadInSpeech = false;
+let vadPreroll = null;             // last quiet frame, kept to catch word onsets
 
 const voiceToggleBtn = $('voice-toggle');
 const VOICE_BTN_TITLE = voiceToggleBtn ? voiceToggleBtn.title : '';
@@ -2319,114 +2519,210 @@ function commitVoiceText(raw) {
   updateVoiceHudTarget();
 }
 
-// -- Engine ------------------------------------------------------------------
-function ensureRecognition() {
-  if (recognition || !SpeechRecognition) return recognition;
-  const rec = new SpeechRecognition();
-  rec.continuous = true;
-  rec.interimResults = true;
-  rec.maxAlternatives = 1;
-  rec.lang = voiceLang;
+// -- Whisper worker ----------------------------------------------------------
+// The model lives in a worker so transcription never blocks the UI (or the
+// terminals). We boot it from a tiny blob module: a file:// page can't spawn a
+// cross-origin hm:// worker directly, but it can spawn a same-origin blob
+// worker, and that blob can `import` the real worker over hm:// (CORS-allowed
+// by the protocol handler in main.js).
+function ensureSttWorker() {
+  if (sttLoadPromise) return sttLoadPromise;
 
-  rec.onstart = () => {
-    voiceStarting = false;
-    voiceSessionStarted = true;
-    voiceNoStartStreak = 0;
-    voiceErrorCount = 0;
-    clearVoiceError();
-  };
-
-  rec.onresult = (event) => {
-    let interim = '';
-    for (let i = event.resultIndex; i < event.results.length; i++) {
-      const res = event.results[i];
-      const phrase = (res[0] && res[0].transcript) || '';
-      if (res.isFinal) commitVoiceText(phrase);
-      else interim += phrase;
-    }
-    setVoiceHudText(interim);
-  };
-
-  rec.onerror = (event) => {
-    const err = event.error;
-    if (err === 'not-allowed' || err === 'service-not-allowed') {
-      stopVoice();
-      flagVoiceError('Microphone access was blocked. Allow the mic for Hivemind, then toggle voice again.');
-    } else if (err === 'audio-capture') {
-      stopVoice();
-      flagVoiceError('No microphone was found.');
-    } else if (err === 'no-speech' || err === 'aborted' || err === 'network') {
-      /* transient — onend restarts us if still active */
-    } else {
-      voiceErrorCount++;
-    }
-  };
-
-  rec.onend = () => {
-    voiceStarting = false;
-    setVoiceHudText('');
-    if (!voiceActive) return;
-    if (voiceErrorCount > 5) {
-      stopVoice();
-      flagVoiceError('Voice recognition kept failing, so it was stopped.');
+  sttLoadPromise = new Promise((resolve, reject) => {
+    let worker;
+    try {
+      const bootstrap = "import 'hm://app/voice-worker.js';";
+      const url = URL.createObjectURL(new Blob([bootstrap], { type: 'text/javascript' }));
+      worker = new Worker(url, { type: 'module' });
+    } catch (err) {
+      sttLoadPromise = null;
+      reject(err);
       return;
     }
-    // The session ended without ever starting — likely no engine / no mic.
-    if (!voiceSessionStarted) {
-      voiceNoStartStreak++;
-      if (voiceNoStartStreak > 5) {
-        stopVoice();
-        flagVoiceError('Could not start the microphone. Check mic access and that a speech engine is available in this build.');
-        return;
-      }
-    }
-    voiceSessionStarted = false;
-    // Web Speech stops itself after a pause; restart to stay continuous.
-    voiceRestartTimer = setTimeout(startRecognition, 300);
-  };
 
-  recognition = rec;
-  return rec;
+    worker.onmessage = (ev) => {
+      const msg = ev.data || {};
+      if (msg.type === 'ready') {
+        sttReady = true;
+        clearVoiceError();
+        resolve();
+      } else if (msg.type === 'progress') {
+        // Surface the one-time model download/warm-up so the HUD isn't silent.
+        if (!sttReady && msg.data && msg.data.status === 'progress' && msg.data.file) {
+          const pct = Math.round(msg.data.progress || 0);
+          setVoiceHudText('Loading speech model… ' + pct + '%');
+        }
+      } else if (msg.type === 'error') {
+        sttLoadPromise = null;
+        reject(new Error(msg.message || 'speech model failed to load'));
+      } else if (msg.type === 'result') {
+        sttInFlight = Math.max(0, sttInFlight - 1);
+        console.log('[voice] result text=' + JSON.stringify(msg.text || '') +
+          ' pane=' + (currentVoicePane() ? (currentVoicePane().name || currentVoicePane().id) : 'NONE') +
+          (msg.error ? ' error=' + JSON.stringify(msg.error) : ''));
+        // A per-utterance inference failure comes back as an empty result with
+        // an error string. Surface it instead of silently typing nothing — an
+        // engine that fails every segment would otherwise look "stuck listening".
+        if (msg.error) flagVoiceError(voiceErrMessage(new Error(msg.error)));
+        if (msg.text) commitVoiceText(msg.text);
+        renderVoiceListening();
+      }
+    };
+    worker.onerror = (e) => {
+      if (!sttReady) { sttLoadPromise = null; reject(new Error(e.message || 'voice worker crashed')); }
+    };
+
+    sttWorker = worker;
+    worker.postMessage({ type: 'load' });
+  });
+
+  return sttLoadPromise;
 }
 
-function startRecognition() {
-  const rec = ensureRecognition();
-  if (!rec || voiceStarting) return;
-  rec.lang = voiceLang;
-  voiceStarting = true;
-  voiceSessionStarted = false;
-  try {
-    rec.start();
-  } catch (_) {
-    // start() throws if a session is still winding down — onend will retry.
-    voiceStarting = false;
+// -- Mic capture + energy-gate VAD ------------------------------------------
+function resetVad() {
+  vadFrames = [];
+  vadSpeechMs = 0;
+  vadSilenceMs = 0;
+  vadInSpeech = false;
+  vadPreroll = null;
+}
+
+function rms(frame) {
+  let sum = 0;
+  for (let i = 0; i < frame.length; i++) sum += frame[i] * frame[i];
+  return Math.sqrt(sum / frame.length);
+}
+
+// Hand the current utterance to the worker and start a fresh segment.
+function flushSegment() {
+  const frames = vadFrames;
+  const speechMs = vadSpeechMs;
+  resetVad();
+  if (speechMs < VAD_MIN_SPEECH_MS || !frames.length) return;
+
+  let total = 0;
+  for (const f of frames) total += f.length;
+  const audio = new Float32Array(total);
+  let off = 0;
+  for (const f of frames) { audio.set(f, off); off += f.length; }
+
+  sttInFlight++;
+  renderVoiceListening();
+  // Transfer the backing buffer so we don't copy the audio across threads.
+  sttWorker.postMessage({ type: 'transcribe', id: ++sttSegId, audio }, [audio.buffer]);
+}
+
+function onAudioFrame(ev) {
+  if (!voiceActive) return;
+  const input = ev.inputBuffer.getChannelData(0);
+  const frame = new Float32Array(input);          // copy; the buffer is reused
+  const frameMs = (frame.length / STT_SAMPLE_RATE) * 1000;
+  const speaking = rms(frame) >= VAD_RMS_THRESHOLD;
+
+  if (speaking) {
+    if (!vadInSpeech) {
+      vadInSpeech = true;
+      if (vadPreroll) vadFrames.push(vadPreroll);  // recover the word's onset
+    }
+    vadFrames.push(frame);
+    vadSpeechMs += frameMs;
+    vadSilenceMs = 0;
+  } else if (vadInSpeech) {
+    vadFrames.push(frame);                          // keep trailing quiet for context
+    vadSilenceMs += frameMs;
+  } else {
+    vadPreroll = frame;                             // not speaking yet; remember last frame
+  }
+
+  const segMs = vadSpeechMs + vadSilenceMs;
+  if (vadInSpeech && (vadSilenceMs >= VAD_SILENCE_MS || segMs >= VAD_MAX_SEGMENT_MS)) {
+    flushSegment();
   }
 }
 
+async function startCapture() {
+  micStream = await navigator.mediaDevices.getUserMedia({
+    audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+  });
+  audioCtx = new AudioContext({ sampleRate: STT_SAMPLE_RATE });
+  if (audioCtx.state === 'suspended') { try { await audioCtx.resume(); } catch (_) {} }
+  micSource = audioCtx.createMediaStreamSource(micStream);
+  // ScriptProcessor is deprecated but dependable and needs no extra module
+  // file; 4096 frames at 16 kHz ≈ 256 ms per VAD tick.
+  micProcessor = audioCtx.createScriptProcessor(4096, 1, 1);
+  micProcessor.onaudioprocess = onAudioFrame;
+  // A muted sink keeps the graph pulling audio without playing the mic back.
+  micSink = audioCtx.createGain();
+  micSink.gain.value = 0;
+  micSource.connect(micProcessor);
+  micProcessor.connect(micSink);
+  micSink.connect(audioCtx.destination);
+  resetVad();
+}
+
+function stopCapture() {
+  if (micProcessor) { try { micProcessor.disconnect(); micProcessor.onaudioprocess = null; } catch (_) {} }
+  if (micSource) { try { micSource.disconnect(); } catch (_) {} }
+  if (micSink) { try { micSink.disconnect(); } catch (_) {} }
+  if (micStream) { try { micStream.getTracks().forEach((t) => t.stop()); } catch (_) {} }
+  if (audioCtx) { try { audioCtx.close(); } catch (_) {} }
+  micProcessor = micSource = micSink = micStream = audioCtx = null;
+  resetVad();
+}
+
 // -- Public controls ---------------------------------------------------------
-function startVoice() {
+async function startVoice() {
   if (voiceActive) return;
-  if (!SpeechRecognition) { flagVoiceError('This build has no speech recognition engine.'); return; }
   const pane = focusedPane && !focusedPane.disposed && focusedPane.state !== 'dead' ? focusedPane : null;
   if (!pane) { flagVoiceError('Open or click a thread first, then start voice typing.'); return; }
   voiceTargetPane = pane;
   voiceActive = true;
-  voiceErrorCount = 0;
-  voiceNoStartStreak = 0;
+  sttInFlight = 0;
   clearVoiceError();
   renderVoiceState();
-  startRecognition();
+  setVoiceHudText('Loading speech model…');
+  try {
+    await ensureSttWorker();
+    if (!voiceActive) return;                       // toggled off while loading
+    await startCapture();
+    renderVoiceListening();
+  } catch (err) {
+    flagVoiceError(voiceErrMessage(err));
+    stopVoice();
+  }
 }
 
 function stopVoice() {
   voiceActive = false;
-  clearTimeout(voiceRestartTimer);
-  if (recognition) { try { recognition.stop(); } catch (_) { /* not running */ } }
+  stopCapture();
   setVoiceHudText('');
   renderVoiceState();
 }
 
 function toggleVoice() { if (voiceActive) stopVoice(); else startVoice(); }
+
+// Turn a worker/capture failure into a sentence that points at the fix.
+function voiceErrMessage(err) {
+  // Include both name and message: DOMException mic errors carry the useful
+  // part in .name (NotAllowedError, …), while model/worker failures carry it in
+  // .message. Using only .name would mask real messages as a bare "Error".
+  const m = String((err && [err.name, err.message].filter(Boolean).join(': ')) || err || '');
+  if (/NotAllowedError|Permission/i.test(m)) {
+    return 'Microphone access was blocked. Allow the mic for Hivemind, then toggle voice again.';
+  }
+  if (/NotFoundError|NotReadable|audio/i.test(m)) {
+    return 'No usable microphone was found.';
+  }
+  // An ONNX-runtime backend failure (e.g. WebGPU adapter missing) — the model
+  // files are present; the engine just couldn't start. Don't send the user to
+  // re-download the model.
+  if (/backend|adapter|webgpu|wasm|gpu/i.test(m)) {
+    return 'Speech engine failed to start (' + m + '). Try restarting Hivemind; if it persists this is a backend issue, not a missing model.';
+  }
+  // Most often: the model files aren't bundled yet.
+  return 'Speech model could not load. Run "npm run fetch-model" to download it, then restart Hivemind. (' + m + ')';
+}
 
 // -- HUD / button state ------------------------------------------------------
 function renderVoiceState() {
@@ -2441,6 +2737,14 @@ function updateVoiceHudTarget() {
   voiceHudTarget.textContent = pane ? '→ ' + (pane.name || 'thread') : '→ (no thread)';
 }
 function setVoiceHudText(t) { if (voiceHudText) voiceHudText.textContent = t || ''; }
+
+// Whisper transcribes a whole utterance at once, so there's no live word-by-word
+// interim text; instead the HUD shows whether we're listening or working.
+function renderVoiceListening() {
+  if (!voiceActive) return;
+  setVoiceHudText(sttInFlight > 0 ? 'Transcribing…' : 'Listening…');
+  updateVoiceHudTarget();
+}
 
 function flagVoiceError(msg) {
   if (voiceToggleBtn) { voiceToggleBtn.classList.add('error'); voiceToggleBtn.title = msg; }
@@ -2474,7 +2778,6 @@ document.addEventListener('keydown', (e) => {
 // -- Settings + dictionary modal --------------------------------------------
 const settingsBackdrop = $('settings-backdrop');
 const voiceModalMsg = $('voice-modal-msg');
-const vLang = $('voice-lang');
 const vHotkey = $('voice-hotkey-enabled');
 const vAutoEnter = $('voice-auto-enter');
 const vAutoSpace = $('voice-auto-space');
@@ -2538,16 +2841,11 @@ function setSettingsTab(tab) {
 
 // Populate the voice tab's fields from the persisted settings.
 function syncVoiceFields() {
-  vLang.value = voiceLang;
   vHotkey.checked = voiceHotkeyEnabled;
   vAutoEnter.checked = voiceAutoEnter;
   vAutoSpace.checked = voiceAutoSpace;
   renderVoiceDict();
-  if (!SpeechRecognition) {
-    setVoiceModalMsg('No speech recognition engine is available in this build, so dictation can’t start. Your dictionary and settings still save.', 'err');
-  } else {
-    setVoiceModalMsg('');
-  }
+  setVoiceModalMsg('');
 }
 
 // Populate the general tab's fields from the current defaults.
@@ -2626,11 +2924,6 @@ if (setNotify) setNotify.addEventListener('change', () => {
 $('voice-dict-add').onclick = addVoiceDictEntry;
 vFrom.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); vTo.focus(); } });
 vTo.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); addVoiceDictEntry(); } });
-vLang.addEventListener('change', () => {
-  voiceLang = vLang.value.trim() || 'en-US';
-  localStorage.setItem('hm.voiceLang', voiceLang);
-  if (recognition) recognition.lang = voiceLang;
-});
 vHotkey.addEventListener('change', () => {
   voiceHotkeyEnabled = vHotkey.checked;
   localStorage.setItem('hm.voiceHotkey', voiceHotkeyEnabled ? '1' : '0');

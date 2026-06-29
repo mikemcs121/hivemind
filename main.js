@@ -1,12 +1,78 @@
 'use strict';
 
-const { app, BrowserWindow, Menu, MenuItem, ipcMain, dialog, Notification, clipboard } = require('electron');
+const { app, BrowserWindow, Menu, MenuItem, ipcMain, dialog, Notification, clipboard, protocol, net } = require('electron');
 const path = require('path');
+const { pathToFileURL } = require('url');
 const fs = require('fs');
 const os = require('os');
+
+// Expose WebGPU to the renderer/worker so the speech-to-text model can run on
+// the GPU (far faster than single-thread WASM, and fast enough to afford the
+// larger, more accurate model). Harmless when no adapter exists: the voice
+// worker probes for a real GPU adapter and falls back to WASM. Must be set
+// before app "ready".
+app.commandLine.appendSwitch('enable-unsafe-webgpu');
+
+// ---------------------------------------------------------------------------
+// hm:// custom protocol — serves the local files the speech-to-text engine
+// needs. The renderer runs over file://, and Chromium refuses fetch() of
+// file:// URLs, so the Whisper model (binary .onnx), the transformers.js
+// library + its ONNX-runtime .wasm, and the voice worker are all served from
+// a privileged scheme that behaves like a normal secure HTTP origin. Three
+// hosts map to three on-disk roots (all inside the app, dev or packaged):
+//   hm://app/...     -> src/                                  (the worker)
+//   hm://vendor/...  -> node_modules/@huggingface/transformers/dist/
+//   hm://models/...  -> models/                               (bundled model)
+// The scheme must be registered before app "ready"; see registerSchemes...
+// below. The handler is installed in whenReady().
+// ---------------------------------------------------------------------------
+const HM_ROOTS = {
+  app: () => path.join(__dirname, 'src'),
+  vendor: () => path.join(__dirname, 'node_modules', '@huggingface', 'transformers', 'dist'),
+  models: () => path.join(__dirname, 'models'),
+};
+
+const HM_MIME = {
+  '.js': 'text/javascript', '.mjs': 'text/javascript', '.wasm': 'application/wasm',
+  '.json': 'application/json', '.onnx': 'application/octet-stream',
+  '.bin': 'application/octet-stream', '.data': 'application/octet-stream',
+  '.txt': 'text/plain', '.css': 'text/css', '.html': 'text/html',
+};
+
+protocol.registerSchemesAsPrivileged([{
+  scheme: 'hm',
+  privileges: { standard: true, secure: true, supportFetchAPI: true, stream: true, corsEnabled: true },
+}]);
+
+function registerHmProtocol() {
+  protocol.handle('hm', async (request) => {
+    try {
+      const url = new URL(request.url);
+      const rootFn = HM_ROOTS[url.host];
+      if (!rootFn) return new Response('Not found', { status: 404 });
+      const root = rootFn();
+      // Decode and normalize, then guard against path traversal outside root.
+      const rel = decodeURIComponent(url.pathname).replace(/^\/+/, '');
+      const abs = path.normalize(path.join(root, rel));
+      if (abs !== root && !abs.startsWith(root + path.sep)) {
+        return new Response('Forbidden', { status: 403 });
+      }
+      const res = await net.fetch(pathToFileURL(abs).toString());
+      const headers = new Headers(res.headers);
+      const ext = path.extname(abs).toLowerCase();
+      if (HM_MIME[ext]) headers.set('Content-Type', HM_MIME[ext]);
+      // Allow the file:// renderer/worker to cross-origin fetch + import these.
+      headers.set('Access-Control-Allow-Origin', '*');
+      return new Response(res.body, { status: res.status, headers });
+    } catch (err) {
+      return new Response('Error: ' + (err && err.message || err), { status: 500 });
+    }
+  });
+}
 const pty = require('@homebridge/node-pty-prebuilt-multiarch');
 const git = require('./git');
 const files = require('./files');
+const build = require('./build');
 
 // ---------------------------------------------------------------------------
 // Persistence: boards are stored as JSON in the app's userData directory.
@@ -143,6 +209,9 @@ function setWatch(cwd) {
 // ---------------------------------------------------------------------------
 let mainWindow = null;
 
+// Guards against starting a second portable build while one is in flight.
+let buildRunning = false;
+
 function createWindow() {
   mainWindow = new BrowserWindow({
     width: 1400,
@@ -237,6 +306,9 @@ function createWindow() {
 app.whenReady().then(() => {
   // Required on Windows for native notifications to show the app name/icon.
   if (process.platform === 'win32') app.setAppUserModelId('com.hivemind.app');
+
+  // Serve the speech-to-text assets over hm:// (see top of file).
+  registerHmProtocol();
 
   // -- IPC: notifications ----------------------------------------------------
   // Fired by the renderer when a terminal needs attention or finishes a turn
@@ -392,6 +464,25 @@ app.whenReady().then(() => {
   ipcMain.handle('files:list', (_e, { cwd, rel }) => files.list(cwd, rel));
   ipcMain.handle('files:open', (_e, { cwd, rel }) => files.open(cwd, rel));
   ipcMain.handle('files:reveal', (_e, { cwd, rel }) => files.reveal(cwd, rel));
+
+  // -- IPC: portable build --------------------------------------------------
+  // Detect whether a hive's directory is the Hivemind source checkout, and (if
+  // so) build a portable copy of the app from it. One build at a time; progress
+  // lines stream to the renderer so the toolbar button can report status.
+  ipcMain.handle('build:isHivemind', (_e, { cwd }) => build.isHivemindProject(cwd));
+  ipcMain.handle('build:portable', async (_e, { cwd }) => {
+    if (buildRunning) return { ok: false, message: 'A build is already running.' };
+    buildRunning = true;
+    try {
+      return await build.buildPortable(cwd, (line) => {
+        if (mainWindow && !mainWindow.isDestroyed()) {
+          mainWindow.webContents.send('build:progress', { line });
+        }
+      });
+    } finally {
+      buildRunning = false;
+    }
+  });
 
   createWindow();
 
