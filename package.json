@@ -17,11 +17,13 @@
   },
   "devDependencies": {
     "@electron/rebuild": "^3.6.0",
-    "electron": "^29.4.6"
+    "electron": "^29.4.6",
+    "electron-builder": "^26.15.3"
   },
   "build": {
     "appId": "com.mikem.hivemind",
     "productName": "Hivemind",
+    "npmRebuild": false,
     "files": [
       "**/*"
     ],
