@@ -854,6 +854,27 @@ button.icon-btn:disabled { opacity: .4; cursor: not-allowed; }
 .settings-tab:hover { color: var(--text); }
 .settings-tab.active { color: var(--text); border-bottom-color: var(--accent); }
 #settings-body { padding: 18px; overflow-y: auto; }
+
+/* Help modal — reuses the settings modal look */
+#help-backdrop {
+  position: fixed; inset: 0; background: rgba(0,0,0,.55);
+  display: flex; align-items: center; justify-content: center; z-index: 60;
+}
+#help-backdrop.hidden { display: none; }
+#help-modal {
+  background: var(--bg-alt); border: 1px solid var(--border); border-radius: 12px;
+  width: 560px; max-width: 94vw; max-height: 88vh;
+  display: flex; flex-direction: column; overflow: hidden;
+}
+#help-title { font-weight: 600; font-size: 14px; }
+#help-body { padding: 18px; overflow-y: auto; display: flex; flex-direction: column; gap: 14px; }
+.help-list { margin: 0; padding-left: 20px; display: flex; flex-direction: column; gap: 8px; font-size: 13px; color: var(--muted); line-height: 1.5; }
+.help-list strong { color: var(--text); font-weight: 600; }
+.help-note { margin: 0; font-size: 13px; color: var(--muted); line-height: 1.5; }
+#help-body kbd {
+  background: var(--panel); border: 1px solid var(--border); border-radius: 4px;
+  padding: 1px 6px; font-size: 12px; color: var(--text);
+}
 .settings-panel { display: flex; flex-direction: column; gap: 14px; }
 .settings-panel.hidden { display: none; }
 .settings-group { display: flex; flex-direction: column; gap: 10px; border-bottom: 1px solid var(--border); padding-bottom: 14px; }

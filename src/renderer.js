@@ -1940,7 +1940,7 @@ document.addEventListener('keydown', (e) => {
   if (!diffBackdrop.classList.contains('hidden')) diffBackdrop.classList.add('hidden');
   else if (!branchBackdrop.classList.contains('hidden')) branchBackdrop.classList.add('hidden');
   else if (!ghBackdrop.classList.contains('hidden')) closeWizard();
-  else { const sb = document.getElementById('settings-backdrop'); if (sb && !sb.classList.contains('hidden')) sb.classList.add('hidden'); }
+  else { const hb = document.getElementById('help-backdrop'); if (hb && !hb.classList.contains('hidden')) { hb.classList.add('hidden'); return; } const sb = document.getElementById('settings-backdrop'); if (sb && !sb.classList.contains('hidden')) sb.classList.add('hidden'); }
 });
 
 // ---------------------------------------------------------------------------
@@ -2578,10 +2578,21 @@ function closeVoiceModal() { closeSettings(); }
 
 // -- Wire it all up ----------------------------------------------------------
 if (voiceToggleBtn) voiceToggleBtn.onclick = toggleVoice;
-$('voice-settings').onclick = openVoiceModal;
+const voiceSettingsBtn = $('voice-settings');
+if (voiceSettingsBtn) voiceSettingsBtn.onclick = openVoiceModal;
 const settingsBtn = $('settings-btn');
 if (settingsBtn) settingsBtn.onclick = () => openSettings('general');
 $('settings-close').onclick = closeSettings;
+
+// -- Help modal -------------------------------------------------------------
+const helpBackdrop = $('help-backdrop');
+function openHelp() { if (helpBackdrop) helpBackdrop.classList.remove('hidden'); }
+function closeHelp() { if (helpBackdrop) helpBackdrop.classList.add('hidden'); }
+const helpBtn = $('help-btn');
+if (helpBtn) helpBtn.onclick = openHelp;
+const helpCloseBtn = $('help-close');
+if (helpCloseBtn) helpCloseBtn.onclick = closeHelp;
+if (helpBackdrop) helpBackdrop.addEventListener('mousedown', (e) => { if (e.target === helpBackdrop) closeHelp(); });
 $('voice-hud-stop').onclick = stopVoice;
 settingsBackdrop.addEventListener('mousedown', (e) => { if (e.target === settingsBackdrop) closeSettings(); });
 document.querySelectorAll('.settings-tab').forEach((b) => {
