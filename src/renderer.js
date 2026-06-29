@@ -248,34 +248,6 @@ function updateBoardStatus(boardId) {
 }
 
 // ---------------------------------------------------------------------------
-// Broadcast: drive every live thread on a board at once
-// ---------------------------------------------------------------------------
-let broadcastTyping = false; // mirror keystrokes from the focused pane to all
-
-function liveBoardPanes(boardId) {
-  const g = grids.get(boardId);
-  if (!g) return [];
-  const out = [];
-  for (const col of g.columns) {
-    for (const p of col.panes) if (!p.disposed && p.state !== 'dead') out.push(p);
-  }
-  return out;
-}
-
-// Broadcast targets: live panes the user hasn't excluded via the 📡 toggle.
-function liveBroadcastPanes(boardId) {
-  return liveBoardPanes(boardId).filter((p) => p.bcInclude !== false);
-}
-
-function broadcastRaw(boardId, data) {
-  for (const p of liveBroadcastPanes(boardId)) {
-    window.api.writePty(p.id, data);
-    feedCaptionInput(p, data);
-    markActivity(p, '');
-  }
-}
-
-// ---------------------------------------------------------------------------
 // Thread captions
 //
 // To label each thread with what it's working on, we watch the raw keystrokes
@@ -334,24 +306,10 @@ function setPaneCaption(pane, text, { persist = true } = {}) {
   if (persist) persistLayout(pane.board.id);
 }
 
-// Send keystrokes/text to a pane. With mirror-typing on, input from the focused
-// pane fans out to every included thread on the board; otherwise it goes only to
-// this one. The focused pane always receives its own input even if it's excluded
-// from broadcast, so typing never silently vanishes.
+// Send keystrokes/text to a pane.
 function sendToPane(pane, data) {
-  if (broadcastTyping && pane === focusedPane) {
-    window.api.writePty(pane.id, data);
-    feedCaptionInput(pane, data);
-    for (const p of liveBroadcastPanes(pane.board.id)) {
-      if (p === pane) continue;
-      window.api.writePty(p.id, data);
-      feedCaptionInput(p, data);
-      markActivity(p, '');
-    }
-  } else {
-    window.api.writePty(pane.id, data);
-    feedCaptionInput(pane, data);
-  }
+  window.api.writePty(pane.id, data);
+  feedCaptionInput(pane, data);
   markActivity(pane, ''); // typing means this pane is active again
 }
 
@@ -383,10 +341,6 @@ async function persistImage(file) {
 async function typePathIntoPane(pane, p) {
   const quoted = /\s/.test(p) ? `"${p}"` : p;
   sendToPane(pane, quoted + ' ');
-}
-
-function broadcastLine(boardId, text) {
-  broadcastRaw(boardId, text + '\r');
 }
 
 // ---------------------------------------------------------------------------
@@ -424,8 +378,7 @@ function serializeLayout(boardId) {
     flex: col.flex,
     panes: col.panes.filter((p) => !p.disposed).map((p) => ({
       name: p.name, model: p.model, fontSize: p.fontSize,
-      flex: p.flex, bcInclude: p.bcInclude !== false,
-      caption: p.captionText || '',
+      flex: p.flex, caption: p.captionText || '',
     })),
   })).filter((c) => c.panes.length);
   return cols.length ? cols : null;
@@ -451,7 +404,7 @@ function rebuildFromLayout(board) {
     for (const pd of (col.panes || [])) {
       const pane = createPane(board, colObj, {
         name: pd.name, model: pd.model, fontSize: pd.fontSize,
-        flex: pd.flex, bcInclude: pd.bcInclude, caption: pd.caption,
+        flex: pd.flex, caption: pd.caption,
         resume: !!board.resumeOnStart,
       });
       colObj.panes.push(pane);
@@ -564,7 +517,6 @@ function selectBoard(id) {
   emptyState.classList.add('hidden');
   gridEl.classList.remove('hidden');
   addTermBtn.disabled = false;
-  broadcastToggle.disabled = false;
   if (typeof voiceToggleBtn !== 'undefined' && voiceToggleBtn) voiceToggleBtn.disabled = false;
 
   boardTitle.textContent = board.name;
@@ -595,7 +547,6 @@ function selectBoard(id) {
     g.el.style.display = bid === id ? 'flex' : 'none';
   }
   renderBoardList();
-  updateBcCount();
   if (typeof gitToggle !== 'undefined' && gitToggle) gitToggle.disabled = false;
   if (typeof gitOnBoardChange === 'function') gitOnBoardChange();
   if (typeof filesToggle !== 'undefined' && filesToggle) filesToggle.disabled = false;
@@ -744,7 +695,6 @@ function addTerminal(board, opts = {}) {
   col.panes.push(pane);
   layout(board.id);
   focusPane(pane);
-  updateBcCount();
   persistLayout(board.id);
   return pane;
 }
@@ -778,11 +728,6 @@ function createPane(board, col, opts = {}) {
   titleWrap.className = 'title-wrap';
   titleWrap.append(title, caption);
 
-  // Include this thread in broadcast / mirror-typing (on by default).
-  const bcBtn = document.createElement('button');
-  bcBtn.className = 'bc-include-btn';
-  bcBtn.textContent = '📡';
-
   const fontDownBtn = document.createElement('button');
   fontDownBtn.className = 'font-btn';
   fontDownBtn.textContent = 'A−';
@@ -810,7 +755,7 @@ function createPane(board, col, opts = {}) {
   const closeBtn = document.createElement('button');
   closeBtn.textContent = '✕';
   closeBtn.title = 'Close thread';
-  header.append(dot, titleWrap, statusEl, bcBtn, modelSelect, fontDownBtn, fontUpBtn, zoomBtn, closeBtn);
+  header.append(dot, titleWrap, statusEl, modelSelect, fontDownBtn, fontUpBtn, zoomBtn, closeBtn);
 
   const termWrap = document.createElement('div');
   termWrap.className = 'pane-term';
@@ -854,13 +799,12 @@ function createPane(board, col, opts = {}) {
 
   const pane = {
     id, el, term, fitAddon, searchAddon, dot, statusEl, modelSelect, title, caption,
-    bcBtn, findBar, findInput, flex: opts.flex || 1, col, board, disposed: false,
+    findBar, findInput, flex: opts.flex || 1, col, board, disposed: false,
     name: startName, state: null, buf: '', idleTimer: null,
     fontSize: startFont, model: startModel, captionText: '', capBuf: '',
-    bcInclude: opts.bcInclude !== false, errored: false, hintShown: false,
+    errored: false, hintShown: false,
   };
 
-  applyBcIncludeBtn(pane);
   if (opts.caption) setPaneCaption(pane, opts.caption, { persist: false });
 
   // Wire IO
@@ -869,16 +813,6 @@ function createPane(board, col, opts = {}) {
 
   // Double-click the title to rename the thread (single click still focuses).
   title.addEventListener('dblclick', (e) => { e.stopPropagation(); beginRename(pane); });
-
-  // Broadcast-include toggle.
-  bcBtn.addEventListener('mousedown', (e) => e.stopPropagation());
-  bcBtn.onclick = (e) => {
-    e.stopPropagation();
-    pane.bcInclude = !pane.bcInclude;
-    applyBcIncludeBtn(pane);
-    updateBcCount();
-    persistLayout(board.id);
-  };
 
   // Zoom / maximize.
   zoomBtn.addEventListener('mousedown', (e) => e.stopPropagation());
@@ -1048,15 +982,6 @@ function beginRename(pane) {
   input.addEventListener('blur', commit);
 }
 
-// Paint the per-pane broadcast-include button to reflect its state.
-function applyBcIncludeBtn(pane) {
-  if (!pane.bcBtn) return;
-  pane.bcBtn.classList.toggle('off', !pane.bcInclude);
-  pane.bcBtn.title = pane.bcInclude
-    ? 'Included in broadcast — click to exclude this thread'
-    : 'Excluded from broadcast — click to include this thread';
-}
-
 // -- Find bar --------------------------------------------------------------
 function openFind(pane) {
   if (!pane || pane.disposed) return;
@@ -1087,7 +1012,6 @@ function closePane(pane) {
     g.columns = g.columns.filter((c) => c !== col);
   }
   updateBoardStatus(pane.board.id);
-  updateBcCount();
 
   // If the board has no panes left, drop back to a fresh single terminal.
   const remaining = g.columns.reduce((s, c) => s + c.panes.length, 0);
@@ -1247,9 +1171,6 @@ function showEmpty() {
   gridEl.classList.add('hidden');
   emptyState.classList.remove('hidden');
   addTermBtn.disabled = true;
-  broadcastToggle.disabled = true;
-  broadcastBar.classList.add('hidden');
-  broadcastToggle.classList.remove('active');
   if (typeof voiceToggleBtn !== 'undefined' && voiceToggleBtn) voiceToggleBtn.disabled = true;
   if (typeof stopVoice === 'function') stopVoice();
   window.api.setWatch(null); // nothing active to watch
@@ -1367,44 +1288,6 @@ window.api.onFsChanged(({ cwd }) => {
     refreshGit({ keepMsg: true });
   }
 });
-
-// ---------------------------------------------------------------------------
-// Broadcast bar wiring
-// ---------------------------------------------------------------------------
-const broadcastToggle = $('broadcast-toggle');
-const broadcastBar = $('broadcast-bar');
-const bcInput = $('bc-input');
-const bcCount = $('bc-count');
-const bcMirror = $('bc-mirror');
-
-function updateBcCount() {
-  if (bcCount) bcCount.textContent = String(activeBoardId ? liveBroadcastPanes(activeBoardId).length : 0);
-}
-
-broadcastToggle.onclick = () => {
-  const open = broadcastBar.classList.toggle('hidden') === false;
-  broadcastToggle.classList.toggle('active', open);
-  if (open) { updateBcCount(); bcInput.focus(); }
-  if (activeBoardId) fitBoard(activeBoardId); // the bar changes the grid height
-};
-
-function sendBroadcast() {
-  if (!activeBoardId) return;
-  broadcastLine(activeBoardId, bcInput.value);
-  bcInput.value = '';
-  bcInput.focus();
-}
-
-$('bc-send').onclick = sendBroadcast;
-bcInput.addEventListener('keydown', (e) => {
-  if (e.key === 'Enter') { e.preventDefault(); sendBroadcast(); }
-});
-$('bc-enter').onclick = () => { if (activeBoardId) broadcastRaw(activeBoardId, '\r'); };
-$('bc-interrupt').onclick = () => { if (activeBoardId) broadcastRaw(activeBoardId, '\x03'); };
-bcMirror.onchange = () => {
-  broadcastTyping = bcMirror.checked;
-  broadcastToggle.classList.toggle('mirror', broadcastTyping);
-};
 
 // ---------------------------------------------------------------------------
 // Source Control (Git) panel

@@ -22,11 +22,6 @@ context.
   finishes a turn while the window isn't focused, you get a native notification
   and a taskbar flash. Click the notification to jump straight to that thread.
   Toggle notifications with the 🔔 button in the top bar.
-- **Broadcast input**: drive every thread on a board at once. Click 📡 in the top
-  bar to open the broadcast bar, then type a command and press Enter to send it to
-  all threads. Quick buttons send **Enter** (⏎, e.g. approve/submit everywhere) or
-  **Ctrl-C** (^C, interrupt all). Tick **mirror typing** to fan out every
-  keystroke from the focused thread to all threads live.
 - **Adjustable text size** per thread: use the **A− / A+** buttons in the thread
   header, **Ctrl +** / **Ctrl −** (Ctrl 0 to reset), or **Ctrl + scroll**. The
   size you pick sticks and becomes the default for new threads.

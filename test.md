@@ -40,8 +40,8 @@ paste natively on Ctrl+V. As always, **fully restart** the app to pick this up.
 ## Checklist if it still doesn't work
 
 - [ ] **Click into the pane first.** The terminal must be focused when you press
-      Ctrl+V (or right-click → Paste). If focus is on the broadcast input, a
-      dialog, or nothing, the paste won't reach the terminal.
+      Ctrl+V (or right-click → Paste). If focus is on a dialog or nothing,
+      the paste won't reach the terminal.
 - [ ] **Confirm there's actually an image on the clipboard.** Re-take the
       screenshot (Win+Shift+S), then paste.
 - [ ] **Open DevTools** (View menu or Ctrl+Shift+I) and check the Console for

@@ -185,7 +185,6 @@ button.icon-btn {
 button.icon-btn:hover { filter: brightness(1.15); }
 button.icon-btn.muted { opacity: .55; }
 button.icon-btn.active { background: var(--accent); color: #11111b; }
-button.icon-btn.active.mirror { background: var(--peach); }
 button.icon-btn:disabled { opacity: .4; cursor: not-allowed; }
 
 /* Text pill button (e.g. Build Portable) — sits among the icon buttons. */
@@ -222,37 +221,6 @@ button.pill-btn.building {
   button.pill-btn.building { animation: none; }
 }
 
-/* ---------------- Broadcast bar ---------------- */
-#broadcast-bar {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  padding: 8px 14px;
-  background: var(--panel);
-  border-top: 1px solid var(--border);
-}
-#broadcast-bar.hidden { display: none; }
-#broadcast-bar .bc-label { font-size: 12px; color: var(--muted); white-space: nowrap; }
-#broadcast-bar #bc-count { color: var(--accent); font-weight: 700; }
-#bc-input {
-  flex: 1;
-  min-width: 0;
-  background: var(--bg-alt);
-  border: 1px solid var(--border);
-  color: var(--text);
-  border-radius: 6px;
-  padding: 8px 10px;
-  font-size: 13px;
-  font-family: "Cascadia Code", Consolas, monospace;
-}
-#bc-input:focus { outline: none; border-color: var(--accent); }
-#broadcast-bar .bc-mirror {
-  display: flex; align-items: center; gap: 5px;
-  font-size: 12px; color: var(--muted); white-space: nowrap; cursor: pointer;
-}
-#broadcast-bar .bc-mirror input { cursor: pointer; }
-#bc-interrupt { font-size: 12px; font-weight: 700; color: var(--danger); }
-
 /* ---------------- Grid ---------------- */
 #grid {
   flex: 1;
@@ -285,7 +253,7 @@ button.pill-btn.building {
 .pane.drag-over { border-color: var(--accent-2); box-shadow: inset 0 0 0 2px var(--accent-2); }
 
 .pane-header {
-  height: 32px;
+  height: 38px;
   display: flex;
   align-items: center;
   gap: 8px;
@@ -297,10 +265,10 @@ button.pill-btn.building {
   user-select: none;
 }
 .pane-header .title-wrap { flex: 1; min-width: 0; display: flex; align-items: center; gap: 6px; overflow: hidden; }
-.pane-header .title { flex: none; max-width: 60%; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-size: 14px; font-weight: 600; }
+.pane-header .title { flex: none; max-width: 60%; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-size: 17px; font-weight: 600; }
 .pane-header .caption {
   flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
-  color: var(--muted); font-size: 11px; opacity: .8;
+  color: var(--muted); font-size: 13px; opacity: .8;
 }
 .pane-header .caption:empty { display: none; }
 .pane-header .caption:not(:empty)::before { content: '— '; opacity: .55; }
@@ -823,10 +791,8 @@ button.pill-btn.building {
 .pane-header .status.error { color: var(--danger); font-weight: 600; }
 .board-item .status-dot.error { background: var(--danger); animation: hm-pulse 1.1s ease-in-out infinite; }
 
-/* Pane header: zoom + broadcast-include + rename input */
+/* Pane header: zoom + rename input */
 .pane-header .zoom-btn { font-size: 12px; }
-.pane-header .bc-include-btn { font-size: 11px; padding: 2px 4px; }
-.pane-header .bc-include-btn.off { opacity: .3; filter: grayscale(1); }
 .pane-header .title-edit {
   flex: 1; min-width: 0;
   background: var(--panel); border: 1px solid var(--accent); color: var(--text);
