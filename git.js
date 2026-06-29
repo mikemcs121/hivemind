@@ -196,6 +196,45 @@ function push(cwd, { branch, setUpstream } = {}) {
   return runGit(cwd, args, { timeout: 120000 });
 }
 
+// Throw away every local change and match the copy on GitHub. Fetches the
+// remote first, hard-resets the current branch onto its upstream (so unpushed
+// commits and uncommitted edits both go), then cleans untracked files so the
+// working tree is byte-for-byte what origin holds. Destructive — the renderer
+// confirms before calling.
+async function resetToRemote(cwd, { branch } = {}) {
+  if (!ok(cwd)) return { code: 1, stdout: '', stderr: 'This board has no project directory set.' };
+
+  // Resolve the upstream ref. Prefer the branch's configured @{u}; fall back to
+  // origin/<branch> when the branch has no upstream set yet.
+  let ref = null;
+  const u = await runGit(cwd, ['rev-parse', '--abbrev-ref', '--symbolic-full-name', '@{u}']);
+  if (u.code === 0 && u.stdout.trim()) {
+    ref = u.stdout.trim();
+  } else if (branch) {
+    ref = `origin/${branch}`;
+  }
+  if (!ref) {
+    return { code: 1, stdout: '', stderr: 'This branch has no GitHub upstream to revert to. Push it first.' };
+  }
+
+  const fetched = await runGit(cwd, ['fetch', 'origin'], { timeout: 120000 });
+  if (fetched.code !== 0) return fetched;
+
+  // Make sure the ref actually exists after fetching before we nuke anything.
+  const verify = await runGit(cwd, ['rev-parse', '--verify', '--quiet', ref + '^{commit}']);
+  if (verify.code !== 0) {
+    return { code: 1, stdout: '', stderr: `Could not find ${ref} on the remote.` };
+  }
+
+  const reset = await runGit(cwd, ['reset', '--hard', ref]);
+  if (reset.code !== 0) return reset;
+
+  const clean = await runGit(cwd, ['clean', '-fd']);
+  if (clean.code !== 0) return clean;
+
+  return { code: 0, stdout: `Reverted working tree to ${ref}.`, stderr: '' };
+}
+
 // ---------------------------------------------------------------------------
 // GitHub connection (used by the "Connect to GitHub" wizard).
 //
@@ -266,6 +305,6 @@ async function ghCreateRepo(cwd, { name, visibility = 'private', push = true } =
 
 module.exports = {
   status, diff, stage, stageAll, unstage, unstageAll, discard,
-  commit, branches, checkout, createBranch, init, fetch, pull, push,
+  commit, branches, checkout, createBranch, init, fetch, pull, push, resetToRemote,
   getRemoteUrl, setRemoteOrigin, ghCheck, ghCreateRepo,
 };

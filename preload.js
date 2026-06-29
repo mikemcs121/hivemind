@@ -43,6 +43,7 @@ contextBridge.exposeInMainWorld('api', {
     fetch: (cwd) => ipcRenderer.invoke('git:fetch', { cwd }),
     pull: (cwd) => ipcRenderer.invoke('git:pull', { cwd }),
     push: (cwd, branch, setUpstream) => ipcRenderer.invoke('git:push', { cwd, branch, setUpstream }),
+    resetToRemote: (cwd, branch) => ipcRenderer.invoke('git:resetToRemote', { cwd, branch }),
 
     // GitHub connection wizard
     remoteUrl: (cwd) => ipcRenderer.invoke('git:remoteUrl', { cwd }),

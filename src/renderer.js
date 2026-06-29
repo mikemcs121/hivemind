@@ -933,6 +933,14 @@ function renderBranchBar(st) {
   }
   actions.append(fetchBtn, pullBtn, pushBtn);
 
+  // Discard everything local and match GitHub. Only meaningful once connected.
+  if (st.hasRemote) {
+    const revertBtn = mkBtn('Revert to GitHub', doRevertToRemote);
+    revertBtn.className = 'git-revert';
+    revertBtn.title = 'Discard all local changes and reset this branch to what is on GitHub';
+    actions.appendChild(revertBtn);
+  }
+
   bar.append(line, actions);
   return bar;
 }
@@ -942,6 +950,22 @@ function doPush() {
   if (!st || !st.hasRemote) { openGitHubWizard(); return; }
   const setUpstream = !st.upstream;
   gitRun('Pushing', (d) => window.api.git.push(d, st.branch, setUpstream), { okMsg: 'Pushed.' });
+}
+
+function doRevertToRemote() {
+  const st = lastStatus;
+  if (!st || !st.hasRemote) { setGitMsg('This repository is not connected to GitHub yet.', 'err'); return; }
+  const target = st.upstream || (st.branch ? 'origin/' + st.branch : 'the remote branch');
+  const warn =
+    'Revert to GitHub?\n\n' +
+    'This resets the current branch to ' + target + ' and DELETES all local changes:\n' +
+    '  • uncommitted edits\n' +
+    '  • staged changes\n' +
+    '  • commits you have not pushed\n' +
+    '  • untracked files\n\n' +
+    'This cannot be undone. Continue?';
+  if (!confirm(warn)) return;
+  gitRun('Reverting to GitHub', (d) => window.api.git.resetToRemote(d, st.branch), { okMsg: 'Reverted to GitHub.' });
 }
 
 function renderPublishBanner() {

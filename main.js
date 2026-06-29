@@ -258,6 +258,7 @@ app.whenReady().then(() => {
   ipcMain.handle('git:fetch', (_e, { cwd }) => git.fetch(cwd));
   ipcMain.handle('git:pull', (_e, { cwd }) => git.pull(cwd));
   ipcMain.handle('git:push', (_e, { cwd, branch, setUpstream }) => git.push(cwd, { branch, setUpstream }));
+  ipcMain.handle('git:resetToRemote', (_e, { cwd, branch }) => git.resetToRemote(cwd, { branch }));
 
   // -- IPC: GitHub connection wizard ----------------------------------------
   ipcMain.handle('git:remoteUrl', (_e, { cwd }) => git.getRemoteUrl(cwd));
