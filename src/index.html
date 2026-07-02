@@ -3,7 +3,7 @@
   <head>
     <meta charset="UTF-8" />
     <!-- hm: serves the offline speech-to-text assets; wasm-unsafe-eval + blob:
-         are needed to run the Whisper ONNX runtime and its worker. -->
+         are needed to run the speech model's ONNX runtime and its worker. -->
     <meta http-equiv="Content-Security-Policy"
           content="default-src 'self'; script-src 'self' 'wasm-unsafe-eval' blob: hm:; worker-src 'self' blob: hm:; connect-src 'self' hm: blob: data:; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self' data:;" />
     <title>Hivemind</title>
@@ -66,6 +66,7 @@
           <div id="board-meta"></div>
           <div class="spacer"></div>
           <button id="build-portable" class="pill-btn hidden" title="Build a portable copy of Hivemind from this checkout">📦 Build Portable</button>
+          <button id="usage-btn" class="pill-btn usage-pill" title="Claude usage — how much of your plan's limits you've used">⛽ Usage</button>
           <button id="voice-toggle" class="icon-btn" title="Voice typing — dictate into the focused thread (toggle with the ~ key)" disabled>🎤</button>
           <button id="settings-btn" class="icon-btn" title="Settings">⚙</button>
           <button id="help-btn" class="icon-btn" title="Help">❔</button>
@@ -176,8 +177,11 @@
           <section class="settings-panel hidden" data-panel="voice">
             <p class="voice-intro">
               Dictate straight into the focused thread — transcribed text is typed at
-              the cursor. Speech is recognized on-device by Whisper (English), fully
-              offline. Press the <kbd>~</kbd> key any time to start or stop listening.
+              the cursor when you pause. Speech is recognized on-device by Moonshine
+              (English), fully offline. Press the <kbd>~</kbd> key any time to start
+              or stop listening. You can start speaking immediately — words spoken
+              while the model is still loading are kept, and toggling off still types
+              whatever you had just said.
             </p>
 
             <div class="voice-settings-grid">
@@ -240,7 +244,7 @@
           <div class="settings-group">
             <div class="settings-group-title">Threads</div>
             <ul class="help-list">
-              <li><strong>🎤 Voice typing</strong> — dictate into the focused thread; speech is transcribed on-device by Whisper (English, fully offline) and typed at the cursor when you pause. Toggle with the <kbd>~</kbd> key. Use the user dictionary in <strong>⚙ Settings → Voice</strong> to fix words it mishears.</li>
+              <li><strong>🎤 Voice typing</strong> — dictate into the focused thread; speech is transcribed on-device by Moonshine (English, fully offline) and typed at the cursor when you pause. Toggle with the <kbd>~</kbd> key. You can start speaking right away — words spoken while the model loads are kept, and toggling off still types what you had just said. If the HUD says “Didn’t catch that”, the model heard you but couldn’t make out words. Use the user dictionary in <strong>⚙ Settings → Voice</strong> to fix words it mishears.</li>
               <li>Each thread's header shows a <strong>caption</strong> built from the last prompt you send it, so you can see what every thread is working on at a glance. Double-click the name to rename a thread.</li>
               <li>Change a thread's model or font from its header, or with <kbd>A−</kbd>/<kbd>A+</kbd> and <kbd>Ctrl</kbd>+scroll.</li>
             </ul>
@@ -266,6 +270,16 @@
           </div>
 
           <div class="settings-group">
+            <div class="settings-group-title">Usage &amp; limits</div>
+            <p class="help-note">The <strong>⛽ Usage</strong> pill in the toolbar shows how much of your
+              Claude plan's most-constrained limit is used right now (green → yellow → red as you approach
+              it). Click it for the full picture: the 5-hour session window and weekly limits with their
+              reset times — the same numbers as Claude Code's <code>/usage</code> — plus how many tokens
+              each model has used today, totalled from your local Claude Code transcripts. Figures refresh
+              about once a minute.</p>
+          </div>
+
+          <div class="settings-group">
             <div class="settings-group-title">Building Hivemind</div>
             <p class="help-note"><strong>📦 Build Portable</strong> appears in the toolbar only when the active
               hive is pointed at the Hivemind source checkout. It runs electron-builder's portable target to
@@ -279,6 +293,19 @@
             <p class="help-note">Open <strong>⚙ Settings</strong> for defaults, notifications, and voice options.</p>
           </div>
         </div>
+      </div>
+    </div>
+
+    <!-- Claude usage (plan limits + today's tokens) -->
+    <div id="usage-backdrop" class="hidden">
+      <div id="usage-modal">
+        <div class="settings-head">
+          <span id="usage-title">⛽ Claude usage</span>
+          <div class="spacer"></div>
+          <button id="usage-refresh" class="git-icon" title="Refresh">⟳</button>
+          <button id="usage-close" class="git-icon" title="Close">✕</button>
+        </div>
+        <div id="usage-body"></div>
       </div>
     </div>
 

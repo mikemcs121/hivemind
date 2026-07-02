@@ -88,6 +88,11 @@ contextBridge.exposeInMainWorld('api', {
     return () => ipcRenderer.removeListener('build:progress', h);
   },
 
+  // Claude usage: rate-limit windows + today's token totals.
+  usage: {
+    get: () => ipcRenderer.invoke('usage:get'),
+  },
+
   // Notifications
   notify: (payload) => ipcRenderer.send('notify', payload),
   onFocusPane: (cb) => {

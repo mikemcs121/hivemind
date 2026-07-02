@@ -221,6 +221,11 @@ button.pill-btn.building {
   button.pill-btn.building { animation: none; }
 }
 
+/* Claude usage pill — tinted by how close the fullest limit window is. */
+button.usage-pill.ok { color: var(--accent-2); }
+button.usage-pill.warn { color: var(--yellow); }
+button.usage-pill.crit { color: var(--danger); }
+
 /* ---------------- Grid ---------------- */
 #grid {
   flex: 1;
@@ -875,6 +880,45 @@ button.pill-btn.building {
 .settings-tab:hover { color: var(--text); }
 .settings-tab.active { color: var(--text); border-bottom-color: var(--accent); }
 #settings-body { padding: 18px; overflow-y: auto; }
+
+/* Claude usage modal — reuses the settings modal look */
+#usage-backdrop {
+  position: fixed; inset: 0; background: rgba(0,0,0,.55);
+  display: flex; align-items: center; justify-content: center; z-index: 60;
+}
+#usage-backdrop.hidden { display: none; }
+#usage-modal {
+  background: var(--bg-alt); border: 1px solid var(--border); border-radius: 12px;
+  width: 560px; max-width: 94vw; max-height: 88vh;
+  display: flex; flex-direction: column; overflow: hidden;
+}
+#usage-title { font-weight: 600; font-size: 14px; }
+#usage-body { padding: 18px; overflow-y: auto; display: flex; flex-direction: column; gap: 14px; }
+
+.usage-limit { display: flex; flex-direction: column; gap: 5px; }
+.usage-limit-head { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; }
+.usage-limit-label { font-size: 13px; color: var(--text); font-weight: 600; }
+.usage-limit-detail { font-size: 11px; color: var(--muted); white-space: nowrap; }
+.usage-bar {
+  height: 8px; border-radius: 4px; background: var(--panel);
+  border: 1px solid var(--border); overflow: hidden;
+}
+.usage-bar-fill { height: 100%; border-radius: 4px; }
+.usage-bar-fill.ok { background: var(--accent-2); }
+.usage-bar-fill.warn { background: var(--yellow); }
+.usage-bar-fill.crit { background: var(--danger); }
+
+.usage-table { border-collapse: collapse; font-size: 12px; width: 100%; }
+.usage-table th, .usage-table td {
+  text-align: right; padding: 4px 8px; border-bottom: 1px solid var(--border);
+  color: var(--muted); white-space: nowrap;
+}
+.usage-table th:first-child, .usage-table td:first-child {
+  text-align: left; color: var(--text); max-width: 220px;
+  overflow: hidden; text-overflow: ellipsis;
+}
+.usage-table th { color: var(--text); font-weight: 600; }
+.usage-table tr.usage-total td { color: var(--text); font-weight: 600; border-bottom: none; }
 
 /* Help modal — reuses the settings modal look */
 #help-backdrop {

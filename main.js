@@ -6,12 +6,14 @@ const { pathToFileURL } = require('url');
 const fs = require('fs');
 const os = require('os');
 
-// Expose WebGPU to the renderer/worker so the speech-to-text model can run on
-// the GPU (far faster than single-thread WASM, and fast enough to afford the
-// larger, more accurate model). Harmless when no adapter exists: the voice
-// worker probes for a real GPU adapter and falls back to WASM. Must be set
-// before app "ready".
-app.commandLine.appendSwitch('enable-unsafe-webgpu');
+// Force-enable SharedArrayBuffer so the speech-to-text ONNX runtime can run
+// multi-threaded WASM (~4x faster than single-thread). A file:// window is not
+// cross-origin isolated, so without this flag Chromium hides SAB and the voice
+// worker silently drops to one thread. Must be set before app "ready".
+// (The previous `enable-unsafe-webgpu` switch was removed: Electron 29 exposes
+// no navigator.gpu in windows or workers even with it, so the GPU path never
+// ran — re-probe if Electron is upgraded.)
+app.commandLine.appendSwitch('enable-features', 'SharedArrayBuffer');
 
 // ---------------------------------------------------------------------------
 // hm:// custom protocol — serves the local files the speech-to-text engine
@@ -73,6 +75,7 @@ const pty = require('@homebridge/node-pty-prebuilt-multiarch');
 const git = require('./git');
 const files = require('./files');
 const build = require('./build');
+const usage = require('./usage');
 
 // ---------------------------------------------------------------------------
 // Persistence: boards are stored as JSON in the app's userData directory.
@@ -464,6 +467,11 @@ app.whenReady().then(() => {
   ipcMain.handle('files:list', (_e, { cwd, rel }) => files.list(cwd, rel));
   ipcMain.handle('files:open', (_e, { cwd, rel }) => files.open(cwd, rel));
   ipcMain.handle('files:reveal', (_e, { cwd, rel }) => files.reveal(cwd, rel));
+
+  // -- IPC: Claude usage ------------------------------------------------------
+  // Snapshot of the account's rate-limit windows (same data as Claude Code's
+  // /usage screen) plus today's token totals from the local transcripts.
+  ipcMain.handle('usage:get', () => usage.getUsage());
 
   // -- IPC: portable build --------------------------------------------------
   // Detect whether a hive's directory is the Hivemind source checkout, and (if

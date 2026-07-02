@@ -62,6 +62,7 @@ function setPaneFontSize(pane, size) {
 // ---------------------------------------------------------------------------
 const MODELS = [
   { value: 'default', label: 'Default' },
+  { value: 'fable', label: 'Fable' },
   { value: 'opus', label: 'Opus' },
   { value: 'sonnet', label: 'Sonnet' },
   { value: 'haiku', label: 'Haiku' },
@@ -405,7 +406,6 @@ function rebuildFromLayout(board) {
       const pane = createPane(board, colObj, {
         name: pd.name, model: pd.model, fontSize: pd.fontSize,
         flex: pd.flex, caption: pd.caption,
-        resume: !!board.resumeOnStart,
       });
       colObj.panes.push(pane);
       const m = /(\d+)\s*$/.exec(pd.name || '');
@@ -414,6 +414,10 @@ function rebuildFromLayout(board) {
   }
   board._seq = maxNum;
   layout(board.id);
+  // Panes are attached now — spawn each PTY at its real size.
+  for (const col of g.columns) {
+    for (const pane of col.panes) spawnPanePty(pane, { resume: board.resumeOnStart });
+  }
   const first = g.columns[0] && g.columns[0].panes[0];
   if (first) focusPane(first);
 }
@@ -528,6 +532,13 @@ function selectBoard(id) {
   // Show the "Build Portable" button only when this hive is the Hivemind source.
   updateBuildButton(board);
 
+  // Show the active grid, hide the rest — BEFORE building a new grid, so pane
+  // measurements during the build see the full workspace width (a still-visible
+  // previous grid would flex-share the row and halve it).
+  for (const [bid, g] of grids) {
+    g.el.style.display = bid === id ? 'flex' : 'none';
+  }
+
   // Build the grid lazily the first time a board is opened.
   if (!grids.has(id)) {
     const g = { el: document.createElement('div'), columns: [] };
@@ -540,11 +551,6 @@ function selectBoard(id) {
     } else {
       addTerminal(board); // open the first terminal automatically
     }
-  }
-
-  // Show the active grid, hide the rest.
-  for (const [bid, g] of grids) {
-    g.el.style.display = bid === id ? 'flex' : 'none';
   }
   renderBoardList();
   if (typeof gitToggle !== 'undefined' && gitToggle) gitToggle.disabled = false;
@@ -695,22 +701,31 @@ function addTerminal(board, opts = {}) {
   col.panes.push(pane);
   layout(board.id);
   focusPane(pane);
-  // createPane() spawned the PTY while the pane was still detached from the DOM,
-  // so its fit() measured a zero-size element and xterm fell back to 80x24 — the
-  // PTY (and Claude Code's TUI) then run at the wrong width. layout() above just
-  // attached the pane, so re-fit now that it has real dimensions and push the
-  // true size to the PTY. This runs well before the 600ms startup-command delay,
-  // so Claude starts at the correct width; skipping it leaves the TUI redrawing
-  // at the wrong width, which strands phantom characters you can't backspace over.
-  requestAnimationFrame(() => {
-    if (pane.disposed) return;
-    try {
-      pane.fitAddon.fit();
-      window.api.resizePty(pane.id, pane.term.cols, pane.term.rows);
-    } catch (_) { /* terminal not ready */ }
-  });
+  spawnPanePty(pane, { resume: opts.resume });
   persistLayout(board.id);
   return pane;
+}
+
+// Spawn a pane's PTY at the pane's true size. Must run after layout() has
+// attached the pane to the DOM, and must stay synchronous: fit() forces a
+// layout read that works even in a hidden window, whereas a deferred
+// (requestAnimationFrame) re-fit is throttled when the window is occluded or
+// starting up busy — it can then land after the 600ms startup delay, so Claude
+// boots into an 80x24 PTY and the late ConPTY resize-reflow strands phantom
+// characters at the start of the input line that can't be typed over or
+// backspaced across.
+function spawnPanePty(pane, { resume } = {}) {
+  try { pane.fitAddon.fit(); } catch (_) { /* keep xterm defaults */ }
+  window.api.spawnPty({
+    id: pane.id,
+    cwd: pane.board.dir,
+    cols: pane.term.cols,
+    rows: pane.term.rows,
+    startupCommand: pane.board.startupCommand || 'claude',
+    model: pane.model,
+    resume: !!resume,
+  });
+  markActivity(pane, ''); // start out "working" until the first quiet period
 }
 
 function createPane(board, col, opts = {}) {
@@ -952,20 +967,8 @@ function createPane(board, col, opts = {}) {
     setPaneFontSize(pane, pane.fontSize + (e.deltaY < 0 ? 1 : -1));
   }, { passive: false, capture: true });
 
-  // Spawn the PTY in the board's directory.
-  fitAddon.fit();
-  window.api.spawnPty({
-    id,
-    cwd: board.dir,
-    cols: term.cols,
-    rows: term.rows,
-    startupCommand: board.startupCommand || 'claude',
-    model: pane.model,
-    resume: !!opts.resume,
-  });
-
-  markActivity(pane, ''); // start out "working" until the first quiet period
-
+  // No PTY yet: the pane is still detached, so nothing useful can be measured.
+  // The caller attaches it via layout() and then calls spawnPanePty().
   return pane;
 }
 
@@ -2061,7 +2064,7 @@ document.addEventListener('keydown', (e) => {
   if (!diffBackdrop.classList.contains('hidden')) diffBackdrop.classList.add('hidden');
   else if (!branchBackdrop.classList.contains('hidden')) branchBackdrop.classList.add('hidden');
   else if (!ghBackdrop.classList.contains('hidden')) closeWizard();
-  else { const hb = document.getElementById('help-backdrop'); if (hb && !hb.classList.contains('hidden')) { hb.classList.add('hidden'); return; } const sb = document.getElementById('settings-backdrop'); if (sb && !sb.classList.contains('hidden')) sb.classList.add('hidden'); }
+  else { const ub = document.getElementById('usage-backdrop'); if (ub && !ub.classList.contains('hidden')) { ub.classList.add('hidden'); return; } const hb = document.getElementById('help-backdrop'); if (hb && !hb.classList.contains('hidden')) { hb.classList.add('hidden'); return; } const sb = document.getElementById('settings-backdrop'); if (sb && !sb.classList.contains('hidden')) sb.classList.add('hidden'); }
 });
 
 // ---------------------------------------------------------------------------
@@ -2331,10 +2334,10 @@ function mkMini(text, title, onclick) { const b = document.createElement('button
 // Voice typing
 //
 // Dictate straight into the focused thread. Speech is transcribed locally and
-// offline by OpenAI Whisper running in a worker (see voice-worker.js) — the
+// offline by Moonshine running in a worker (see voice-worker.js) — the
 // browser's Web Speech API is unusable in Electron (it relies on a Google
 // speech key that ships only in Chrome). We capture the mic, detect utterance
-// boundaries with a simple energy gate, and hand each spoken segment to the
+// boundaries with an adaptive energy gate, and hand each spoken segment to the
 // worker. Whatever text comes back is run through a user-editable dictionary
 // (to fix words it keeps mishearing) and then written to the target pane's PTY
 // — so it lands at the terminal cursor exactly like typing. The ~ key toggles
@@ -2377,13 +2380,14 @@ const VOICE_ENTER_RE = /^\s*(new ?line|press enter|hit enter|submit|send it)\s*[
 let voiceActive = false;        // the user wants to be listening
 let voiceTargetPane = null;     // pane that receives this dictation session
 
-// Whisper worker + its load lifecycle. The worker is created lazily on first
+// Speech (Moonshine) worker + its load lifecycle. The worker is created lazily on first
 // use and kept alive after that, so the model only loads once per app run.
 let sttWorker = null;
 let sttReady = false;           // model finished loading
 let sttLoadPromise = null;      // in-flight load(), resolves on 'ready'
 let sttSegId = 0;               // ids correlate transcribe requests/results
 let sttInFlight = 0;            // segments currently being transcribed
+let sttPending = [];            // segments spoken while the model was still loading
 
 // Mic capture graph (built on start, torn down on stop).
 let micStream = null;
@@ -2394,17 +2398,25 @@ let micSink = null;
 
 // Energy-gate VAD. We accumulate audio while you're speaking and flush a
 // segment to the worker once you pause (or the segment gets long). 16 kHz mono
-// is what Whisper wants, so we run the AudioContext at that rate directly.
+// is what the model wants, so we run the AudioContext at that rate directly.
+// The speech threshold adapts to the room: it tracks a running estimate of the
+// background level during quiet and requires speech to clear it by a healthy
+// factor, so a noisy fan doesn't stream junk to the model and a quiet speaker
+// with a quiet mic still registers.
 const STT_SAMPLE_RATE = 16000;
-const VAD_RMS_THRESHOLD = 0.012;   // above this a frame counts as speech
-const VAD_SILENCE_MS = 700;        // trailing quiet that ends an utterance
-const VAD_MIN_SPEECH_MS = 300;     // ignore blips shorter than this
+const VAD_FRAME_SAMPLES = 1024;    // 64 ms per VAD tick — fine-grained boundaries
+const VAD_RMS_FLOOR = 0.006;       // absolute minimum level that can count as speech
+const VAD_NOISE_FACTOR = 2.5;      // speech must exceed the noise estimate by this
+const VAD_SILENCE_MS = 550;        // trailing quiet that ends an utterance
+const VAD_MIN_SPEECH_MS = 250;     // ignore blips shorter than this
 const VAD_MAX_SEGMENT_MS = 15000;  // force a flush so long talk still lands
+const VAD_PREROLL_MS = 320;        // quiet audio kept before onset so the first word isn't clipped
 let vadFrames = [];                // Float32Array frames of the current segment
 let vadSpeechMs = 0;
 let vadSilenceMs = 0;
 let vadInSpeech = false;
-let vadPreroll = null;             // last quiet frame, kept to catch word onsets
+let vadPreroll = [];               // recent quiet frames (≤ VAD_PREROLL_MS total)
+let vadNoiseRms = 0.005;           // running background-level estimate (adapts during quiet)
 
 const voiceToggleBtn = $('voice-toggle');
 const VOICE_BTN_TITLE = voiceToggleBtn ? voiceToggleBtn.title : '';
@@ -2460,7 +2472,7 @@ function commitVoiceText(raw) {
   updateVoiceHudTarget();
 }
 
-// -- Whisper worker ----------------------------------------------------------
+// -- Speech worker -----------------------------------------------------------
 // The model lives in a worker so transcription never blocks the UI (or the
 // terminals). We boot it from a tiny blob module: a file:// page can't spawn a
 // cross-origin hm:// worker directly, but it can spawn a same-origin blob
@@ -2506,6 +2518,10 @@ function ensureSttWorker() {
         // engine that fails every segment would otherwise look "stuck listening".
         if (msg.error) flagVoiceError(voiceErrMessage(new Error(msg.error)));
         if (msg.text) commitVoiceText(msg.text);
+        // An empty transcription with no error means the model heard the
+        // segment but made nothing of it. Say so briefly — silence here is
+        // indistinguishable from the feature being broken.
+        else if (!msg.error && voiceActive) flashVoiceNotice('Didn’t catch that — try again');
         renderVoiceListening();
       }
     };
@@ -2526,7 +2542,9 @@ function resetVad() {
   vadSpeechMs = 0;
   vadSilenceMs = 0;
   vadInSpeech = false;
-  vadPreroll = null;
+  vadPreroll = [];
+  // vadNoiseRms deliberately survives resets — the room doesn't change between
+  // utterances, and re-learning it from scratch would mis-gate the next one.
 }
 
 function rms(frame) {
@@ -2548,23 +2566,42 @@ function flushSegment() {
   let off = 0;
   for (const f of frames) { audio.set(f, off); off += f.length; }
 
+  if (!sttReady) {
+    // The model is still loading: hold the segment and send it once ready, so
+    // words spoken right after toggling voice on aren't lost. Cap the backlog
+    // at ~60s of audio (oldest dropped first) in case the load never finishes.
+    sttPending.push(audio);
+    let held = 0;
+    for (const a of sttPending) held += a.length;
+    while (sttPending.length > 1 && held > STT_SAMPLE_RATE * 60) {
+      held -= sttPending[0].length;
+      sttPending.shift();
+    }
+    return;
+  }
+  postSegment(audio);
+}
+
+function postSegment(audio) {
   sttInFlight++;
   renderVoiceListening();
   // Transfer the backing buffer so we don't copy the audio across threads.
   sttWorker.postMessage({ type: 'transcribe', id: ++sttSegId, audio }, [audio.buffer]);
 }
 
-function onAudioFrame(ev) {
+// One VAD tick: `frame` is VAD_FRAME_SAMPLES of 16 kHz mono Float32 we own.
+function onAudioFrame(frame) {
   if (!voiceActive) return;
-  const input = ev.inputBuffer.getChannelData(0);
-  const frame = new Float32Array(input);          // copy; the buffer is reused
   const frameMs = (frame.length / STT_SAMPLE_RATE) * 1000;
-  const speaking = rms(frame) >= VAD_RMS_THRESHOLD;
+  const level = rms(frame);
+  const threshold = Math.max(VAD_RMS_FLOOR, vadNoiseRms * VAD_NOISE_FACTOR);
+  const speaking = level >= threshold;
 
   if (speaking) {
     if (!vadInSpeech) {
       vadInSpeech = true;
-      if (vadPreroll) vadFrames.push(vadPreroll);  // recover the word's onset
+      for (const f of vadPreroll) vadFrames.push(f);  // recover the word's onset
+      vadPreroll = [];
     }
     vadFrames.push(frame);
     vadSpeechMs += frameMs;
@@ -2573,7 +2610,12 @@ function onAudioFrame(ev) {
     vadFrames.push(frame);                          // keep trailing quiet for context
     vadSilenceMs += frameMs;
   } else {
-    vadPreroll = frame;                             // not speaking yet; remember last frame
+    // Not speaking: adapt the noise estimate (quiet frames only, so speech
+    // never inflates it) and keep a short rolling pre-roll for the next onset.
+    vadNoiseRms = vadNoiseRms * 0.95 + level * 0.05;
+    vadPreroll.push(frame);
+    const maxFrames = Math.ceil(VAD_PREROLL_MS / frameMs);
+    while (vadPreroll.length > maxFrames) vadPreroll.shift();
   }
 
   const segMs = vadSpeechMs + vadSilenceMs;
@@ -2589,21 +2631,62 @@ async function startCapture() {
   audioCtx = new AudioContext({ sampleRate: STT_SAMPLE_RATE });
   if (audioCtx.state === 'suspended') { try { await audioCtx.resume(); } catch (_) {} }
   micSource = audioCtx.createMediaStreamSource(micStream);
-  // ScriptProcessor is deprecated but dependable and needs no extra module
-  // file; 4096 frames at 16 kHz ≈ 256 ms per VAD tick.
-  micProcessor = audioCtx.createScriptProcessor(4096, 1, 1);
-  micProcessor.onaudioprocess = onAudioFrame;
+
+  // Prefer an AudioWorklet: it captures on the realtime audio thread, so heavy
+  // main-thread work (xterm rendering across many panes) can't stall or drop
+  // mic audio the way the deprecated ScriptProcessor can — dropped frames turn
+  // directly into missing words. The tiny processor accumulates the 128-sample
+  // render quanta into VAD_FRAME_SAMPLES chunks and transfers them here.
+  try {
+    const src = `registerProcessor('hm-mic-capture', class extends AudioWorkletProcessor {
+      constructor() { super(); this.buf = new Float32Array(${VAD_FRAME_SAMPLES}); this.n = 0; }
+      process(inputs) {
+        const ch = inputs[0] && inputs[0][0];
+        if (!ch) return true;
+        let i = 0;
+        while (i < ch.length) {
+          const take = Math.min(ch.length - i, this.buf.length - this.n);
+          this.buf.set(ch.subarray(i, i + take), this.n);
+          this.n += take; i += take;
+          if (this.n === this.buf.length) {
+            this.port.postMessage(this.buf, [this.buf.buffer]);
+            this.buf = new Float32Array(${VAD_FRAME_SAMPLES}); this.n = 0;
+          }
+        }
+        return true;
+      }
+    });`;
+    const url = URL.createObjectURL(new Blob([src], { type: 'text/javascript' }));
+    await audioCtx.audioWorklet.addModule(url);
+    micProcessor = new AudioWorkletNode(audioCtx, 'hm-mic-capture', {
+      numberOfInputs: 1, numberOfOutputs: 1, outputChannelCount: [1],
+    });
+    micProcessor.port.onmessage = (ev) => onAudioFrame(ev.data);
+    micSource.connect(micProcessor);
+  } catch (_) {
+    // Fallback: ScriptProcessor (deprecated but universal). Its buffer is
+    // reused by the browser, so copy each callback's samples before queuing.
+    micProcessor = audioCtx.createScriptProcessor(VAD_FRAME_SAMPLES, 1, 1);
+    micProcessor.onaudioprocess = (ev) => onAudioFrame(new Float32Array(ev.inputBuffer.getChannelData(0)));
+    micSource.connect(micProcessor);
+  }
+
   // A muted sink keeps the graph pulling audio without playing the mic back.
   micSink = audioCtx.createGain();
   micSink.gain.value = 0;
-  micSource.connect(micProcessor);
   micProcessor.connect(micSink);
   micSink.connect(audioCtx.destination);
   resetVad();
 }
 
 function stopCapture() {
-  if (micProcessor) { try { micProcessor.disconnect(); micProcessor.onaudioprocess = null; } catch (_) {} }
+  if (micProcessor) {
+    try {
+      micProcessor.disconnect();
+      if (micProcessor.port) micProcessor.port.onmessage = null;   // AudioWorkletNode
+      micProcessor.onaudioprocess = null;                          // ScriptProcessor fallback
+    } catch (_) {}
+  }
   if (micSource) { try { micSource.disconnect(); } catch (_) {} }
   if (micSink) { try { micSink.disconnect(); } catch (_) {} }
   if (micStream) { try { micStream.getTracks().forEach((t) => t.stop()); } catch (_) {} }
@@ -2620,13 +2703,22 @@ async function startVoice() {
   voiceTargetPane = pane;
   voiceActive = true;
   sttInFlight = 0;
+  sttPending = [];
   clearVoiceError();
   renderVoiceState();
-  setVoiceHudText('Loading speech model…');
+  setVoiceHudText(sttReady ? 'Listening…' : 'Loading speech model… (you can start speaking)');
   try {
-    await ensureSttWorker();
-    if (!voiceActive) return;                       // toggled off while loading
+    // Open the mic and load the model concurrently: the VAD holds segments
+    // spoken during the load (see flushSegment), so early words aren't lost.
+    const loading = ensureSttWorker();
+    loading.catch(() => {});                        // handled below; avoid unhandled rejection if capture throws first
     await startCapture();
+    if (!voiceActive) { stopCapture(); return; }    // toggled off while the mic was opening
+    await loading;
+    if (!voiceActive) return;                       // toggled off while loading
+    const backlog = sttPending;
+    sttPending = [];
+    for (const audio of backlog) postSegment(audio);
     renderVoiceListening();
   } catch (err) {
     flagVoiceError(voiceErrMessage(err));
@@ -2635,6 +2727,10 @@ async function startVoice() {
 }
 
 function stopVoice() {
+  // Speech still buffered when the user toggles off is speech they said —
+  // transcribe and type it rather than throw it away.
+  if (vadInSpeech && sttReady && vadSpeechMs >= VAD_MIN_SPEECH_MS) flushSegment();
+  sttPending = [];
   voiceActive = false;
   stopCapture();
   setVoiceHudText('');
@@ -2679,12 +2775,24 @@ function updateVoiceHudTarget() {
 }
 function setVoiceHudText(t) { if (voiceHudText) voiceHudText.textContent = t || ''; }
 
-// Whisper transcribes a whole utterance at once, so there's no live word-by-word
+// The model transcribes a whole utterance at once, so there's no live word-by-word
 // interim text; instead the HUD shows whether we're listening or working.
 function renderVoiceListening() {
   if (!voiceActive) return;
+  if (voiceNoticeTimer) return;   // a transient notice is showing; don't stomp it
   setVoiceHudText(sttInFlight > 0 ? 'Transcribing…' : 'Listening…');
   updateVoiceHudTarget();
+}
+
+// Show a short-lived message in the HUD, then fall back to Listening…/Transcribing…
+let voiceNoticeTimer = null;
+function flashVoiceNotice(text) {
+  if (voiceNoticeTimer) clearTimeout(voiceNoticeTimer);
+  setVoiceHudText(text);
+  voiceNoticeTimer = setTimeout(() => {
+    voiceNoticeTimer = null;
+    renderVoiceListening();
+  }, 1600);
 }
 
 function flagVoiceError(msg) {
@@ -2825,6 +2933,167 @@ if (voiceSettingsBtn) voiceSettingsBtn.onclick = openVoiceModal;
 const settingsBtn = $('settings-btn');
 if (settingsBtn) settingsBtn.onclick = () => openSettings('general');
 $('settings-close').onclick = closeSettings;
+
+// -- Claude usage (toolbar pill + modal) --------------------------------------
+// The pill shows the most-constrained plan limit (the one closest to running
+// out); the modal breaks down every limit window plus today's per-model token
+// totals from the local Claude Code transcripts.
+const usageBackdrop = $('usage-backdrop');
+const usageBtn = $('usage-btn');
+const usageBody = $('usage-body');
+let usageData = null;
+
+function fmtTokens(n) {
+  if (!n) return '0';
+  if (n >= 1e9) return (n / 1e9).toFixed(1) + 'B';
+  if (n >= 1e6) return (n / 1e6).toFixed(1) + 'M';
+  if (n >= 1e3) return (n / 1e3).toFixed(1) + 'k';
+  return String(n);
+}
+
+// "resets 8:30 PM (in 2h 4m)" from an ISO timestamp.
+function fmtReset(iso) {
+  if (!iso) return '';
+  const t = new Date(iso);
+  if (isNaN(t)) return '';
+  const clock = t.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+  let mins = Math.max(0, Math.round((t - Date.now()) / 60000));
+  const h = Math.floor(mins / 60), m = mins % 60;
+  const rel = h >= 24 ? `in ${Math.floor(h / 24)}d ${h % 24}h` : h ? `in ${h}h ${m}m` : `in ${m}m`;
+  return `resets ${clock} (${rel})`;
+}
+
+function usageSeverity(pct) {
+  if (pct >= 85) return 'crit';
+  if (pct >= 60) return 'warn';
+  return 'ok';
+}
+
+function renderUsagePill() {
+  if (!usageBtn) return;
+  usageBtn.classList.remove('ok', 'warn', 'crit');
+  const d = usageData;
+  if (!d || !d.limits || !d.limits.length) {
+    usageBtn.textContent = '⛽ Usage';
+    usageBtn.title = d && d.limitsError
+      ? 'Claude usage — ' + d.limitsError
+      : 'Claude usage — how much of your plan\'s limits you\'ve used';
+    return;
+  }
+  // The binding constraint is whichever window is fullest — that's the number
+  // that decides how much Claude you have left right now.
+  const top = d.limits.reduce((a, b) => (b.percent > a.percent ? b : a), d.limits[0]);
+  usageBtn.textContent = `⛽ ${Math.round(top.percent)}%`;
+  usageBtn.classList.add(usageSeverity(top.percent));
+  usageBtn.title = d.limits
+    .map((l) => `${l.label}: ${Math.round(l.percent)}% used — ${fmtReset(l.resetsAt)}`)
+    .join('\n') + '\nClick for details.';
+}
+
+function renderUsageModal() {
+  if (!usageBody) return;
+  usageBody.innerHTML = '';
+  const d = usageData;
+  if (!d) { usageBody.appendChild(el('p', 'help-note', 'Loading…')); return; }
+
+  // -- Plan limits ----------------------------------------------------------
+  const limitsGroup = el('div', 'settings-group');
+  const planName = d.subscriptionType ? ` (${d.subscriptionType} plan)` : '';
+  limitsGroup.appendChild(el('div', 'settings-group-title', 'Plan limits' + planName));
+  if (d.limitsError) {
+    limitsGroup.appendChild(el('p', 'help-note', d.limitsError));
+  } else if (!d.limits.length) {
+    limitsGroup.appendChild(el('p', 'help-note', 'No limit information reported for this account.'));
+  } else {
+    for (const l of d.limits) {
+      const row = el('div', 'usage-limit');
+      const head = el('div', 'usage-limit-head');
+      head.appendChild(el('span', 'usage-limit-label', l.label));
+      head.appendChild(el('span', 'usage-limit-detail',
+        `${Math.round(l.percent)}% used · ${100 - Math.round(l.percent)}% left · ${fmtReset(l.resetsAt)}`));
+      const bar = el('div', 'usage-bar');
+      const fill = el('div', 'usage-bar-fill ' + usageSeverity(l.percent));
+      fill.style.width = Math.min(100, Math.max(0, l.percent)) + '%';
+      bar.appendChild(fill);
+      row.append(head, bar);
+      limitsGroup.appendChild(row);
+    }
+    limitsGroup.appendChild(el('small', '',
+      'Same windows as Claude Code\'s /usage — the session window covers rolling 5-hour blocks; weekly windows cap the whole week.'));
+  }
+  usageBody.appendChild(limitsGroup);
+
+  // -- Today's tokens ---------------------------------------------------------
+  const tokGroup = el('div', 'settings-group');
+  tokGroup.appendChild(el('div', 'settings-group-title', 'Tokens used today'));
+  const models = Object.keys((d.tokens && d.tokens.byModel) || {});
+  if (d.tokensError) {
+    tokGroup.appendChild(el('p', 'help-note', d.tokensError));
+  } else if (!models.length) {
+    tokGroup.appendChild(el('p', 'help-note', 'No Claude activity recorded today.'));
+  } else {
+    const table = document.createElement('table');
+    table.className = 'usage-table';
+    const mkRow = (cells, header) => {
+      const tr = document.createElement('tr');
+      for (const c of cells) {
+        const td = document.createElement(header ? 'th' : 'td');
+        td.textContent = c;
+        tr.appendChild(td);
+      }
+      return tr;
+    };
+    table.appendChild(mkRow(['Model', 'Msgs', 'Input', 'Output', 'Cache read', 'Cache write'], true));
+    const total = { messages: 0, input: 0, output: 0, cacheRead: 0, cacheCreate: 0 };
+    for (const model of models.sort()) {
+      const m = d.tokens.byModel[model];
+      table.appendChild(mkRow([model, String(m.messages), fmtTokens(m.input),
+        fmtTokens(m.output), fmtTokens(m.cacheRead), fmtTokens(m.cacheCreate)]));
+      for (const k of Object.keys(total)) total[k] += m[k];
+    }
+    if (models.length > 1) {
+      const tr = mkRow(['Total', String(total.messages), fmtTokens(total.input),
+        fmtTokens(total.output), fmtTokens(total.cacheRead), fmtTokens(total.cacheCreate)]);
+      tr.className = 'usage-total';
+      table.appendChild(tr);
+    }
+    tokGroup.appendChild(table);
+    tokGroup.appendChild(el('small', '',
+      'Counted from this machine\'s Claude Code transcripts (all projects, since midnight). Cache reads are heavily discounted against your limits.'));
+  }
+  usageBody.appendChild(tokGroup);
+}
+
+async function refreshUsage() {
+  try {
+    usageData = await window.api.usage.get();
+  } catch (err) {
+    usageData = {
+      limits: [], limitsError: (err && err.message) || String(err),
+      tokens: { byModel: {} }, tokensError: null, subscriptionType: null,
+    };
+  }
+  renderUsagePill();
+  if (usageBackdrop && !usageBackdrop.classList.contains('hidden')) renderUsageModal();
+}
+
+function openUsage() {
+  if (!usageBackdrop) return;
+  renderUsageModal(); // show whatever we have, then refresh in place
+  usageBackdrop.classList.remove('hidden');
+  refreshUsage();
+}
+function closeUsage() { if (usageBackdrop) usageBackdrop.classList.add('hidden'); }
+
+if (usageBtn) usageBtn.onclick = openUsage;
+const usageCloseBtn = $('usage-close');
+if (usageCloseBtn) usageCloseBtn.onclick = closeUsage;
+const usageRefreshBtn = $('usage-refresh');
+if (usageRefreshBtn) usageRefreshBtn.onclick = refreshUsage;
+if (usageBackdrop) usageBackdrop.addEventListener('mousedown', (e) => { if (e.target === usageBackdrop) closeUsage(); });
+
+refreshUsage();
+setInterval(refreshUsage, 60 * 1000);
 
 // -- Help modal -------------------------------------------------------------
 const helpBackdrop = $('help-backdrop');
