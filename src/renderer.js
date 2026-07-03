@@ -2974,7 +2974,7 @@ function renderUsagePill() {
   usageBtn.classList.remove('ok', 'warn', 'crit');
   const d = usageData;
   if (!d || !d.limits || !d.limits.length) {
-    usageBtn.textContent = '⛽ Usage';
+    usageBtn.textContent = '📊 Usage';
     usageBtn.title = d && d.limitsError
       ? 'Claude usage — ' + d.limitsError
       : 'Claude usage — how much of your plan\'s limits you\'ve used';
@@ -2983,7 +2983,7 @@ function renderUsagePill() {
   // The binding constraint is whichever window is fullest — that's the number
   // that decides how much Claude you have left right now.
   const top = d.limits.reduce((a, b) => (b.percent > a.percent ? b : a), d.limits[0]);
-  usageBtn.textContent = `⛽ ${Math.round(top.percent)}%`;
+  usageBtn.textContent = `📊 ${Math.round(top.percent)}%`;
   usageBtn.classList.add(usageSeverity(top.percent));
   usageBtn.title = d.limits
     .map((l) => `${l.label}: ${Math.round(l.percent)}% used — ${fmtReset(l.resetsAt)}`)
