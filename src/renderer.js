@@ -11,18 +11,161 @@ const grids = new Map();         // boardId -> { el, columns: [ { el, flex, pane
 let idCounter = 1;
 const nextId = (p) => `${p}-${Date.now().toString(36)}-${idCounter++}`;
 
-// xterm theme
-const THEME = {
-  background: '#11111b',
-  foreground: '#cdd6f4',
-  cursor: '#f5e0dc',
-  selectionBackground: '#585b70',
-  black: '#45475a', red: '#f38ba8', green: '#a6e3a1', yellow: '#f9e2af',
-  blue: '#89b4fa', magenta: '#f5c2e7', cyan: '#94e2d5', white: '#bac2de',
-  brightBlack: '#585b70', brightRed: '#f38ba8', brightGreen: '#a6e3a1',
-  brightYellow: '#f9e2af', brightBlue: '#89b4fa', brightMagenta: '#f5c2e7',
-  brightCyan: '#94e2d5', brightWhite: '#a6adc8',
+// ---------------------------------------------------------------------------
+// Themes
+//
+// A theme colours both the app chrome (CSS custom properties on :root) and the
+// xterm terminal palette. The registry below is the single source of truth;
+// styles.css mirrors the default (Midnight) so the app is correctly coloured
+// before this script runs. Switching themes updates the CSS variables live and
+// re-applies the terminal colours to every open thread.
+//
+// `vars`  — CSS custom properties set on :root (matches the names in styles.css).
+// `term`  — the xterm palette (background/foreground + 16 ANSI colours).
+// ---------------------------------------------------------------------------
+const THEMES = {
+  midnight: {
+    label: 'Midnight (deep blue-black, cyan)',
+    vars: {
+      '--bg': '#0b0e14', '--bg-alt': '#070a10', '--panel': '#04060a',
+      '--surface': '#1b2333', '--text': '#c6d0e0', '--muted': '#64748b',
+      '--accent': '#38bdf8', '--accent-2': '#34d399', '--border': '#1b2333',
+      '--danger': '#f87171', '--peach': '#fb923c', '--yellow': '#fbbf24',
+      '--on-accent': '#04060a',
+    },
+    term: {
+      background: '#04060a', foreground: '#c6d0e0',
+      cursor: '#38bdf8', selectionBackground: '#1e293b',
+      black: '#1b2333', red: '#f87171', green: '#34d399', yellow: '#fbbf24',
+      blue: '#38bdf8', magenta: '#c084fc', cyan: '#22d3ee', white: '#cbd5e1',
+      brightBlack: '#475569', brightRed: '#fca5a5', brightGreen: '#6ee7b7',
+      brightYellow: '#fcd34d', brightBlue: '#7dd3fc', brightMagenta: '#d8b4fe',
+      brightCyan: '#67e8f9', brightWhite: '#f1f5f9',
+    },
+  },
+  forest: {
+    label: 'Forest (deep green, lime)',
+    vars: {
+      '--bg': '#0f1a14', '--bg-alt': '#0a130e', '--panel': '#050d08',
+      '--surface': '#1d2f24', '--text': '#d3e0d5', '--muted': '#7d9585',
+      '--accent': '#4ade80', '--accent-2': '#a3e635', '--border': '#1d2f24',
+      '--danger': '#f87171', '--peach': '#fb923c', '--yellow': '#facc15',
+      '--on-accent': '#050d08',
+    },
+    term: {
+      background: '#050d08', foreground: '#d3e0d5',
+      cursor: '#4ade80', selectionBackground: '#1f3327',
+      black: '#1d2f24', red: '#ef6f6f', green: '#4ade80', yellow: '#facc15',
+      blue: '#4d9de0', magenta: '#c58fd8', cyan: '#56c8b0', white: '#c9d6cc',
+      brightBlack: '#4a6154', brightRed: '#fca5a5', brightGreen: '#86efac',
+      brightYellow: '#fde047', brightBlue: '#7cc0f5', brightMagenta: '#d8b4fe',
+      brightCyan: '#7ee0cc', brightWhite: '#e7efe9',
+    },
+  },
+  ember: {
+    label: 'Ember (warm charcoal, amber)',
+    vars: {
+      '--bg': '#1a1512', '--bg-alt': '#140f0c', '--panel': '#0d0907',
+      '--surface': '#2c2420', '--text': '#ecdcc8', '--muted': '#a08a76',
+      '--accent': '#f59e0b', '--accent-2': '#fb923c', '--border': '#2c2420',
+      '--danger': '#ef4444', '--peach': '#fdba74', '--yellow': '#fcd34d',
+      '--on-accent': '#0d0907',
+    },
+    term: {
+      background: '#0d0907', foreground: '#ecdcc8',
+      cursor: '#f59e0b', selectionBackground: '#3a2f27',
+      black: '#2c2420', red: '#ef4444', green: '#a3b18a', yellow: '#fcd34d',
+      blue: '#7ba7c9', magenta: '#c98fb0', cyan: '#6fbfae', white: '#d9c7b0',
+      brightBlack: '#6e5c4c', brightRed: '#f87171', brightGreen: '#c3d1a8',
+      brightYellow: '#fde68a', brightBlue: '#9cc0dc', brightMagenta: '#e0abc8',
+      brightCyan: '#94d6c6', brightWhite: '#f5ead6',
+    },
+  },
+  grape: {
+    label: 'Grape (purple, magenta)',
+    vars: {
+      '--bg': '#231a33', '--bg-alt': '#1c1429', '--panel': '#140d1e',
+      '--surface': '#382a4d', '--text': '#e9def5', '--muted': '#9d8bb8',
+      '--accent': '#c084fc', '--accent-2': '#f472b6', '--border': '#382a4d',
+      '--danger': '#fb7185', '--peach': '#fbbf24', '--yellow': '#fde047',
+      '--on-accent': '#140d1e',
+    },
+    term: {
+      background: '#140d1e', foreground: '#e9def5',
+      cursor: '#c084fc', selectionBackground: '#3f2f57',
+      black: '#382a4d', red: '#fb7185', green: '#7ee787', yellow: '#fde047',
+      blue: '#818cf8', magenta: '#e879f9', cyan: '#67e8f9', white: '#d8c9ec',
+      brightBlack: '#6d5a8a', brightRed: '#fda4af', brightGreen: '#a6f0ad',
+      brightYellow: '#fef08a', brightBlue: '#a5b4fc', brightMagenta: '#f0abfc',
+      brightCyan: '#a5f3fc', brightWhite: '#f3edfb',
+    },
+  },
+  paper: {
+    label: 'Paper (light, indigo)',
+    vars: {
+      '--bg': '#faf9f6', '--bg-alt': '#f1efe9', '--panel': '#eae7df',
+      '--surface': '#ded9cd', '--text': '#3a3733', '--muted': '#6f6a60',
+      '--accent': '#4f46e5', '--accent-2': '#059669', '--border': '#d6d1c4',
+      '--danger': '#dc2626', '--peach': '#ea580c', '--yellow': '#ca8a04',
+      '--on-accent': '#faf9f6',
+    },
+    term: {
+      background: '#eae7df', foreground: '#3a3733',
+      cursor: '#4f46e5', selectionBackground: '#d6d1c4',
+      black: '#57534e', red: '#dc2626', green: '#059669', yellow: '#ca8a04',
+      blue: '#4f46e5', magenta: '#c026d3', cyan: '#0891b2', white: '#a8a29e',
+      brightBlack: '#78716c', brightRed: '#ef4444', brightGreen: '#10b981',
+      brightYellow: '#eab308', brightBlue: '#6366f1', brightMagenta: '#d946ef',
+      brightCyan: '#06b6d4', brightWhite: '#292524',
+    },
+  },
+  rose: {
+    label: 'Rose (warm cream, rose)',
+    vars: {
+      '--bg': '#faf4ed', '--bg-alt': '#f3ece2', '--panel': '#efe6da',
+      '--surface': '#e4d8cc', '--text': '#575279', '--muted': '#8c839c',
+      '--accent': '#d7827e', '--accent-2': '#56949f', '--border': '#dfd6ca',
+      '--danger': '#b4637a', '--peach': '#ea9d34', '--yellow': '#ea9d34',
+      '--on-accent': '#faf4ed',
+    },
+    term: {
+      background: '#efe6da', foreground: '#575279',
+      cursor: '#d7827e', selectionBackground: '#dfd6ca',
+      black: '#797593', red: '#b4637a', green: '#56949f', yellow: '#ea9d34',
+      blue: '#286983', magenta: '#907aa9', cyan: '#d7827e', white: '#575279',
+      brightBlack: '#9893a5', brightRed: '#c96a83', brightGreen: '#63a3ae',
+      brightYellow: '#f0ac48', brightBlue: '#356e8a', brightMagenta: '#a086bb',
+      brightCyan: '#e0918d', brightWhite: '#4a4568',
+    },
+  },
 };
+const DEFAULT_THEME = 'midnight';
+const isValidTheme = (t) => Object.prototype.hasOwnProperty.call(THEMES, t);
+
+let currentTheme = localStorage.getItem('hm.theme');
+if (!isValidTheme(currentTheme)) currentTheme = DEFAULT_THEME;
+
+// xterm theme — mutated in place by applyTheme so freshly-created terminals
+// read the current palette from it (new Terminal({ theme: THEME })).
+const THEME = { ...THEMES[DEFAULT_THEME].term };
+
+// Apply a theme: repaint the app chrome (CSS vars) and every open terminal.
+function applyTheme(id, { persist = true } = {}) {
+  if (!isValidTheme(id)) id = DEFAULT_THEME;
+  currentTheme = id;
+  const t = THEMES[id];
+  const root = document.documentElement;
+  for (const [k, v] of Object.entries(t.vars)) root.style.setProperty(k, v);
+  Object.assign(THEME, t.term);
+  for (const g of grids.values())
+    for (const col of g.columns)
+      for (const pane of col.panes)
+        if (!pane.disposed) pane.term.options.theme = { ...THEME };
+  if (persist) localStorage.setItem('hm.theme', id);
+}
+
+// Paint the persisted theme immediately, before any terminals are created.
+applyTheme(currentTheme, { persist: false });
 
 // ---------------------------------------------------------------------------
 // Per-thread font sizing
@@ -72,6 +215,64 @@ const isValidModel = (m) => MODELS.some((x) => x.value === m);
 let defaultModel = localStorage.getItem('hm.model') || 'default';
 if (!isValidModel(defaultModel)) defaultModel = 'default';
 
+// ---------------------------------------------------------------------------
+// Per-thread agent
+//
+// Each thread can run a different coding agent CLI: Claude Code (the default),
+// OpenAI's Codex CLI ("ChatGPT"), or Google's Gemini CLI — so one hive can mix
+// e.g. three Claude threads and one ChatGPT thread. A Claude thread keeps the
+// hive's custom startup command (extra flags etc.); other agents run their own
+// command. Switching a live thread kills its process and starts the new agent
+// in the same pane. The Claude model dropdown only applies to Claude threads.
+// ---------------------------------------------------------------------------
+const AGENTS = [
+  { value: 'claude', label: 'Claude',  command: 'claude', install: null },
+  { value: 'codex',  label: 'ChatGPT', command: 'codex',  install: 'npm install -g @openai/codex' },
+  { value: 'gemini', label: 'Gemini',  command: 'gemini', install: 'npm install -g @google/gemini-cli' },
+];
+const isValidAgent = (a) => AGENTS.some((x) => x.value === a);
+const agentFor = (v) => AGENTS.find((x) => x.value === v) || AGENTS[0];
+
+// The command a pane's PTY should auto-run. Claude threads honour the hive's
+// custom startup command; other agents always run their own CLI.
+function paneCommand(pane) {
+  return pane.agent === 'claude'
+    ? (pane.board.startupCommand || 'claude')
+    : agentFor(pane.agent).command;
+}
+
+function setPaneAgent(pane, agent) {
+  if (pane.disposed) return;
+  if (!isValidAgent(agent)) agent = 'claude';
+  if (pane.agent === agent) return;
+  pane.agent = agent;
+  if (pane.agentSelect && pane.agentSelect.value !== agent) pane.agentSelect.value = agent;
+  // The Claude model dropdown means nothing to other agents — hide it there.
+  if (pane.modelSelect) pane.modelSelect.style.display = agent === 'claude' ? '' : 'none';
+  // Auto names track the running command ("codex 2"); manual names stay put.
+  if (pane.autoName) {
+    const num = (/(\d+)\s*$/.exec(pane.name || '') || [])[1];
+    pane.name = agentFor(agent).command + (num ? ' ' + num : '');
+    pane.title.textContent = pane.name;
+  }
+  respawnPane(pane);
+}
+
+// Kill a pane's process and start its (possibly new) agent in the same pane.
+// The pane gets a fresh PTY id so late data/exit events from the old process
+// can't reach it.
+function respawnPane(pane) {
+  window.api.killPty(pane.id);
+  pane.id = nextId('term');
+  clearTimeout(pane.idleTimer);
+  pane.state = null;
+  pane.buf = '';
+  pane.errored = false;
+  pane.hintShown = false;
+  try { pane.term.reset(); } catch (_) { /* ignore */ }
+  spawnPanePty(pane);
+}
+
 function setPaneModel(pane, model) {
   if (pane.disposed) return;
   if (!isValidModel(model)) model = 'default';
@@ -80,7 +281,7 @@ function setPaneModel(pane, model) {
   localStorage.setItem('hm.model', model);
   if (pane.modelSelect && pane.modelSelect.value !== model) pane.modelSelect.value = model;
   // Switch a running thread live by driving Claude Code's /model command.
-  if (pane.state !== 'dead') {
+  if (pane.agent === 'claude' && pane.state !== 'dead') {
     window.api.writePty(pane.id, `/model ${model}\r`);
     markActivity(pane, '');
   }
@@ -155,12 +356,15 @@ function evaluateIdle(pane) {
   // A failed startup command: hint once, right in the terminal.
   if (!pane.hintShown && CMD_MISSING_PATTERNS.some((re) => re.test(buf))) {
     pane.hintShown = true;
-    const cmd = pane.board.startupCommand || 'claude';
+    const cmd = paneCommand(pane);
+    const install = agentFor(pane.agent).install;
+    const fix = install
+      ? `Install it with \`${install}\` (then sign in by running \`${cmd}\` once)`
+      : `Install it (or fix the hive's startup command in ✎ Edit hive)`;
     try {
       pane.term.write(
         `\r\n\x1b[33m[Hivemind] "${cmd}" wasn't found on PATH. ` +
-        `Install it (or fix the hive's startup command in ✎ Edit hive), ` +
-        `then open a new thread.\x1b[0m\r\n`);
+        `${fix}, then open a new thread.\x1b[0m\r\n`);
     } catch (_) { /* ignore */ }
   }
 
@@ -304,7 +508,19 @@ function setPaneCaption(pane, text, { persist = true } = {}) {
     pane.caption.textContent = full.length > 80 ? full.slice(0, 79) + '…' : full;
     pane.caption.title = full;
   }
+  updateTitleVisibility(pane);
   if (persist) persistLayout(pane.board.id);
+}
+
+// Once an auto-named thread ("claude 1") has a caption, the caption becomes the
+// title: hide the "claude #" name and promote the caption's styling. A manually
+// renamed thread keeps its name on show.
+function updateTitleVisibility(pane) {
+  if (!pane || !pane.title) return;
+  const titled = pane.autoName && !!(pane.captionText || '').trim();
+  pane.title.classList.toggle('is-hidden', titled);
+  const wrap = pane.title.parentElement;
+  if (wrap) wrap.classList.toggle('titled', titled);
 }
 
 // Send keystrokes/text to a pane.
@@ -378,8 +594,8 @@ function serializeLayout(boardId) {
   const cols = g.columns.map((col) => ({
     flex: col.flex,
     panes: col.panes.filter((p) => !p.disposed).map((p) => ({
-      name: p.name, model: p.model, fontSize: p.fontSize,
-      flex: p.flex, caption: p.captionText || '',
+      name: p.name, agent: p.agent, model: p.model, fontSize: p.fontSize,
+      flex: p.flex, caption: p.captionText || '', autoName: !!p.autoName,
     })),
   })).filter((c) => c.panes.length);
   return cols.length ? cols : null;
@@ -403,9 +619,14 @@ function rebuildFromLayout(board) {
     colObj.el.className = 'column';
     g.columns.push(colObj);
     for (const pd of (col.panes || [])) {
+      // Layouts saved before autoName existed: treat a "<cmd> <n>" name as auto.
+      const agent = isValidAgent(pd.agent) ? pd.agent : 'claude';
+      const cmd = agent === 'claude' ? (board.startupCommand || 'claude') : agentFor(agent).command;
+      const looksAuto = new RegExp('^' + cmd.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + ' \\d+$').test(pd.name || '');
+      const autoName = pd.autoName !== undefined ? pd.autoName : looksAuto;
       const pane = createPane(board, colObj, {
-        name: pd.name, model: pd.model, fontSize: pd.fontSize,
-        flex: pd.flex, caption: pd.caption,
+        name: pd.name, agent, model: pd.model, fontSize: pd.fontSize,
+        flex: pd.flex, caption: pd.caption, autoName,
       });
       colObj.panes.push(pane);
       const m = /(\d+)\s*$/.exec(pd.name || '');
@@ -695,7 +916,10 @@ function addTerminal(board, opts = {}) {
 
   if (!opts.name) {
     board._seq = (board._seq || 0) + 1;
-    opts = Object.assign({ name: `${board.startupCommand || 'claude'} ${board._seq}` }, opts);
+    const baseCmd = (opts.agent && opts.agent !== 'claude')
+      ? agentFor(opts.agent).command
+      : (board.startupCommand || 'claude');
+    opts = Object.assign({ name: `${baseCmd} ${board._seq}`, autoName: true }, opts);
   }
   const pane = createPane(board, col, opts);
   col.panes.push(pane);
@@ -721,8 +945,8 @@ function spawnPanePty(pane, { resume } = {}) {
     cwd: pane.board.dir,
     cols: pane.term.cols,
     rows: pane.term.rows,
-    startupCommand: pane.board.startupCommand || 'claude',
-    model: pane.model,
+    startupCommand: paneCommand(pane),
+    model: pane.agent === 'claude' ? pane.model : 'default',
     resume: !!resume,
   });
   markActivity(pane, ''); // start out "working" until the first quiet period
@@ -730,7 +954,9 @@ function spawnPanePty(pane, { resume } = {}) {
 
 function createPane(board, col, opts = {}) {
   const id = nextId('term');
-  const startName = opts.name || board.startupCommand || 'claude';
+  const startAgent = isValidAgent(opts.agent) ? opts.agent : 'claude';
+  const startName = opts.name ||
+    (startAgent === 'claude' ? (board.startupCommand || 'claude') : agentFor(startAgent).command);
   const startModel = isValidModel(opts.model) ? opts.model : defaultModel;
   const startFont = opts.fontSize ? clampFont(opts.fontSize) : defaultFontSize;
   const el = document.createElement('div');
@@ -769,6 +995,16 @@ function createPane(board, col, opts = {}) {
   zoomBtn.className = 'zoom-btn';
   zoomBtn.textContent = '⛶';
   zoomBtn.title = 'Maximize this thread (Ctrl+Enter)';
+  const agentSelect = document.createElement('select');
+  agentSelect.className = 'model-select agent-select';
+  agentSelect.title = 'Agent for this thread (Claude, ChatGPT, or Gemini)';
+  for (const a of AGENTS) {
+    const opt = document.createElement('option');
+    opt.value = a.value;
+    opt.textContent = a.label;
+    agentSelect.appendChild(opt);
+  }
+  agentSelect.value = startAgent;
   const modelSelect = document.createElement('select');
   modelSelect.className = 'model-select';
   modelSelect.title = 'Claude model for this thread';
@@ -779,12 +1015,13 @@ function createPane(board, col, opts = {}) {
     modelSelect.appendChild(opt);
   }
   modelSelect.value = startModel;
+  if (startAgent !== 'claude') modelSelect.style.display = 'none';
   const statusEl = document.createElement('span');
   statusEl.className = 'status';
   const closeBtn = document.createElement('button');
   closeBtn.textContent = '✕';
   closeBtn.title = 'Close thread';
-  header.append(dot, titleWrap, statusEl, modelSelect, fontDownBtn, fontUpBtn, zoomBtn, closeBtn);
+  header.append(dot, titleWrap, statusEl, agentSelect, modelSelect, fontDownBtn, fontUpBtn, zoomBtn, closeBtn);
 
   const termWrap = document.createElement('div');
   termWrap.className = 'pane-term';
@@ -813,6 +1050,13 @@ function createPane(board, col, opts = {}) {
     allowProposedApi: true,
     theme: THEME,
     scrollback: 5000,
+    // Tell xterm it's driven by ConPTY on Windows so its line-wrap/reflow model
+    // matches the backend. Without this, full-screen TUIs that redraw with
+    // absolute cursor moves (e.g. Codex / "ChatGPT") make the cursor bounce to
+    // stale positions. Harmless/omitted off Windows.
+    ...(window.api.platform === 'win32'
+      ? { windowsPty: { backend: 'conpty', buildNumber: window.api.osBuild || undefined } }
+      : {}),
   });
   const fitAddon = new FitAddon.FitAddon();
   term.loadAddon(fitAddon);
@@ -827,21 +1071,27 @@ function createPane(board, col, opts = {}) {
   term.open(termWrap);
 
   const pane = {
-    id, el, term, fitAddon, searchAddon, dot, statusEl, modelSelect, title, caption,
+    id, el, term, fitAddon, searchAddon, dot, statusEl, agentSelect, modelSelect, title, caption,
     findBar, findInput, flex: opts.flex || 1, col, board, disposed: false,
     name: startName, state: null, buf: '', idleTimer: null,
-    fontSize: startFont, model: startModel, captionText: '', capBuf: '',
+    fontSize: startFont, agent: startAgent, model: startModel, captionText: '', capBuf: '',
     errored: false, hintShown: false,
+    // Auto names ("claude 1") give way to the caption once the thread has one;
+    // a manual rename (autoName=false) always stays visible.
+    autoName: opts.autoName !== undefined ? !!opts.autoName : !opts.name,
   };
 
   if (opts.caption) setPaneCaption(pane, opts.caption, { persist: false });
+  updateTitleVisibility(pane);
 
   // Wire IO
   term.onData((data) => sendToPane(pane, data));
   el.addEventListener('mousedown', () => focusPane(pane));
 
   // Double-click the title to rename the thread (single click still focuses).
+  // The caption is wired too, since it replaces the name once the thread is titled.
   title.addEventListener('dblclick', (e) => { e.stopPropagation(); beginRename(pane); });
+  caption.addEventListener('dblclick', (e) => { e.stopPropagation(); beginRename(pane); });
 
   // Zoom / maximize.
   zoomBtn.addEventListener('mousedown', (e) => e.stopPropagation());
@@ -862,6 +1112,10 @@ function createPane(board, col, opts = {}) {
   findNext.onclick = () => runFind(false);
   findPrev.onclick = () => runFind(true);
   findClose.onclick = () => closeFind(pane);
+
+  // Agent dropdown: switch which CLI this thread runs (restarts the thread).
+  agentSelect.addEventListener('mousedown', (e) => e.stopPropagation());
+  agentSelect.onchange = (e) => { e.stopPropagation(); setPaneAgent(pane, agentSelect.value); persistLayout(board.id); };
 
   // Model dropdown: switch the model this thread runs (live, if it's started).
   modelSelect.addEventListener('mousedown', (e) => e.stopPropagation());
@@ -985,9 +1239,10 @@ function beginRename(pane) {
   input.select();
   const commit = () => {
     const v = input.value.trim();
-    pane.name = v || pane.name;
+    if (v) { pane.name = v; pane.autoName = false; }
     span.textContent = pane.name;
     input.replaceWith(span);
+    updateTitleVisibility(pane);
     persistLayout(pane.board.id);
   };
   input.addEventListener('keydown', (e) => {
@@ -2899,6 +3154,15 @@ function syncVoiceFields() {
 
 // Populate the general tab's fields from the current defaults.
 function syncGeneralFields() {
+  const st = $('set-theme');
+  if (st && !st.options.length) {
+    for (const [id, t] of Object.entries(THEMES)) {
+      const opt = document.createElement('option');
+      opt.value = id; opt.textContent = t.label;
+      st.appendChild(opt);
+    }
+  }
+  if (st) st.value = currentTheme;
   const sm = $('set-default-model');
   if (sm && !sm.options.length) {
     for (const m of MODELS) {
@@ -3111,6 +3375,10 @@ document.querySelectorAll('.settings-tab').forEach((b) => {
 });
 
 // General-tab controls.
+const setThemeSel = $('set-theme');
+if (setThemeSel) setThemeSel.addEventListener('change', () => {
+  if (isValidTheme(setThemeSel.value)) applyTheme(setThemeSel.value);
+});
 const setModelSel = $('set-default-model');
 if (setModelSel) setModelSel.addEventListener('change', () => {
   if (isValidModel(setModelSel.value)) {

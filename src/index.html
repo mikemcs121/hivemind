@@ -54,8 +54,21 @@
         </aside>
 
         <div class="sidebar-actions">
-          <button id="files-toggle" class="sidebar-action-btn" title="File Explorer" aria-label="File Explorer" disabled>🗂</button>
-          <button id="git-toggle" class="sidebar-action-btn" title="Source Control (Git)" aria-label="Source Control (Git)" disabled>⑂</button>
+          <button id="files-toggle" class="sidebar-action-btn" title="File Explorer" aria-label="File Explorer" disabled>
+            <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor"
+                 stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z" />
+            </svg>
+          </button>
+          <button id="git-toggle" class="sidebar-action-btn" title="Source Control (Git)" aria-label="Source Control (Git)" disabled>
+            <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor"
+                 stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <line x1="6" y1="3" x2="6" y2="15" />
+              <circle cx="18" cy="6" r="3" />
+              <circle cx="6" cy="18" r="3" />
+              <path d="M18 9a9 9 0 0 1-9 9" />
+            </svg>
+          </button>
         </div>
         <div class="sidebar-footer">Hivemind</div>
       </aside>
@@ -151,6 +164,15 @@
           <!-- General tab ------------------------------------------------- -->
           <section class="settings-panel" data-panel="general">
             <div class="settings-group">
+              <div class="settings-group-title">Appearance</div>
+              <label>Theme
+                <select id="set-theme"></select>
+              </label>
+              <small>Recolours the whole app, including the terminals. Applies
+                instantly to every open thread.</small>
+            </div>
+
+            <div class="settings-group">
               <div class="settings-group-title">Defaults for new threads</div>
               <label>Claude model
                 <select id="set-default-model"></select>
@@ -237,7 +259,11 @@
             <ol class="help-list">
               <li>Click <strong>＋</strong> next to the logo to create a <em>hive</em> and point it at a project directory.</li>
               <li>Press <strong>＋ Thread</strong> to open a Claude thread — open as many as you like; they all share the hive's directory.</li>
-              <li>Use the <strong>🗂 Explorer</strong> and <strong>⑂ Source Control</strong> buttons to browse files and manage Git.</li>
+              <li>Use the
+                <strong><svg class="help-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z" /></svg> Explorer</strong>
+                and
+                <strong><svg class="help-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><line x1="6" y1="3" x2="6" y2="15" /><circle cx="18" cy="6" r="3" /><circle cx="6" cy="18" r="3" /><path d="M18 9a9 9 0 0 1-9 9" /></svg> Source Control</strong>
+                buttons to browse files and manage Git.</li>
             </ol>
           </div>
 
@@ -245,7 +271,8 @@
             <div class="settings-group-title">Threads</div>
             <ul class="help-list">
               <li><strong>🎤 Voice typing</strong> — dictate into the focused thread; speech is transcribed on-device by Moonshine (English, fully offline) and typed at the cursor when you pause. Toggle with the <kbd>~</kbd> key. You can start speaking right away — words spoken while the model loads are kept, and toggling off still types what you had just said. If the HUD says “Didn’t catch that”, the model heard you but couldn’t make out words. Use the user dictionary in <strong>⚙ Settings → Voice</strong> to fix words it mishears.</li>
-              <li>Each thread's header shows a <strong>caption</strong> built from the last prompt you send it, so you can see what every thread is working on at a glance. Double-click the name to rename a thread.</li>
+              <li>Each thread's header shows a <strong>caption</strong> built from the last prompt you send it, so you can see what every thread is working on at a glance. Once a thread has a caption it takes over as the header title and the default <em>claude&nbsp;#</em> name is hidden. Double-click the title to rename a thread — a name you set yourself always stays shown.</li>
+              <li>Each thread can run a different <strong>agent</strong> — pick <em>Claude</em>, <em>ChatGPT</em>, or <em>Gemini</em> from the dropdown in the thread header. One hive can mix them (e.g. three Claude threads and one ChatGPT thread). Switching a running thread restarts it with the new agent. ChatGPT needs OpenAI's Codex CLI (<code>npm install -g @openai/codex</code>) and Gemini needs Google's Gemini CLI (<code>npm install -g @google/gemini-cli</code>) installed and signed in; the model dropdown applies to Claude threads only.</li>
               <li>Change a thread's model or font from its header, or with <kbd>A−</kbd>/<kbd>A+</kbd> and <kbd>Ctrl</kbd>+scroll.</li>
             </ul>
           </div>
@@ -289,8 +316,15 @@
           </div>
 
           <div class="settings-group">
+            <div class="settings-group-title">Appearance</div>
+            <p class="help-note">Pick a colour <strong>Theme</strong> in <strong>⚙ Settings → General</strong>
+              (Midnight, Forest, Ember, Grape, plus light themes Paper &amp; Rose). It recolours the whole
+              app — including every terminal — instantly, and is remembered across restarts.</p>
+          </div>
+
+          <div class="settings-group">
             <div class="settings-group-title">More</div>
-            <p class="help-note">Open <strong>⚙ Settings</strong> for defaults, notifications, and voice options.</p>
+            <p class="help-note">Open <strong>⚙ Settings</strong> for the theme, defaults, notifications, and voice options.</p>
           </div>
         </div>
       </div>

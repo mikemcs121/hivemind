@@ -1,6 +1,14 @@
 // Download the speech-to-text model so it can be bundled with the app.
 //
-// Run once after `npm install`:   npm run fetch-model
+// Runs automatically after `npm install` (postinstall, in --soft mode) and
+// before `npm run dist` (predist), so the model is always present without
+// anyone remembering to fetch it. Can still be run by hand: npm run fetch-model
+//
+// Flags:
+//   --soft   Never fail the process: a download error prints a warning and
+//            exits 0. Used by postinstall so an offline/CI `npm install`
+//            still succeeds (voice just won't work until the model is
+//            fetched). A normal `npm run fetch-model` and predist fail loudly.
 //
 // Files land in models/onnx-community/moonshine-base-ONNX/, which the app
 // serves over the hm:// scheme and loads fully offline (see main.js +
@@ -15,6 +23,8 @@
 import { mkdir, writeFile, stat } from 'node:fs/promises';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+
+const SOFT = process.argv.includes('--soft');
 
 const MODELS_ROOT = resolve(fileURLToPath(new URL('..', import.meta.url)), 'models');
 
@@ -70,6 +80,14 @@ try {
   }
   console.log('\nDone. Restart Hivemind and toggle voice typing with the ~ key.');
 } catch (err) {
+  if (SOFT) {
+    // Postinstall path: don't break `npm install` when offline / behind a
+    // proxy. Voice typing will report the missing model at runtime and the
+    // user can run `npm run fetch-model` once they have a connection.
+    console.warn('\nSkipped speech-model download:', err.message);
+    console.warn('Voice typing will be unavailable until you run: npm run fetch-model');
+    process.exit(0);
+  }
   console.error('\nFailed:', err.message);
   console.error('Check your network connection and try again.');
   process.exit(1);

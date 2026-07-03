@@ -2,7 +2,19 @@
 
 const { contextBridge, ipcRenderer } = require('electron');
 
+// Windows build number (e.g. 26200 from "10.0.26200"), 0 elsewhere. xterm's
+// `windowsPty` option needs it to match ConPTY's line-wrap/reflow behaviour.
+// This preload is sandboxed and can't require('os'), so main.js computes the
+// build and passes it in via webPreferences.additionalArguments (--hm-os-build).
+const osBuild = (() => {
+  const arg = process.argv.find((a) => a.startsWith('--hm-os-build='));
+  return arg ? Number(arg.slice('--hm-os-build='.length)) || 0 : 0;
+})();
+
 contextBridge.exposeInMainWorld('api', {
+  platform: process.platform,
+  osBuild,
+
   // Boards persistence
   listBoards: () => ipcRenderer.invoke('boards:list'),
   saveBoards: (boards) => ipcRenderer.invoke('boards:save', boards),

@@ -1,18 +1,26 @@
 :root {
-  --bg: #1e1e2e;
-  --bg-alt: #181825;
-  --panel: #11111b;
-  --surface: #313244;
-  --text: #cdd6f4;
-  --muted: #9399b2;
-  --accent: #89b4fa;
-  --accent-2: #a6e3a1;
-  --border: #313244;
-  --danger: #f38ba8;
-  --peach: #fab387;
-  --yellow: #f9e2af;
+  --bg: #0b0e14;
+  --bg-alt: #070a10;
+  --panel: #04060a;
+  --surface: #1b2333;
+  --text: #c6d0e0;
+  --muted: #64748b;
+  --accent: #38bdf8;
+  --accent-2: #34d399;
+  --border: #1b2333;
+  --danger: #f87171;
+  --peach: #fb923c;
+  --yellow: #fbbf24;
+  /* Text/icon colour drawn on top of an accent-filled surface (active buttons,
+     badges). Kept as a variable so themes — including light ones — can flip it. */
+  --on-accent: #04060a;
   --gutter: 6px;
 }
+
+/* The active theme is applied at runtime by setting these same custom
+   properties on :root (see THEMES / applyTheme in renderer.js). The values
+   above are the default (Midnight) so the app is correctly coloured
+   before the script runs. */
 
 /* Terminal status colours (shared by pane dots, header labels, sidebar dots) */
 @keyframes hm-pulse { 0%, 100% { opacity: 1; } 50% { opacity: .3; } }
@@ -69,7 +77,7 @@ html, body {
   font-size: 16px;
   cursor: pointer;
 }
-.sidebar-header button:hover { background: var(--accent); color: #11111b; }
+.sidebar-header button:hover { background: var(--accent); color: var(--on-accent); }
 
 #board-list {
   list-style: none;
@@ -107,7 +115,7 @@ html, body {
 .board-item .badge {
   display: none; flex: none; align-items: center; justify-content: center;
   min-width: 17px; height: 17px; padding: 0 5px; border-radius: 9px;
-  background: var(--peach); color: #11111b; font-size: 10px; font-weight: 700;
+  background: var(--peach); color: var(--on-accent); font-size: 10px; font-weight: 700;
 }
 .board-item .badge.show { display: inline-flex; }
 .board-item:hover .badge.show { display: none; } /* make room for edit/delete on hover */
@@ -136,8 +144,9 @@ html, body {
   line-height: 1;
   cursor: pointer;
 }
-.sidebar-action-btn:hover:not(:disabled) { background: var(--accent); color: #11111b; border-color: var(--accent); }
-.sidebar-action-btn.active { background: var(--accent); color: #11111b; border-color: var(--accent); }
+.sidebar-action-btn svg { display: block; }
+.sidebar-action-btn:hover:not(:disabled) { background: var(--accent); color: var(--on-accent); border-color: var(--accent); }
+.sidebar-action-btn.active { background: var(--accent); color: var(--on-accent); border-color: var(--accent); }
 .sidebar-action-btn:disabled { opacity: 0.4; cursor: default; }
 
 .sidebar-footer { padding: 10px 14px; font-size: 11px; color: var(--muted); border-top: 1px solid var(--border); }
@@ -160,7 +169,7 @@ html, body {
 
 button.primary {
   background: var(--accent);
-  color: #11111b;
+  color: var(--on-accent);
   border: none;
   border-radius: 6px;
   padding: 7px 12px;
@@ -184,7 +193,7 @@ button.icon-btn {
 }
 button.icon-btn:hover { filter: brightness(1.15); }
 button.icon-btn.muted { opacity: .55; }
-button.icon-btn.active { background: var(--accent); color: #11111b; }
+button.icon-btn.active { background: var(--accent); color: var(--on-accent); }
 button.icon-btn:disabled { opacity: .4; cursor: not-allowed; }
 
 /* Text pill button (e.g. Build Portable) — sits among the icon buttons. */
@@ -271,12 +280,16 @@ button.usage-pill.crit { color: var(--danger); }
 }
 .pane-header .title-wrap { flex: 1; min-width: 0; display: flex; align-items: center; gap: 6px; overflow: hidden; }
 .pane-header .title { flex: none; max-width: 60%; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-size: 17px; font-weight: 600; }
+.pane-header .title.is-hidden { display: none; }
 .pane-header .caption {
   flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
   color: var(--muted); font-size: 13px; opacity: .8;
 }
 .pane-header .caption:empty { display: none; }
 .pane-header .caption:not(:empty)::before { content: '— '; opacity: .55; }
+/* When the caption stands in for the name, promote it to a full title. */
+.pane-header .title-wrap.titled .caption { color: var(--text); font-size: 18px; font-weight: 600; opacity: 1; }
+.pane-header .title-wrap.titled .caption::before { content: none; }
 .pane-header .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); flex: none; }
 .pane-header .dot.busy { background: var(--yellow); }
 .pane-header .dot.idle { background: var(--accent-2); }
@@ -304,7 +317,7 @@ button.usage-pill.crit { color: var(--danger); }
   cursor: pointer;
   outline: none;
 }
-.pane-header .model-select:hover { border-color: var(--accent, #89b4fa); }
+.pane-header .model-select:hover { border-color: var(--accent, #38bdf8); }
 
 .pane-term { flex: 1; min-height: 0; padding: 4px 6px; }
 .pane-term .xterm { height: 100%; }
@@ -678,7 +691,7 @@ button.usage-pill.crit { color: var(--danger); }
 }
 #voice-toggle.listening {
   background: var(--danger);
-  color: #11111b;
+  color: var(--on-accent);
   animation: hm-mic-pulse 1.4s ease-out infinite;
 }
 #voice-toggle.error { box-shadow: inset 0 0 0 1px var(--danger); }
@@ -936,6 +949,7 @@ button.usage-pill.crit { color: var(--danger); }
 .help-list { margin: 0; padding-left: 20px; display: flex; flex-direction: column; gap: 8px; font-size: 13px; color: var(--muted); line-height: 1.5; }
 .help-list strong { color: var(--text); font-weight: 600; }
 .help-note { margin: 0; font-size: 13px; color: var(--muted); line-height: 1.5; }
+.help-ico { width: 14px; height: 14px; vertical-align: -2px; }
 #help-body kbd {
   background: var(--panel); border: 1px solid var(--border); border-radius: 4px;
   padding: 1px 6px; font-size: 12px; color: var(--text);

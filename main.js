@@ -226,6 +226,10 @@ function createWindow() {
       preload: path.join(__dirname, 'preload.js'),
       contextIsolation: true,
       nodeIntegration: false,
+      // The preload runs sandboxed, so it can't require('os') to read the
+      // Windows build number that xterm's windowsPty option needs. Compute it
+      // here (full Node) and hand it over via argv, which the sandbox allows.
+      additionalArguments: [`--hm-os-build=${(/^\d+\.\d+\.(\d+)/.exec(os.release() || '') || [])[1] || 0}`],
     },
   });
 
