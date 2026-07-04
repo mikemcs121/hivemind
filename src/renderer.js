@@ -186,6 +186,8 @@ function setPaneFontSize(pane, size) {
   if (pane.fontSize === n) return;
   pane.fontSize = n;
   pane.term.options.fontSize = n;
+  // The chat view scales off this variable (see .chat-* rules in styles.css).
+  pane.el.style.setProperty('--pane-font', n + 'px');
   defaultFontSize = n;
   localStorage.setItem('hm.fontSize', String(n));
   try {
@@ -271,6 +273,8 @@ function setPaneAgent(pane, agent) {
   // them there.
   if (pane.modelSelect) pane.modelSelect.style.display = agent === 'claude' ? '' : 'none';
   if (pane.permSelect) pane.permSelect.style.display = agent === 'claude' ? '' : 'none';
+  // The chat view reads Claude Code transcripts — other agents are terminal-only.
+  updateChatAvailability(pane);
   // Auto names track the running command ("codex 2"); manual names stay put.
   if (pane.autoName) {
     const num = (/(\d+)\s*$/.exec(pane.name || '') || [])[1];
@@ -286,6 +290,7 @@ function setPaneAgent(pane, agent) {
 // (e.g. when only a startup flag changed, not the whole agent).
 function respawnPane(pane, { resume } = {}) {
   window.api.killPty(pane.id);
+  window.api.transcript.unbind(pane.id); // release before the id changes
   pane.id = nextId('term');
   clearTimeout(pane.idleTimer);
   pane.state = null;
@@ -293,6 +298,7 @@ function respawnPane(pane, { resume } = {}) {
   pane.errored = false;
   pane.hintShown = false;
   try { pane.term.reset(); } catch (_) { /* ignore */ }
+  resetChat(pane); // the new session's transcript backfills the chat view
   spawnPanePty(pane, { resume: !!resume });
 }
 
@@ -426,6 +432,22 @@ function evaluateIdle(pane) {
   setPaneState(pane, needsYou ? 'attention' : 'idle');
 }
 
+// A finished turn is easy to miss — the header dot just flips yellow→green. So
+// when a turn completes (busy → idle) the whole pane glows green and its status
+// reads "✓ done" until the user clicks back into the thread (focusPane clears
+// it). Starting new work, dying, or needing input also clears a stale glow.
+function setDoneGlow(pane, on) {
+  on = !!on && pane.state === 'idle';
+  if (!!pane.doneGlow === on) return;
+  pane.doneGlow = on;
+  pane.el.classList.toggle('done', on);
+  if (pane.statusEl && pane.state === 'idle') {
+    pane.statusEl.textContent = on ? '✓ done' : STATE_LABEL.idle;
+  }
+  updateBoardStatus(pane.board.id);
+  refreshZoomTabs(pane.board.id);
+}
+
 function setPaneState(pane, state) {
   if (pane.state === state) return;
   const prev = pane.state;
@@ -436,8 +458,15 @@ function setPaneState(pane, state) {
     pane.statusEl.textContent = STATE_LABEL[state] || '';
     pane.statusEl.className = 'status ' + state;
   }
+  if (state === 'idle' && prev === 'busy') setDoneGlow(pane, true);
+  else if (state !== 'idle') setDoneGlow(pane, false);
   updateBoardStatus(pane.board.id);
   refreshZoomTabs(pane.board.id);
+  updateChatBanner(pane);
+
+  // A kanban card dispatched this thread: keep the card in step (live status
+  // dot; finished turn moves the card to Done).
+  if (typeof kanbanOnPaneState === 'function') kanbanOnPaneState(pane, state, prev);
 
   // Notify on the transitions that pull a human back: a terminal asking for
   // input, hitting an error, or finishing a turn while the window is backgrounded.
@@ -462,12 +491,13 @@ function notify(pane, what) {
 }
 
 function boardStatus(boardId) {
-  const s = { attention: 0, error: 0, busy: 0, idle: 0, dead: 0, total: 0 };
+  const s = { attention: 0, error: 0, busy: 0, idle: 0, dead: 0, done: 0, total: 0 };
   const g = grids.get(boardId);
   if (!g) return s;
   for (const col of g.columns) {
     for (const p of col.panes) {
       s.total++;
+      if (p.doneGlow) s.done++;
       const st = p.state || 'idle';
       if (s[st] !== undefined) s[st]++;
     }
@@ -486,6 +516,7 @@ function updateBoardStatus(boardId) {
   if (s.error > 0) summary = 'error';
   else if (s.attention > 0) summary = 'attention';
   else if (s.busy > 0) summary = 'busy';
+  else if (s.done > 0) summary = 'done';
   else if (s.idle > 0) summary = 'idle';
   else if (s.dead > 0) summary = 'dead';
   if (sdot) sdot.className = 'status-dot ' + summary;
@@ -597,6 +628,215 @@ function sendToPane(pane, data) {
   markActivity(pane, ''); // typing means this pane is active again
 }
 
+// Send a full prompt to a live pane, exactly like the chat composer would:
+// multi-line text goes through bracketed paste, and Enter follows as its own
+// keystroke once the TUI has ingested the text.
+function deliverPrompt(pane, text) {
+  window.api.transcript.noteSent(pane.id, text);
+  if (pane.chat) addEchoRow(pane, text);
+  if (text.includes('\n')) sendToPane(pane, '\x1b[200~' + text + '\x1b[201~');
+  else sendToPane(pane, text);
+  setTimeout(() => { if (!pane.disposed) sendToPane(pane, '\r'); }, 40);
+}
+
+// ---------------------------------------------------------------------------
+// Hivemind commands
+//
+// A message addressed to the app instead of the thread: start a composer
+// message (or one dictated utterance) with "Hivemind" and the rest is a
+// command Hivemind itself carries out — open a thread and hand it a task,
+// route a task to another thread, close/rename/maximize threads, switch
+// hives — rather than text sent to Claude. Parsing is deliberately loose
+// (rule-based, punctuation-tolerant) so dictated phrasing works.
+// ---------------------------------------------------------------------------
+const HM_WAKE_RE = /^(?:hey\s+|ok\s+|okay\s+)?hive\s*mind\b[\s,:.!?-]*/i;
+
+// The command text after the wake word ('' if the wake word stood alone), or
+// null when the text isn't addressed to Hivemind at all.
+function matchHivemindCommand(text) {
+  const t = String(text || '').trim();
+  const m = HM_WAKE_RE.exec(t);
+  return m ? t.slice(m[0].length).trim() : null;
+}
+
+// Feedback for commands: a transient toast over the workspace, view-agnostic.
+let hmToastTimer = null;
+function hmToast(msg, kind) {
+  const el = document.getElementById('hm-toast');
+  if (!el) return;
+  el.textContent = '🐝 ' + msg;
+  el.classList.toggle('err', kind === 'err');
+  el.classList.remove('hidden');
+  clearTimeout(hmToastTimer);
+  hmToastTimer = setTimeout(() => el.classList.add('hidden'), kind === 'err' ? 6000 : 3500);
+}
+
+function boardPanes(board) {
+  const g = board && grids.get(board.id);
+  if (!g) return [];
+  const out = [];
+  for (const col of g.columns) for (const p of col.panes) if (!p.disposed) out.push(p);
+  return out;
+}
+
+// Find a thread by what the user calls it: exact name, then partial name,
+// then caption — all case-insensitive, so dictated names match.
+function findPaneByName(board, name) {
+  const q = String(name || '').trim().toLowerCase();
+  if (!q) return null;
+  const panes = boardPanes(board);
+  return panes.find((p) => (p.name || '').toLowerCase() === q)
+      || panes.find((p) => (p.name || '').toLowerCase().includes(q))
+      || panes.find((p) => (p.captionText || '').toLowerCase().includes(q))
+      || null;
+}
+
+// Strip the connective tissue between "open a new thread" and the task itself:
+// "and have it fix the bug" → "fix the bug".
+function hmExtractTask(rest) {
+  let task = String(rest || '').trim();
+  task = task.replace(/^(?:,|\.|and|then)\s+/i, '');
+  task = task.replace(/^(?:to|have it|tell it to|ask it to|get it to|and)\s+/i, '');
+  return task.trim();
+}
+
+// Execute a command addressed to Hivemind. Returns true when the text was a
+// recognized command (even one that failed, e.g. an unknown thread name) and
+// false when it wasn't — the caller then sends the message to the thread as
+// normal, so talking *about* Hivemind never gets swallowed.
+function runHivemindCommand(cmd, ctxPane) {
+  const board = activeBoard();
+  const pane = (ctxPane && !ctxPane.disposed) ? ctxPane : focusedPane;
+  const c = String(cmd || '').replace(/[\s.!?]+$/, '').trim();
+  if (!c) {
+    hmToast('Say a command after "Hivemind" — e.g. "Hivemind, open a new thread and fix the failing test". Say "Hivemind help" for the list.', 'err');
+    return true;
+  }
+  let m;
+
+  // "help" — open the Help modal, which documents the command list.
+  if (/^(?:help|commands?|what can (?:you|i) (?:do|say))$/i.test(c)) {
+    const hb = document.getElementById('help-backdrop');
+    if (hb) hb.classList.remove('hidden');
+    hmToast('Commands are listed under "Hivemind commands" in Help.');
+    return true;
+  }
+
+  // "add a todo (item) [to] <text>" — append to this hive's Todo panel. The
+  // bare "todo <text>" composer prefix is the shortcut for the same thing.
+  m = /^(?:add|create|make|new)\s+(?:a\s+)?(?:new\s+)?to-?do(?:\s+item)?\b\s*(.*)$/i.exec(c);
+  if (m) {
+    captureTodo(hmExtractTask(m[1]));
+    return true;
+  }
+
+  // "open (up) a new thread [and/to <task>]" — the task rides along as the new
+  // Claude's initial prompt, so it starts working the moment it boots.
+  m = /^(?:open(?:\s+up)?|start|create|add|make|spawn)\s+(?:a\s+|another\s+)?(?:new\s+)?(?:thread|terminal|pane|tab|claude)\b\s*(.*)$/i.exec(c)
+   || /^new\s+(?:thread|terminal|pane|tab)\b\s*(.*)$/i.exec(c);
+  if (m) {
+    if (!board) { hmToast('No hive is open — create one first.', 'err'); return true; }
+    const task = hmExtractTask(m[1]);
+    const p = addTerminal(board, task ? { initialPrompt: task } : {});
+    if (p && task) setPaneCaption(p, task);
+    hmToast(task ? 'Opened a new thread — starting on: ' + task : 'Opened a new thread.');
+    return true;
+  }
+
+  // "tell <thread> to <task>" — route a task to another thread by name/caption.
+  m = /^(?:tell|ask)\s+(?:thread\s+)?(.+?)\s+to\s+(.+)$/i.exec(c);
+  if (m) {
+    const who = m[1].trim();
+    const target = /^(?:it|this|this thread|the current thread)$/i.test(who)
+      ? pane : findPaneByName(board, who);
+    if (!target) { hmToast('No thread called "' + who + '" on this hive.', 'err'); return true; }
+    if (target.state === 'dead') { hmToast('That thread has exited — open a new one.', 'err'); return true; }
+    const task = m[2].trim();
+    deliverPrompt(target, task);
+    hmToast('Sent to ' + paneLabel(target) + ': ' + task);
+    return true;
+  }
+
+  // "close this thread" / "close thread <name>"
+  m = /^(?:close|kill)\s+(?:(?:this|the\s+current)\s+)?(?:thread|terminal|pane)\b\s*(.*)$/i.exec(c);
+  if (m) {
+    const nm = m[1].replace(/^(?:called|named)\s+/i, '').trim();
+    const target = nm ? findPaneByName(board, nm) : pane;
+    if (!target) { hmToast(nm ? 'No thread called "' + nm + '" on this hive.' : 'No thread to close.', 'err'); return true; }
+    const label = paneLabel(target);
+    closePane(target);
+    hmToast('Closed ' + label + '.');
+    return true;
+  }
+
+  // "rename this thread to <name>"
+  m = /^rename\s+(?:(?:this|the\s+current)\s+)?(?:thread|terminal|pane)?\s*(?:to|as)\s+(.+)$/i.exec(c);
+  if (m) {
+    if (!pane) { hmToast('No thread to rename.', 'err'); return true; }
+    pane.name = m[1].trim();
+    pane.autoName = false;
+    pane.title.textContent = pane.name;
+    updateTitleVisibility(pane);
+    refreshZoomTabs(pane.board.id);
+    persistLayout(pane.board.id);
+    hmToast('Renamed this thread to "' + pane.name + '".');
+    return true;
+  }
+
+  // "maximize [this thread]" / "restore"
+  if (/^(?:maximi[sz]e|zoom(?:\s+in)?)\b/i.test(c)) {
+    if (!pane) { hmToast('No thread to maximize.', 'err'); return true; }
+    const g = grids.get(pane.board.id);
+    if (g && g.zoomed !== pane) toggleZoom(pane);
+    hmToast('Maximized ' + paneLabel(pane) + '.');
+    return true;
+  }
+  if (/^(?:restore|un\s*zoom|zoom\s+out|minimi[sz]e|tile)\b/i.test(c)) {
+    const g = board && grids.get(board.id);
+    if (g && g.zoomed) toggleZoom(g.zoomed);
+    hmToast('Restored the tiled layout.');
+    return true;
+  }
+
+  // "stop / interrupt [thread <name>]" — same Ctrl+C the ⏹ button sends.
+  m = /^(?:stop|interrupt|cancel)(?:\s+(?:(?:this|the\s+current)\s+)?(?:thread|terminal|pane))?\s*(.*)$/i.exec(c);
+  if (m) {
+    const nm = m[1].trim();
+    const target = nm ? findPaneByName(board, nm) : pane;
+    if (!target) { hmToast(nm ? 'No thread called "' + nm + '" on this hive.' : 'No thread to interrupt.', 'err'); return true; }
+    sendToPane(target, '\x03');
+    hmToast('Interrupted ' + paneLabel(target) + '.');
+    return true;
+  }
+
+  // "focus / go to thread <name>"
+  m = /^(?:focus|go\s+to|switch\s+to|show)\s+(?:the\s+)?thread\s+(.+)$/i.exec(c);
+  if (m) {
+    const target = findPaneByName(board, m[1]);
+    if (!target) { hmToast('No thread called "' + m[1].trim() + '" on this hive.', 'err'); return true; }
+    focusPane(target);
+    hmToast('Focused ' + paneLabel(target) + '.');
+    return true;
+  }
+
+  // "switch to hive <name>"
+  m = /^(?:switch|go|jump|move)\s+to\s+(?:the\s+)?(?:hive|board|project)\s+(.+)$/i.exec(c)
+   || /^open\s+(?:the\s+)?(?:hive|board|project)\s+(.+)$/i.exec(c);
+  if (m) {
+    const q = m[1].trim().toLowerCase();
+    const b = boards.find((x) => (x.name || '').toLowerCase() === q)
+           || boards.find((x) => (x.name || '').toLowerCase().includes(q));
+    if (!b) { hmToast('No hive called "' + m[1].trim() + '".', 'err'); return true; }
+    selectBoard(b.id);
+    hmToast('Switched to ' + b.name + '.');
+    return true;
+  }
+
+  // Not a command we recognize — let the caller send it to the thread as a
+  // normal message (the user may just be talking about Hivemind).
+  return false;
+}
+
 // ---------------------------------------------------------------------------
 // Image drop / paste helpers
 // ---------------------------------------------------------------------------
@@ -620,11 +860,1174 @@ async function persistImage(file) {
   }
 }
 
+// Paths with spaces need quoting before they land on an input line.
+const quotePath = (p) => (/\s/.test(p) ? `"${p}"` : p);
+
 // Type an image's path into the pane's prompt so Claude Code can read it.
-// Paths with spaces are quoted; a trailing space lets the user keep typing.
+// A trailing space lets the user keep typing.
 async function typePathIntoPane(pane, p) {
-  const quoted = /\s/.test(p) ? `"${p}"` : p;
-  sendToPane(pane, quoted + ' ');
+  sendToPane(pane, quotePath(p) + ' ');
+}
+
+// ---------------------------------------------------------------------------
+// Chat wrapper
+//
+// A structured chat view layered over each Claude thread. The TUI keeps
+// running in the pane's (covered, never unmounted) xterm; the chat renders
+// the session's transcript JSONL, streamed from main via api.transcript.
+// Input goes through the same sendToPane() path as keystrokes; voice
+// dictation lands in the composer textarea while chat view is showing.
+// ---------------------------------------------------------------------------
+const CHAT_KINDS = ['tool', 'thinking', 'meta', 'subagent'];
+const CHAT_KIND_LABELS = { tool: 'Tools', thinking: 'Thinking', meta: 'Meta', subagent: 'Subagents' };
+const CHAT_DEFAULT_FILTERS = { tool: true, thinking: false, meta: false, subagent: false };
+
+// Filter defaults for new panes; each pane's own choices persist in its layout.
+function globalChatFilters() {
+  try {
+    return Object.assign({}, CHAT_DEFAULT_FILTERS, JSON.parse(localStorage.getItem('hm.chatFilters') || '{}'));
+  } catch (_) {
+    return Object.assign({}, CHAT_DEFAULT_FILTERS);
+  }
+}
+
+// The chat view reads Claude Code transcripts — other agents are terminal-only.
+function chatSupported(pane) {
+  return pane.agent === 'claude';
+}
+
+function initChatUI(pane, body) {
+  const wrap = document.createElement('div');
+  wrap.className = 'chat-wrap';
+
+  // Header bar: the conversation topic on the left (Claude Code's rolling
+  // summary of the session — what the terminal TUI shows in its header, fed
+  // by the transcript's summary lines) and the filter chips on the right.
+  const filters = document.createElement('div');
+  filters.className = 'chat-filters';
+  const topic = document.createElement('div');
+  topic.className = 'chat-topic';
+  filters.appendChild(topic);
+
+  // History picker: a dropdown of this thread's past conversations. The button
+  // toggles a menu (populated on open via api.transcript.listSessions); picking
+  // an entry shows that session read-only over the live view (openHistorySession).
+  const historyBtn = document.createElement('button');
+  historyBtn.className = 'chat-chip chat-history-btn';
+  historyBtn.textContent = '🕘 History';
+  historyBtn.title = 'Browse this thread’s past conversations';
+  const historyMenu = document.createElement('div');
+  historyMenu.className = 'chat-history-menu hidden';
+  historyBtn.onclick = (e) => { e.stopPropagation(); toggleHistoryMenu(pane); };
+  filters.append(historyBtn, historyMenu);
+
+  const chips = {};
+  for (const kind of CHAT_KINDS) {
+    const chip = document.createElement('button');
+    chip.className = 'chat-chip';
+    chip.textContent = CHAT_KIND_LABELS[kind];
+    chip.title = `Show/hide ${CHAT_KIND_LABELS[kind].toLowerCase()} in this thread's chat view`;
+    chip.onclick = (e) => {
+      e.stopPropagation();
+      pane.chatFilters[kind] = !pane.chatFilters[kind];
+      applyChatFilters(pane);
+      localStorage.setItem('hm.chatFilters', JSON.stringify(pane.chatFilters));
+      persistLayout(pane.board.id);
+    };
+    chips[kind] = chip;
+    filters.appendChild(chip);
+  }
+
+  // Attention banner: the hidden TUI wants something the transcript can't
+  // show (permission prompt, menu, error). Quick keys go straight to the PTY.
+  const banner = document.createElement('div');
+  banner.className = 'chat-banner hidden';
+  const bannerText = document.createElement('pre');
+  bannerText.className = 'chat-banner-text';
+  const bannerActions = document.createElement('div');
+  bannerActions.className = 'chat-banner-actions';
+  const keyWrap = document.createElement('span');
+  keyWrap.className = 'chat-banner-keys';
+  for (const [label, seq, hint] of [
+    ['1', '1', 'Choose option 1'],
+    ['2', '2', 'Choose option 2'],
+    ['Enter', '\r', 'Press Enter'],
+    ['Esc', '\x1b', 'Press Escape'],
+  ]) {
+    const b = document.createElement('button');
+    b.textContent = label;
+    b.title = `${hint} in the hidden terminal`;
+    b.onclick = (e) => { e.stopPropagation(); sendToPane(pane, seq); };
+    keyWrap.appendChild(b);
+  }
+  const openTermBtn = document.createElement('button');
+  openTermBtn.className = 'chat-open-term';
+  openTermBtn.textContent = 'Open terminal';
+  openTermBtn.onclick = (e) => { e.stopPropagation(); setPaneView(pane, 'term'); };
+  bannerActions.append(keyWrap, openTermBtn);
+  banner.append(bannerText, bannerActions);
+
+  // Binding trouble notice ("couldn't find this thread's transcript").
+  const notice = document.createElement('div');
+  notice.className = 'chat-notice hidden';
+  const noticeText = document.createElement('span');
+  noticeText.textContent = 'Couldn’t find this thread’s transcript — the chat view can’t update. Still watching for it…';
+  const noticeBtn = document.createElement('button');
+  noticeBtn.className = 'chat-open-term';
+  noticeBtn.textContent = 'Open terminal';
+  noticeBtn.onclick = (e) => { e.stopPropagation(); setPaneView(pane, 'term'); };
+  notice.append(noticeText, noticeBtn);
+
+  // Working indicator: a spinning swirl below the last message while the
+  // thread is busy on a turn (mirrors the header's "working…" status). It
+  // lives inside the message list as its permanent last child — rows are
+  // inserted before it (upsertChatRow) so it always trails the newest one.
+  const working = document.createElement('div');
+  working.className = 'chat-working hidden';
+  const workingIcon = document.createElement('span');
+  workingIcon.className = 'chat-working-icon';
+  workingIcon.textContent = '🌀';
+  const workingText = document.createElement('span');
+  workingText.textContent = 'working…';
+  working.append(workingIcon, workingText);
+
+  // Message list.
+  const list = document.createElement('div');
+  list.className = 'chat-list';
+  list.addEventListener('scroll', () => {
+    const c = pane.chat;
+    if (c) c.pinned = list.scrollTop + list.clientHeight >= list.scrollHeight - 40;
+  });
+  list.appendChild(working);
+
+  // Composer. Attachment chips (pasted/dropped/picked files) sit in their own
+  // row above the input; their paths are appended to the message on send.
+  const composer = document.createElement('div');
+  composer.className = 'chat-composer';
+  const attachRow = document.createElement('div');
+  attachRow.className = 'chat-attachments hidden';
+  const input = document.createElement('textarea');
+  input.className = 'chat-input';
+  input.rows = 1;
+  input.placeholder = 'Message this thread…  (Enter sends, Shift+Enter for a new line, paste/drop files to attach)';
+  input.spellcheck = true;
+  const attachBtn = document.createElement('button');
+  attachBtn.className = 'chat-attach';
+  attachBtn.textContent = '📎';
+  attachBtn.title = 'Attach files — their paths are sent with your message';
+  // Interrupt: same as typing Ctrl+C in the terminal — ConPTY (Windows) / the
+  // tty line discipline (POSIX) turn \x03 into the interrupt for the running
+  // process. Routed through sendToPane so the caption buffer resets like a
+  // typed Ctrl+C would.
+  const interruptBtn = document.createElement('button');
+  interruptBtn.className = 'chat-interrupt';
+  interruptBtn.textContent = '⏹';
+  interruptBtn.title = 'Interrupt — send Ctrl+C to this thread';
+  interruptBtn.onclick = (e) => { e.stopPropagation(); sendToPane(pane, '\x03'); };
+  const sendBtn = document.createElement('button');
+  sendBtn.className = 'chat-send';
+  sendBtn.textContent = '➤';
+  sendBtn.title = 'Send (Enter)';
+  const composerRow = document.createElement('div');
+  composerRow.className = 'chat-composer-row';
+  composerRow.append(attachBtn, input, interruptBtn, sendBtn);
+  composer.append(attachRow, composerRow);
+
+  // Read-only banner shown while browsing a past conversation. "Back to live"
+  // drops history mode and restores the live tail (exitHistory).
+  const historyBar = document.createElement('div');
+  historyBar.className = 'chat-history-bar hidden';
+  const historyBarText = document.createElement('span');
+  historyBarText.className = 'chat-history-bar-text';
+  const historyBackBtn = document.createElement('button');
+  historyBackBtn.className = 'chat-open-term';
+  historyBackBtn.textContent = 'Back to live';
+  historyBackBtn.onclick = (e) => { e.stopPropagation(); exitHistory(pane); };
+  historyBar.append(historyBarText, historyBackBtn);
+
+  wrap.append(filters, banner, notice, historyBar, list, composer);
+  body.appendChild(wrap);
+
+  pane.chat = {
+    wrap, list, input, sendBtn, banner, bannerText, notice, chips, attachRow, topic, working,
+    historyBtn, historyMenu, historyBar, historyBarText,
+    viewingHistory: false,   // true while showing a past session read-only
+    attachments: [],         // { path, name, isImage, thumbUrl } chips awaiting send
+    byKey: new Map(),        // row key -> row element
+    toolByUseId: new Map(),  // tool_use id -> row key
+    pendingResults: new Map(), // tool_use id -> result payload that arrived early
+    pendingEcho: [],         // optimistic user bubbles awaiting their transcript line
+    echoSeq: 0,
+    pinned: true,
+    history: [],             // past sent messages, oldest→newest (↑/↓ to recall)
+    histIdx: null,           // index into history while browsing; null = live draft
+    histDraft: '',           // the in-progress draft stashed when browsing began
+  };
+
+  // Composer wiring. Keystrokes stay local to the textarea; Enter sends.
+  // The autocomplete menu gets first look at keys so ↑/↓/Tab/Enter/Esc can
+  // drive it while it's open.
+  const ac = initChatAutocomplete(pane, composer, input);
+  pane.chat.ac = ac;
+  input.addEventListener('keydown', (e) => {
+    e.stopPropagation();
+    if (ac.handleKey(e)) return;
+    if ((e.key === 'ArrowUp' || e.key === 'ArrowDown') &&
+        !e.shiftKey && !e.metaKey && !e.ctrlKey && !e.altKey &&
+        chatHistoryNav(pane, e.key === 'ArrowUp' ? -1 : 1)) {
+      e.preventDefault();
+      return;
+    }
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault();
+      sendChatMessage(pane);
+    }
+  });
+  // Typing abandons history browsing so the next ↑ starts from the newest entry.
+  input.addEventListener('input', () => { pane.chat.histIdx = null; autosizeComposer(input); ac.refresh(); });
+  input.addEventListener('click', () => ac.refresh());
+  input.addEventListener('blur', () => ac.hide());
+  input.addEventListener('mousedown', (e) => e.stopPropagation());
+  sendBtn.onclick = (e) => { e.stopPropagation(); sendChatMessage(pane); };
+
+  // 📎 opens a native picker; each chosen file becomes an attachment chip.
+  attachBtn.onclick = async (e) => {
+    e.stopPropagation();
+    const paths = (await window.api.pickFiles()) || [];
+    for (const p of paths) addChatAttachment(pane, p);
+    input.focus();
+  };
+
+  // Images pasted into the composer become temp files shown as attachment
+  // chips, so they submit together with the message text.
+  input.addEventListener('paste', async (e) => {
+    const cd = e.clipboardData;
+    const items = Array.from((cd && cd.items) || []);
+    const types = Array.from((cd && cd.types) || []);
+    const imgItem = items.find((it) => it.kind === 'file' && it.type.startsWith('image/'));
+    if (imgItem) {
+      e.preventDefault();
+      const file = imgItem.getAsFile();
+      const p = file && (await persistImage(file));
+      if (p) addChatAttachment(pane, p, file);
+      return;
+    }
+    if (types.includes('text/plain')) return; // native text paste
+    // Raw bitmap on the native clipboard (e.g. Win+Shift+S).
+    e.preventDefault();
+    const p = await window.api.clipboardImage();
+    if (p) addChatAttachment(pane, p);
+  });
+
+  // Drag-and-drop files anywhere on the chat view — each becomes a chip.
+  wrap.addEventListener('dragover', (e) => {
+    if (e.dataTransfer && Array.from(e.dataTransfer.items || []).some((it) => it.kind === 'file')) {
+      e.preventDefault();
+      pane.el.classList.add('drag-over');
+    }
+  });
+  wrap.addEventListener('dragleave', () => pane.el.classList.remove('drag-over'));
+  wrap.addEventListener('drop', async (e) => {
+    pane.el.classList.remove('drag-over');
+    const files = Array.from((e.dataTransfer && e.dataTransfer.files) || []);
+    if (!files.length) return;
+    e.preventDefault(); // never let Electron navigate to a dropped file
+    focusPane(pane);
+    for (const f of files) {
+      // Files already on disk keep their path; in-memory images get persisted.
+      const p = f.path || (isImageFile(f) ? await persistImage(f) : null);
+      if (p) addChatAttachment(pane, p, f);
+    }
+    input.focus();
+  });
+
+  // Font sizing works in the chat view too: Ctrl +/-/0 and Ctrl+scroll, same
+  // as the terminal. Capture phase so the composer's stopPropagation (which
+  // keeps ordinary typing local) doesn't swallow the shortcuts.
+  wrap.addEventListener('keydown', (e) => {
+    if (!(e.ctrlKey || e.metaKey) || e.altKey) return;
+    let size = null;
+    if (e.key === '=' || e.key === '+') size = pane.fontSize + 1;
+    else if (e.key === '-' || e.key === '_') size = pane.fontSize - 1;
+    else if (e.key === '0') size = FONT_DEFAULT;
+    if (size === null) return;
+    e.preventDefault();           // don't also zoom the whole Electron page
+    e.stopPropagation();
+    setPaneFontSize(pane, size);
+  }, true);
+  wrap.addEventListener('wheel', (e) => {
+    if (!e.ctrlKey) return;
+    e.preventDefault();
+    e.stopPropagation();
+    setPaneFontSize(pane, pane.fontSize + (e.deltaY < 0 ? 1 : -1));
+  }, { passive: false, capture: true });
+
+  // View toggle button (created in createPane's header).
+  pane.viewBtn.addEventListener('mousedown', (e) => e.stopPropagation());
+  pane.viewBtn.onclick = (e) => {
+    e.stopPropagation();
+    setPaneView(pane, pane.view === 'chat' ? 'term' : 'chat');
+  };
+  pane.viewBtn.style.display = chatSupported(pane) ? '' : 'none';
+
+  applyChatFilters(pane);
+  setPaneView(pane, pane.view, { persist: false });
+}
+
+function autosizeComposer(input) {
+  input.style.height = 'auto';
+  input.style.height = Math.min(input.scrollHeight, 160) + 'px';
+}
+
+// ---------------------------------------------------------------------------
+// Composer attachments — VS-Code-style chips above the input. Images render a
+// thumbnail, other files a pill with the filename; ✕ removes a chip. On send
+// the chips' quoted paths are appended to the message text.
+// ---------------------------------------------------------------------------
+
+// file:// URL for an <img> thumbnail (the window itself is file://-origin).
+// The drive-letter colon stays unencoded (":" can't appear in filenames).
+function fileUrlFor(p) {
+  let u = String(p).replace(/\\/g, '/');
+  if (!u.startsWith('/')) u = '/' + u;
+  return 'file://' + u.split('/').map(encodeURIComponent).join('/').replace(/%3A/gi, ':');
+}
+
+function addChatAttachment(pane, p, file) {
+  const c = pane.chat;
+  if (!c || !p) return;
+  if (c.attachments.some((a) => a.path === p)) return;
+  const name = String(p).split(/[\\/]/).pop() || String(p);
+  const isImage = isImageFile(file) || IMAGE_EXT_RE.test(name);
+  // Prefer an object URL when we still hold the bytes (pasted images) — it
+  // works even before slow disks flush; fall back to the on-disk path.
+  const thumbUrl = !isImage ? null
+    : (file && file.size ? URL.createObjectURL(file) : fileUrlFor(p));
+  c.attachments.push({ path: p, name, isImage, thumbUrl });
+  renderChatAttachments(pane);
+}
+
+function removeChatAttachment(pane, att) {
+  const c = pane.chat;
+  const i = c.attachments.indexOf(att);
+  if (i === -1) return;
+  c.attachments.splice(i, 1);
+  if (att.thumbUrl && att.thumbUrl.startsWith('blob:')) URL.revokeObjectURL(att.thumbUrl);
+  renderChatAttachments(pane);
+}
+
+function renderChatAttachments(pane) {
+  const c = pane.chat;
+  c.attachRow.innerHTML = '';
+  for (const att of c.attachments) {
+    const chip = document.createElement('div');
+    chip.className = 'chat-attachment' + (att.isImage ? ' image' : '');
+    chip.title = att.path;
+    if (att.isImage) {
+      const img = document.createElement('img');
+      img.src = att.thumbUrl;
+      img.alt = att.name;
+      // Broken thumbnail (e.g. unreadable file) degrades to a file pill.
+      img.onerror = () => { chip.classList.remove('image'); img.replaceWith(fileChipLabel(att)); };
+      chip.appendChild(img);
+    } else {
+      chip.appendChild(fileChipLabel(att));
+    }
+    const rm = document.createElement('button');
+    rm.className = 'att-remove';
+    rm.textContent = '✕';
+    rm.title = 'Remove attachment';
+    rm.onclick = (e) => { e.stopPropagation(); removeChatAttachment(pane, att); c.input.focus(); };
+    chip.appendChild(rm);
+    c.attachRow.appendChild(chip);
+  }
+  c.attachRow.classList.toggle('hidden', !c.attachments.length);
+}
+
+function fileChipLabel(att) {
+  const label = document.createElement('span');
+  label.className = 'att-label';
+  const icon = document.createElement('span');
+  icon.className = 'att-icon';
+  icon.textContent = '📄';
+  const name = document.createElement('span');
+  name.className = 'att-name';
+  name.textContent = att.name;
+  label.append(icon, name);
+  return label;
+}
+
+// ---------------------------------------------------------------------------
+// Composer autocomplete. Two triggers:
+//   "/" as the first character  -> slash commands (built-ins below, plus the
+//        project's .claude/commands/*.md and .claude/skills/* directories)
+//   "@word" anywhere            -> file paths under the board's project
+//        directory, listed one level at a time via api.files.list
+// ↑/↓ select, Tab/Enter accept, Esc dismisses. Enter falls through to "send"
+// when the typed token already exactly matches the selected suggestion.
+// ---------------------------------------------------------------------------
+const AC_MAX_ITEMS = 8;
+const SLASH_COMMANDS = [
+  ['/agents', 'Manage agent configurations'],
+  ['/clear', 'Clear the conversation history'],
+  ['/compact', 'Summarize the conversation to free up context'],
+  ['/config', 'Open Claude Code settings'],
+  ['/context', 'Show what is using up the context window'],
+  ['/cost', 'Show token usage for this session'],
+  ['/doctor', 'Check the Claude Code installation'],
+  ['/exit', 'Quit this Claude session'],
+  ['/export', 'Export the conversation'],
+  ['/help', 'List available commands'],
+  ['/hooks', 'Manage hooks'],
+  ['/init', 'Generate a CLAUDE.md for this project'],
+  ['/mcp', 'Manage MCP servers'],
+  ['/memory', 'Edit memory files'],
+  ['/model', 'Switch model'],
+  ['/permissions', 'View or change tool permissions'],
+  ['/resume', 'Resume an earlier conversation'],
+  ['/review', 'Review a pull request'],
+  ['/rewind', 'Rewind the conversation or code'],
+  ['/status', 'Show session status'],
+  ['/todos', 'List current TODO items'],
+  ['/usage', 'Show plan usage limits'],
+  ['/vim', 'Toggle vim editing mode'],
+];
+
+function initChatAutocomplete(pane, composer, input) {
+  const menu = document.createElement('div');
+  menu.className = 'chat-autocomplete hidden';
+  composer.appendChild(menu);
+
+  const st = {
+    items: [], sel: 0, token: null,
+    seq: 0,            // guards against stale async listings
+    customFor: null,   // board dir the cached project commands were read from
+    custom: null,
+  };
+
+  function hide() {
+    st.items = [];
+    st.token = null;
+    menu.innerHTML = '';
+    menu.classList.add('hidden');
+  }
+
+  // The completable token ending at the caret, or null.
+  function tokenAtCaret() {
+    if (input.selectionStart !== input.selectionEnd) return null;
+    const pos = input.selectionStart;
+    const before = input.value.slice(0, pos);
+    if (/^\/\S*$/.test(before)) return { type: 'slash', start: 0, end: pos, query: before.slice(1) };
+    const m = before.match(/(^|\s)@([^\s@]*)$/);
+    if (m) return { type: 'file', start: pos - m[2].length - 1, end: pos, query: m[2] };
+    return null;
+  }
+
+  async function refresh() {
+    const tok = tokenAtCaret();
+    if (!tok) { hide(); return; }
+    const seq = ++st.seq;
+    const items = tok.type === 'slash' ? await slashItems(tok.query) : await fileItems(tok.query);
+    if (seq !== st.seq || pane.disposed) return; // a newer refresh superseded this one
+    if (document.activeElement !== input) return; // blurred while the listing was in flight
+    st.token = tok;
+    st.items = items.slice(0, AC_MAX_ITEMS);
+    st.sel = 0;
+    render();
+  }
+
+  async function slashItems(query) {
+    const q = query.toLowerCase();
+    const byName = new Map();
+    for (const [name, desc] of SLASH_COMMANDS) byName.set(name, { label: name, desc, insert: name + ' ' });
+    for (const it of await projectCommands()) if (!byName.has(it.label)) byName.set(it.label, it);
+    return Array.from(byName.values())
+      .filter((it) => it.label.slice(1).toLowerCase().startsWith(q))
+      .sort((a, b) => a.label.localeCompare(b.label));
+  }
+
+  // Project slash commands, read once per board directory.
+  async function projectCommands() {
+    const dir = pane.board.dir;
+    if (!dir) return [];
+    if (st.customFor === dir && st.custom) return st.custom;
+    st.customFor = dir;
+    st.custom = [];
+    try {
+      const [cmds, skills] = await Promise.all([
+        window.api.files.list(dir, '.claude/commands'),
+        window.api.files.list(dir, '.claude/skills'),
+      ]);
+      if (cmds && cmds.ok) {
+        for (const e of cmds.entries) {
+          if (e.isDir || !/\.md$/i.test(e.name)) continue;
+          const name = '/' + e.name.replace(/\.md$/i, '');
+          st.custom.push({ label: name, desc: 'Project command', insert: name + ' ' });
+        }
+      }
+      if (skills && skills.ok) {
+        for (const e of skills.entries) {
+          if (e.isDir) st.custom.push({ label: '/' + e.name, desc: 'Project skill', insert: '/' + e.name + ' ' });
+        }
+      }
+    } catch (_) { /* no project commands */ }
+    return st.custom;
+  }
+
+  async function fileItems(query) {
+    const dir = pane.board.dir;
+    if (!dir) return [];
+    const slash = query.lastIndexOf('/');
+    const parent = slash >= 0 ? query.slice(0, slash) : '';
+    const prefix = (slash >= 0 ? query.slice(slash + 1) : query).toLowerCase();
+    let res;
+    try { res = await window.api.files.list(dir, parent); } catch (_) { return []; }
+    if (!res || !res.ok) return [];
+    const showHidden = prefix.startsWith('.');
+    return res.entries
+      .filter((e) => (showHidden || !e.name.startsWith('.')) && e.name.toLowerCase().startsWith(prefix))
+      .map((e) => ({
+        label: e.name + (e.isDir ? '/' : ''),
+        desc: e.path,
+        insert: '@' + e.path + (e.isDir ? '/' : ' '),
+        keepOpen: e.isDir, // completing a directory re-opens the menu inside it
+      }));
+  }
+
+  function render() {
+    if (!st.items.length || !st.token) { hide(); return; }
+    menu.innerHTML = '';
+    st.items.forEach((it, i) => {
+      const row = document.createElement('div');
+      row.className = 'chat-ac-item' + (i === st.sel ? ' sel' : '');
+      const name = document.createElement('span');
+      name.className = 'chat-ac-name';
+      name.textContent = it.label;
+      const desc = document.createElement('span');
+      desc.className = 'chat-ac-desc';
+      desc.textContent = it.desc || '';
+      row.append(name, desc);
+      // mousedown (not click) with preventDefault keeps focus in the textarea.
+      row.addEventListener('mousedown', (e) => { e.preventDefault(); e.stopPropagation(); accept(it); });
+      row.addEventListener('mouseenter', () => {
+        if (st.sel === i) return;
+        menu.children[st.sel] && menu.children[st.sel].classList.remove('sel');
+        st.sel = i;
+        row.classList.add('sel');
+      });
+      menu.appendChild(row);
+    });
+    menu.classList.remove('hidden');
+  }
+
+  function accept(it) {
+    const tok = st.token;
+    if (!tok) return;
+    input.setRangeText(it.insert, tok.start, tok.end, 'end');
+    autosizeComposer(input);
+    input.focus();
+    if (it.keepOpen) refresh();
+    else hide();
+  }
+
+  // Returns true when the key was consumed by the menu.
+  function handleKey(e) {
+    if (menu.classList.contains('hidden')) return false;
+    if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+      e.preventDefault();
+      st.sel = (st.sel + (e.key === 'ArrowDown' ? 1 : -1) + st.items.length) % st.items.length;
+      render();
+      return true;
+    }
+    if (e.key === 'Tab' || (e.key === 'Enter' && !e.shiftKey)) {
+      const it = st.items[st.sel];
+      const typed = st.token ? input.value.slice(st.token.start, st.token.end) : '';
+      // Fully-typed token: let Enter through so it sends instead of re-inserting.
+      if (e.key === 'Enter' && it && !it.keepOpen && it.insert.trim() === typed.trim()) {
+        hide();
+        return false;
+      }
+      e.preventDefault();
+      if (it) accept(it);
+      return true;
+    }
+    if (e.key === 'Escape') {
+      e.preventDefault();
+      hide();
+      return true;
+    }
+    // Caret moves don't fire 'input'; re-evaluate the token after they land.
+    if (e.key === 'ArrowLeft' || e.key === 'ArrowRight' || e.key === 'Home' || e.key === 'End') {
+      setTimeout(() => { if (!pane.disposed) refresh(); }, 0);
+    }
+    return false;
+  }
+
+  return { handleKey, refresh, hide };
+}
+
+function updateViewBtn(pane) {
+  if (!pane.viewBtn) return;
+  const chat = pane.view === 'chat';
+  pane.viewBtn.textContent = chat ? '>_' : '💬';
+  pane.viewBtn.title = chat
+    ? 'Show the terminal running underneath this chat view'
+    : 'Show the chat view';
+}
+
+function setPaneView(pane, view, { persist = true } = {}) {
+  if (!chatSupported(pane)) view = 'term';
+  pane.view = view;
+  pane.el.classList.toggle('term-view', view === 'term');
+  updateViewBtn(pane);
+  if (view === 'term') fitBoard(pane.board.id); // defensive re-fit on reveal
+  if (pane === focusedPane) {
+    try {
+      if (view === 'chat' && pane.chat) pane.chat.input.focus();
+      else pane.term.focus();
+    } catch (_) { /* ignore */ }
+  }
+  if (persist) persistLayout(pane.board.id);
+}
+
+// Called when a pane's agent changes: chat for Claude, terminal for the rest.
+function updateChatAvailability(pane) {
+  if (!pane.viewBtn) return;
+  const ok = chatSupported(pane);
+  pane.viewBtn.style.display = ok ? '' : 'none';
+  setPaneView(pane, ok ? 'chat' : 'term', { persist: false });
+}
+
+function applyChatFilters(pane) {
+  const c = pane.chat;
+  if (!c) return;
+  for (const kind of CHAT_KINDS) {
+    const show = !!pane.chatFilters[kind];
+    c.wrap.classList.toggle('hide-' + kind, !show);
+    if (c.chips[kind]) c.chips[kind].classList.toggle('active', show);
+  }
+}
+
+// Drop all rendered rows (respawn, session rollover) — the transcript backfill
+// that follows repopulates the view.
+function resetChat(pane) {
+  const c = pane.chat;
+  if (!c) return;
+  c.list.innerHTML = '';
+  c.list.appendChild(c.working); // clearing the list must not drop the swirl
+  c.byKey.clear();
+  c.toolByUseId.clear();
+  c.pendingResults.clear();
+  c.pendingEcho = [];
+  c.pinned = true;
+  c.topic.textContent = '';
+  c.topic.title = '';
+}
+
+function chatBindStatus(pane, status) {
+  const c = pane.chat;
+  if (!c) return;
+  // Don't let a live (re)bind wipe the past conversation being viewed; the
+  // live view is rebuilt from scratch when the user clicks "Back to live".
+  if (c.viewingHistory) return;
+  if (status === 'timeout') {
+    c.notice.classList.remove('hidden');
+  } else {
+    c.notice.classList.add('hidden');
+    // A (re)bind means a fresh source file; render it from scratch.
+    if (status === 'bound') resetChat(pane);
+  }
+}
+
+// -- Conversation history (chat-overlay session picker) ----------------------
+
+// Compact "2h ago" style stamp for the picker; falls back to a date past a week.
+function relTimeShort(ms) {
+  const d = Date.now() - ms;
+  if (d < 60 * 1000) return 'just now';
+  const m = Math.floor(d / 60000);
+  if (m < 60) return m + 'm ago';
+  const h = Math.floor(m / 60);
+  if (h < 24) return h + 'h ago';
+  const days = Math.floor(h / 24);
+  if (days < 7) return days + 'd ago';
+  return new Date(ms).toLocaleDateString();
+}
+
+function hideHistoryMenu(pane) {
+  const c = pane.chat;
+  if (c) c.historyMenu.classList.add('hidden');
+}
+
+async function toggleHistoryMenu(pane) {
+  const c = pane.chat;
+  if (!c) return;
+  if (!c.historyMenu.classList.contains('hidden')) { hideHistoryMenu(pane); return; }
+  c.historyMenu.innerHTML = '<div class="chat-history-empty">Loading…</div>';
+  c.historyMenu.classList.remove('hidden');
+  let res;
+  try { res = await window.api.transcript.listSessions({ paneId: pane.id, cwd: pane.board.dir }); }
+  catch (_) { res = null; }
+  if (pane.disposed || c.historyMenu.classList.contains('hidden')) return; // closed meanwhile
+  buildHistoryMenu(pane, (res && res.sessions) || []);
+}
+
+function buildHistoryMenu(pane, sessions) {
+  const c = pane.chat;
+  c.historyMenu.innerHTML = '';
+  if (!sessions.length) {
+    const empty = document.createElement('div');
+    empty.className = 'chat-history-empty';
+    empty.textContent = 'No past conversations yet.';
+    c.historyMenu.appendChild(empty);
+    return;
+  }
+  for (const s of sessions) {
+    const item = document.createElement('button');
+    item.className = 'chat-history-item' + (s.current ? ' current' : '');
+    const title = document.createElement('span');
+    title.className = 'chat-history-item-title';
+    title.textContent = s.title || s.preview || '(no messages)';
+    const meta = document.createElement('span');
+    meta.className = 'chat-history-item-meta';
+    meta.textContent = (s.current ? 'live · ' : '') + relTimeShort(s.mtimeMs);
+    item.append(title, meta);
+    item.title = s.title || s.preview || '';
+    item.onclick = (e) => {
+      e.stopPropagation();
+      hideHistoryMenu(pane);
+      if (s.current) exitHistory(pane);       // clicking the live session just returns to it
+      else openHistorySession(pane, s);
+    };
+    c.historyMenu.appendChild(item);
+  }
+}
+
+// Show a past session read-only over the live view. Live tailing keeps running
+// underneath (chatIngest is suppressed) so nothing is lost; exitHistory rebuilds
+// the live view from the current file.
+async function openHistorySession(pane, sess) {
+  const c = pane.chat;
+  if (!c) return;
+  let res;
+  try { res = await window.api.transcript.readSession({ cwd: pane.board.dir, name: sess.name }); }
+  catch (_) { res = null; }
+  if (pane.disposed || !c) return;
+  if (!res || !res.ok) { c.notice.classList.remove('hidden'); return; }
+  c.viewingHistory = true;
+  resetChat(pane);
+  renderChatEntries(pane, res.entries, true);
+  if (sess.title) setChatTopic(pane, sess.title);
+  updateChatBanner(pane);   // hide the live swirl/banner while browsing
+  c.list.scrollTop = 0;     // start at the top of the past conversation
+  updateHistoryChrome(pane, sess);
+}
+
+function exitHistory(pane) {
+  const c = pane.chat;
+  if (!c) return;
+  hideHistoryMenu(pane);
+  if (!c.viewingHistory) return;
+  c.viewingHistory = false;
+  resetChat(pane);
+  updateHistoryChrome(pane, null);
+  updateChatBanner(pane);              // restore live swirl/banner state
+  window.api.transcript.refresh(pane.id); // re-emit the live file to catch up
+}
+
+function updateHistoryChrome(pane, sess) {
+  const c = pane.chat;
+  if (!c) return;
+  const on = !!sess;
+  c.historyBar.classList.toggle('hidden', !on);
+  c.wrap.classList.toggle('viewing-history', on);
+  c.historyBtn.classList.toggle('active', on);
+  if (on) {
+    c.historyBarText.textContent =
+      'Viewing a past conversation (read-only)' + (sess.title ? ' · ' + sess.title : '');
+  }
+}
+
+// -- Rendering ---------------------------------------------------------------
+
+function chatIngest(pane, entries, backfill) {
+  const c = pane.chat;
+  // Live tail updates are paused while the user browses a past conversation;
+  // exitHistory() re-reads the live file to catch up.
+  if (!c || c.viewingHistory) return;
+  renderChatEntries(pane, entries, backfill);
+}
+
+function renderChatEntries(pane, entries, backfill) {
+  const c = pane.chat;
+  for (const e of entries) {
+    try { renderChatEntry(pane, e); } catch (_) { /* one bad entry never kills the view */ }
+  }
+  if (c.pinned || backfill) c.list.scrollTop = c.list.scrollHeight;
+}
+
+function renderChatEntry(pane, e) {
+  // Summary lines carry the conversation topic — they feed the chat's topic
+  // header rather than the message list.
+  if (e.type === 'summary') {
+    setChatTopic(pane, e.summary);
+    return;
+  }
+  // Subagent traffic (Task tool sidechains) collapses to one-liners.
+  if (e.isSidechain) {
+    addSidechainRow(pane, e);
+    return;
+  }
+  if (e.type === 'user' && e.message) {
+    const content = e.message.content;
+    if (typeof content === 'string') {
+      addUserOrMetaRow(pane, e, content);
+      return;
+    }
+    if (Array.isArray(content)) {
+      for (const part of content) {
+        if (part && part.type === 'tool_result') attachToolResult(pane, part, e.toolUseResult);
+      }
+      const text = content
+        .filter((p) => p && p.type === 'text' && typeof p.text === 'string')
+        .map((p) => p.text).join('\n').trim();
+      if (text) addUserOrMetaRow(pane, e, text);
+      return;
+    }
+    return;
+  }
+  if (e.type === 'assistant' && e.message && Array.isArray(e.message.content)) {
+    e.message.content.forEach((part, i) => {
+      if (!part) return;
+      const key = (e.uuid || 'a') + ':' + i;
+      if (part.type === 'text' && part.text && part.text.trim()) {
+        upsertChatRow(pane, key, 'assistant', (row) => {
+          row.innerHTML = '<div class="chat-bubble assistant chat-md">' + markdownToHtml(part.text) + '</div>';
+        });
+      } else if (part.type === 'thinking' && part.thinking) {
+        upsertChatRow(pane, key, 'thinking', (row) => {
+          row.innerHTML =
+            '<details class="chat-fold"><summary>Thinking…</summary><pre class="chat-pre"></pre></details>';
+          row.querySelector('.chat-pre').textContent = part.thinking;
+        });
+      } else if (part.type === 'tool_use') {
+        addToolRow(pane, key, part);
+      }
+    });
+    return;
+  }
+  addMetaRow(pane, chatKeyFor(e), metaLabel(e));
+}
+
+let chatAnonSeq = 0;
+function chatKeyFor(e) {
+  return e.uuid || 'anon:' + (++chatAnonSeq);
+}
+
+// Upsert keyed by transcript uuid (+part index) — re-emitted lines update in
+// place instead of duplicating. Re-renders keep an open <details> open.
+function upsertChatRow(pane, key, kind, render) {
+  const c = pane.chat;
+  let row = c.byKey.get(key);
+  const fold = row && row.querySelector('details');
+  const wasOpen = !!(fold && fold.open);
+  if (!row) {
+    row = document.createElement('div');
+    row.className = 'chat-row';
+    c.byKey.set(key, row);
+    c.list.insertBefore(row, c.working); // the working swirl stays last
+  }
+  row.dataset.kind = kind;
+  render(row);
+  if (wasOpen) {
+    const f = row.querySelector('details');
+    if (f) f.open = true;
+  }
+  return row;
+}
+
+// User lines that are really app/CLI plumbing (slash-command envelopes, meta
+// notes) belong in the meta bucket, not as chat bubbles.
+const CHAT_PLUMBING_RE = /<(command-name|command-message|command-args|local-command-stdout|local-command-stderr|system-reminder)>/;
+
+function addUserOrMetaRow(pane, e, text) {
+  if (e.isMeta || CHAT_PLUMBING_RE.test(text)) {
+    const cmd = /<command-name>([\s\S]*?)<\/command-name>/.exec(text);
+    addMetaRow(pane, chatKeyFor(e), cmd ? 'command: ' + cmd[1].trim() : text);
+    return;
+  }
+  confirmEcho(pane, text);
+  upsertChatRow(pane, chatKeyFor(e), 'user', (row) => {
+    row.innerHTML = '<div class="chat-bubble user"></div>';
+    row.firstChild.textContent = text;
+  });
+}
+
+// The latest summary wins; a bare/blank one never wipes an existing topic.
+function setChatTopic(pane, text) {
+  const c = pane.chat;
+  if (!c) return;
+  const t = String(text || '').replace(/\s+/g, ' ').trim();
+  if (!t) return;
+  c.topic.textContent = t;
+  c.topic.title = t;
+}
+
+function addMetaRow(pane, key, label) {
+  const text = String(label || '').replace(/\s+/g, ' ').trim().slice(0, 200);
+  if (!text) return;
+  upsertChatRow(pane, key, 'meta', (row) => {
+    row.innerHTML = '<div class="chat-meta-line"></div>';
+    row.firstChild.textContent = text;
+  });
+}
+
+function addSidechainRow(pane, e) {
+  let brief = e.type;
+  if (e.message && Array.isArray(e.message.content)) {
+    const t = e.message.content.find((p) => p && p.type === 'text' && p.text);
+    const u = e.message.content.find((p) => p && p.type === 'tool_use');
+    if (t) brief = t.text;
+    else if (u) brief = u.name || 'tool';
+  } else if (e.message && typeof e.message.content === 'string') {
+    brief = e.message.content;
+  }
+  upsertChatRow(pane, chatKeyFor(e), 'subagent', (row) => {
+    row.innerHTML = '<div class="chat-meta-line subagent"></div>';
+    row.firstChild.textContent =
+      'subagent · ' + String(brief).replace(/\s+/g, ' ').trim().slice(0, 160);
+  });
+}
+
+function metaLabel(e) {
+  if (e.type === 'system' && typeof e.content === 'string') return stripAnsi(e.content);
+  return e.type + (e.subtype ? ': ' + e.subtype : '');
+}
+
+// One-line description of a tool call: the input field a human would scan for.
+const TOOL_SUMMARY_FIELDS = ['file_path', 'command', 'pattern', 'path', 'url', 'query', 'description', 'prompt', 'skill'];
+function toolSummary(part) {
+  const input = part.input || {};
+  for (const f of TOOL_SUMMARY_FIELDS) {
+    if (typeof input[f] === 'string' && input[f].trim()) {
+      return input[f].replace(/\s+/g, ' ').trim().slice(0, 100);
+    }
+  }
+  const keys = Object.keys(input);
+  return keys.length ? keys.join(', ').slice(0, 100) : '';
+}
+
+const CHAT_RESULT_MAX = 4000;
+function clipResult(s) {
+  s = String(s);
+  return s.length > CHAT_RESULT_MAX ? s.slice(0, CHAT_RESULT_MAX) + '\n… (truncated)' : s;
+}
+
+function addToolRow(pane, key, part) {
+  const c = pane.chat;
+  upsertChatRow(pane, key, 'tool', (row) => {
+    row.innerHTML =
+      '<details class="chat-fold chat-tool"><summary>' +
+      '<span class="chat-tool-name"></span> <span class="chat-tool-sum"></span>' +
+      '</summary><pre class="chat-pre chat-tool-input"></pre>' +
+      '<pre class="chat-pre chat-tool-result hidden"></pre></details>';
+    row.querySelector('.chat-tool-name').textContent = part.name || 'tool';
+    row.querySelector('.chat-tool-sum').textContent = toolSummary(part);
+    let inputJson = '';
+    try { inputJson = JSON.stringify(part.input || {}, null, 2); } catch (_) { /* ignore */ }
+    row.querySelector('.chat-tool-input').textContent = clipResult(inputJson);
+  });
+  if (part.id) {
+    c.toolByUseId.set(part.id, key);
+    // The matching result can outrun the tool row on a backfill batch.
+    const early = c.pendingResults.get(part.id);
+    if (early) {
+      c.pendingResults.delete(part.id);
+      attachToolResult(pane, early.part, early.toolUseResult);
+    }
+  }
+}
+
+function attachToolResult(pane, part, toolUseResult) {
+  const c = pane.chat;
+  const key = c.toolByUseId.get(part.tool_use_id);
+  if (!key) {
+    c.pendingResults.set(part.tool_use_id, { part, toolUseResult });
+    return;
+  }
+  const row = c.byKey.get(key);
+  if (!row) return;
+  let text = '';
+  if (typeof part.content === 'string') text = part.content;
+  else if (Array.isArray(part.content)) {
+    text = part.content
+      .filter((p) => p && p.type === 'text' && typeof p.text === 'string')
+      .map((p) => p.text).join('\n');
+  }
+  if (!text && toolUseResult) {
+    text = typeof toolUseResult === 'string' ? toolUseResult : safeJson(toolUseResult);
+  }
+  const out = row.querySelector('.chat-tool-result');
+  if (!out) return;
+  out.textContent = clipResult(text || '(no output)');
+  out.classList.remove('hidden');
+  row.classList.toggle('tool-error', !!part.is_error);
+}
+
+function safeJson(v) {
+  try { return JSON.stringify(v, null, 2); } catch (_) { return String(v); }
+}
+
+// -- Composer ------------------------------------------------------------------
+
+// Recall previously-sent messages in the composer with ↑/↓, shell-style.
+// dir: -1 = older, +1 = newer. Returns true when it consumed the keypress.
+// Only hijacks the arrow when it can't usefully move the caret in the textarea
+// (↑ on the first line, ↓ on the last), so multi-line editing still works.
+function chatHistoryNav(pane, dir) {
+  const c = pane.chat;
+  if (!c || c.viewingHistory || !c.history.length) return false;
+  const input = c.input;
+  const val = input.value;
+  const pos = input.selectionStart;
+  if (dir < 0) {
+    if (val.slice(0, pos).includes('\n')) return false; // caret not on first line
+  } else {
+    if (val.slice(pos).includes('\n')) return false;    // caret not on last line
+  }
+  if (c.histIdx === null) {
+    if (dir > 0) return false;          // nothing newer than the live draft
+    c.histDraft = val;                  // stash the in-progress draft
+    c.histIdx = c.history.length;
+  }
+  const idx = c.histIdx + dir;
+  if (idx >= c.history.length) {
+    // Stepped past the newest entry — restore the stashed draft.
+    c.histIdx = null;
+    input.value = c.histDraft;
+  } else {
+    c.histIdx = Math.max(0, idx);
+    input.value = c.history[c.histIdx];
+  }
+  autosizeComposer(input);
+  const end = input.value.length;
+  input.setSelectionRange(end, end);
+  return true;
+}
+
+function sendChatMessage(pane) {
+  const c = pane.chat;
+  if (!c) return;
+  const raw = c.input.value.replace(/\r\n?/g, '\n');
+  let text = raw.trim();
+  if (!text && !c.attachments.length) return;
+  // A message addressed to Hivemind itself ("Hivemind, open a new thread…")
+  // is an app command — run it instead of sending it to the thread. Text that
+  // starts with the wake word but isn't a recognized command falls through and
+  // is sent as a normal message.
+  const hmCmd = matchHivemindCommand(text);
+  // A message starting with "todo" is a checklist entry for the Todo panel,
+  // handled by Hivemind itself — same swallow-and-clear path as app commands.
+  const todoText = hmCmd === null ? matchTodoPrefix(text) : null;
+  if ((hmCmd !== null && runHivemindCommand(hmCmd, pane)) || todoText !== null) {
+    if (todoText !== null) captureTodo(todoText);
+    if (text && c.history[c.history.length - 1] !== text) {
+      c.history.push(text);
+      if (c.history.length > 200) c.history.shift();
+    }
+    c.histIdx = null;
+    c.histDraft = '';
+    c.input.value = '';
+    autosizeComposer(c.input);
+    if (c.ac) c.ac.hide();
+    return;
+  }
+  const typed = text; // the user's typed text, recallable later with ↑
+  // Attachments ride along as quoted paths appended to the message.
+  if (c.attachments.length) {
+    const paths = c.attachments.map((a) => quotePath(a.path)).join(' ');
+    text = text ? text + '\n' + paths : paths;
+    for (const a of c.attachments) {
+      if (a.thumbUrl && a.thumbUrl.startsWith('blob:')) URL.revokeObjectURL(a.thumbUrl);
+    }
+    c.attachments.length = 0;
+    renderChatAttachments(pane);
+  }
+  c.input.value = '';
+  autosizeComposer(c.input);
+  if (c.ac) c.ac.hide();
+  // Record for ↑/↓ recall, skipping consecutive duplicates; cap the backlog.
+  if (typed && c.history[c.history.length - 1] !== typed) {
+    c.history.push(typed);
+    if (c.history.length > 200) c.history.shift();
+  }
+  c.histIdx = null;
+  c.histDraft = '';
+  deliverPrompt(pane, text);
+}
+
+// Optimistic echo: show the message immediately; the transcript's real user
+// line replaces it (confirmEcho) when it lands.
+function addEchoRow(pane, text) {
+  const c = pane.chat;
+  const key = 'echo:' + (++c.echoSeq);
+  upsertChatRow(pane, key, 'user', (row) => {
+    row.innerHTML = '<div class="chat-bubble user pending"></div>';
+    row.firstChild.textContent = text;
+    if (pane.state === 'busy') {
+      const note = document.createElement('div');
+      note.className = 'chat-echo-note';
+      note.textContent = 'queued — thread is working…';
+      row.firstChild.appendChild(note);
+    }
+  });
+  c.pendingEcho.push({ key, text });
+  c.pinned = true;
+  c.list.scrollTop = c.list.scrollHeight;
+}
+
+function confirmEcho(pane, text) {
+  const c = pane.chat;
+  if (!c.pendingEcho.length) return;
+  let i = c.pendingEcho.findIndex((p) => p.text === String(text).trim());
+  if (i === -1) i = 0; // the TUI can reshape the text slightly — this real user
+                       // line still corresponds to the oldest unconfirmed send
+  const [p] = c.pendingEcho.splice(i, 1);
+  const row = c.byKey.get(p.key);
+  if (row) row.remove();
+  c.byKey.delete(p.key);
+}
+
+// -- Attention banner ----------------------------------------------------------
+
+// Mirror the pane's heuristic state into the chat view: when the hidden TUI is
+// waiting on a prompt (or errored/exited), surface it with quick actions.
+function updateChatBanner(pane) {
+  const c = pane.chat;
+  if (!c) return;
+  // While browsing history the swirl and attention banner don't apply to the
+  // (past, finished) conversation on screen — keep them hidden.
+  if (c.viewingHistory) {
+    c.working.classList.add('hidden');
+    c.banner.classList.add('hidden');
+    return;
+  }
+  const state = pane.state;
+  const wasHidden = c.working.classList.contains('hidden');
+  c.working.classList.toggle('hidden', state !== 'busy');
+  // The swirl sits under the last message; when it appears, keep a pinned
+  // view scrolled to the bottom so it's actually visible.
+  if (wasHidden && state === 'busy' && c.pinned) c.list.scrollTop = c.list.scrollHeight;
+  const show = state === 'attention' || state === 'error' || state === 'dead';
+  c.banner.classList.toggle('hidden', !show);
+  if (!show) return;
+  c.banner.classList.toggle('error', state === 'error' || state === 'dead');
+  if (state === 'dead') {
+    c.bannerText.textContent = 'The process behind this thread exited.';
+  } else {
+    const lines = (pane.buf || '').split('\n').map((s) => s.trim()).filter(Boolean).slice(-3);
+    c.bannerText.textContent = lines.join('\n') || (state === 'error' ? 'The thread hit an error.' : 'The thread needs your input.');
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -711,6 +2114,7 @@ function serializeLayout(boardId) {
       name: p.name, agent: p.agent, model: p.model, perm: p.permMode, fontSize: p.fontSize,
       flex: p.flex, caption: p.captionText || '', autoName: !!p.autoName,
       planId: p.planId || undefined, // stable per-thread key for the Plan pane
+      view: p.view, chatFilters: p.chatFilters,
     })),
   })).filter((c) => c.panes.length);
   return cols.length ? cols : null;
@@ -742,6 +2146,7 @@ function rebuildFromLayout(board) {
       const pane = createPane(board, colObj, {
         name: pd.name, agent, model: pd.model, perm: pd.perm, fontSize: pd.fontSize,
         flex: pd.flex, caption: pd.caption, autoName, planId: pd.planId,
+        view: pd.view, chatFilters: pd.chatFilters,
       });
       colObj.panes.push(pane);
       const m = /(\d+)\s*$/.exec(pd.name || '');
@@ -895,6 +2300,10 @@ function selectBoard(id) {
   if (typeof filesOnBoardChange === 'function') filesOnBoardChange();
   if (typeof planToggle !== 'undefined' && planToggle) planToggle.disabled = false;
   if (typeof planOnBoardChange === 'function') planOnBoardChange();
+  if (typeof todoToggle !== 'undefined' && todoToggle) todoToggle.disabled = false;
+  if (typeof todoOnBoardChange === 'function') todoOnBoardChange();
+  if (typeof kanbanToggle !== 'undefined' && kanbanToggle) kanbanToggle.disabled = false;
+  if (typeof kanbanOnBoardChange === 'function') kanbanOnBoardChange();
   fitBoard(id);
 }
 
@@ -984,7 +2393,7 @@ function buildZoomTabs(boardId, g, allPanes, active) {
     const tab = document.createElement('button');
     tab.className = 'zoom-tab' + (p === active ? ' active' : '');
     const d = document.createElement('span');
-    d.className = 'zoom-tab-dot ' + (p.state || '');
+    d.className = 'zoom-tab-dot ' + (p.state || '') + (p.doneGlow ? ' done' : '');
     const label = document.createElement('span');
     label.className = 'zoom-tab-label';
     label.textContent = paneLabel(p);
@@ -1013,7 +2422,7 @@ function refreshZoomTabs(boardId) {
   const strip = g.el.querySelector('.zoom-tabs');
   if (!strip) return;
   strip.querySelectorAll('.zoom-tab-dot').forEach((d) => {
-    if (d.__pane) d.className = 'zoom-tab-dot ' + (d.__pane.state || '');
+    if (d.__pane) d.className = 'zoom-tab-dot ' + (d.__pane.state || '') + (d.__pane.doneGlow ? ' done' : '');
   });
   strip.querySelectorAll('.zoom-tab-label').forEach((l) => {
     if (l.__pane) { l.textContent = paneLabel(l.__pane); l.parentElement.title = paneLabel(l.__pane); }
@@ -1106,7 +2515,7 @@ function addTerminal(board, opts = {}) {
   col.panes.push(pane);
   layout(board.id);
   focusPane(pane);
-  spawnPanePty(pane, { resume: opts.resume });
+  spawnPanePty(pane, { resume: opts.resume, initialPrompt: opts.initialPrompt });
   persistLayout(board.id);
   return pane;
 }
@@ -1119,7 +2528,7 @@ function addTerminal(board, opts = {}) {
 // boots into an 80x24 PTY and the late ConPTY resize-reflow strands phantom
 // characters at the start of the input line that can't be typed over or
 // backspaced across.
-function spawnPanePty(pane, { resume } = {}) {
+function spawnPanePty(pane, { resume, initialPrompt } = {}) {
   try { pane.fitAddon.fit(); } catch (_) { /* keep xterm defaults */ }
   window.api.spawnPty({
     id: pane.id,
@@ -1130,7 +2539,13 @@ function spawnPanePty(pane, { resume } = {}) {
     model: pane.agent === 'claude' ? pane.model : 'default',
     permissionMode: pane.agent === 'claude' ? pane.permMode : 'default',
     resume: !!resume,
+    initialPrompt: (pane.agent === 'claude' && initialPrompt) || undefined,
   });
+  // Chat view: bind this pane to the session transcript Claude Code is about
+  // to create (or, on resume, continue) in the board's project directory.
+  if (pane.agent === 'claude') {
+    window.api.transcript.bind({ paneId: pane.id, cwd: pane.board.dir, resume: !!resume });
+  }
   markActivity(pane, ''); // start out "working" until the first quiet period
 }
 
@@ -1144,6 +2559,7 @@ function createPane(board, col, opts = {}) {
   const startFont = opts.fontSize ? clampFont(opts.fontSize) : defaultFontSize;
   const el = document.createElement('div');
   el.className = 'pane';
+  el.style.setProperty('--pane-font', startFont + 'px'); // chat view text scale
 
   const header = document.createElement('div');
   header.className = 'pane-header';
@@ -1216,7 +2632,10 @@ function createPane(board, col, opts = {}) {
   const closeBtn = document.createElement('button');
   closeBtn.textContent = '✕';
   closeBtn.title = 'Close thread';
-  header.append(dot, titleWrap, statusEl, agentSelect, modelSelect, permSelect, fontDownBtn, fontUpBtn, zoomBtn, closeBtn);
+  // Chat/terminal view toggle (Claude threads only — see initChatUI).
+  const viewBtn = document.createElement('button');
+  viewBtn.className = 'font-btn view-btn';
+  header.append(dot, titleWrap, statusEl, agentSelect, modelSelect, permSelect, viewBtn, fontDownBtn, fontUpBtn, zoomBtn, closeBtn);
 
   const termWrap = document.createElement('div');
   termWrap.className = 'pane-term';
@@ -1236,7 +2655,14 @@ function createPane(board, col, opts = {}) {
   findClose.textContent = '✕'; findClose.title = 'Close (Esc)';
   findBar.append(findInput, findPrev, findNext, findClose);
 
-  el.append(header, findBar, termWrap);
+  // The terminal and the chat overlay share a positioned body. The chat view
+  // covers the terminal instead of replacing it (never display:none on the
+  // terminal): the xterm keeps its real layout box, so fit()/ConPTY sizing
+  // stay correct while hidden and revealing the terminal is instant.
+  const body = document.createElement('div');
+  body.className = 'pane-body';
+  body.appendChild(termWrap);
+  el.append(header, findBar, body);
 
   const term = new Terminal({
     fontFamily: 'Cascadia Code, Consolas, monospace',
@@ -1267,11 +2693,19 @@ function createPane(board, col, opts = {}) {
 
   const pane = {
     id, el, term, fitAddon, searchAddon, dot, statusEl, agentSelect, modelSelect, permSelect, title, caption,
-    findBar, findInput, flex: opts.flex || 1, col, board, disposed: false,
+    findBar, findInput, viewBtn, flex: opts.flex || 1, col, board, disposed: false,
     name: startName, state: null, buf: '', idleTimer: null,
     fontSize: startFont, agent: startAgent, model: startModel, permMode: startPerm, captionText: '', capBuf: '',
     errored: false, hintShown: false,
     planId: opts.planId || null, // assigned lazily the first time the Plan pane needs it
+
+    // Chat wrapper: which layer is on top ('chat' | 'term'), what the chat view
+    // shows, and its live render state (built in initChatUI).
+    view: opts.view === 'chat' || opts.view === 'term'
+      ? opts.view
+      : (startAgent === 'claude' ? 'chat' : 'term'),
+    chatFilters: Object.assign(globalChatFilters(), opts.chatFilters || {}),
+    chat: null,
 
     // Auto names ("claude 1") give way to the caption once the thread has one;
     // a manual rename (autoName=false) always stays visible.
@@ -1281,6 +2715,7 @@ function createPane(board, col, opts = {}) {
   if (opts.caption) setPaneCaption(pane, opts.caption, { persist: false });
   updateTitleVisibility(pane);
   paintPermSelect(pane);
+  initChatUI(pane, body);
 
   // Wire IO
   term.onData((data) => sendToPane(pane, data));
@@ -1476,6 +2911,7 @@ function closePane(pane) {
   pane.disposed = true;
   clearTimeout(pane.idleTimer);
   window.api.killPty(pane.id);
+  window.api.transcript.unbind(pane.id);
   try { pane.term.dispose(); } catch (_) { /* ignore */ }
 
   const g = grids.get(pane.board.id);
@@ -1503,7 +2939,11 @@ function focusPane(pane) {
   if (focusedPane && focusedPane !== pane) focusedPane.el.classList.remove('focused');
   focusedPane = pane;
   pane.el.classList.add('focused');
-  try { pane.term.focus(); } catch (_) { /* ignore */ }
+  setDoneGlow(pane, false); // visiting the thread acknowledges its finished turn
+  try {
+    if (pane.view === 'chat' && pane.chat) pane.chat.input.focus();
+    else pane.term.focus();
+  } catch (_) { /* ignore */ }
   // The Plan pane always mirrors the focused thread's plan.
   if (changed && typeof planOnFocusChange === 'function') planOnFocusChange();
 }
@@ -1550,6 +2990,31 @@ window.api.onPtyExit(({ id }) => {
     pane.term.write('\r\n\x1b[90m[process exited]\x1b[0m\r\n');
   }
 });
+
+// Transcript entries/status for the chat view (see "Chat wrapper" section).
+window.api.transcript.onEntries(({ paneId, entries, backfill }) => {
+  const pane = findPane(paneId);
+  if (pane && !pane.disposed) chatIngest(pane, entries || [], !!backfill);
+});
+
+window.api.transcript.onStatus(({ paneId, status }) => {
+  const pane = findPane(paneId);
+  if (pane && !pane.disposed) chatBindStatus(pane, status);
+});
+
+// Click anywhere outside an open history menu closes it.
+document.addEventListener('mousedown', (e) => {
+  for (const g of grids.values()) {
+    for (const col of g.columns) {
+      for (const pane of col.panes) {
+        const c = pane.chat;
+        if (!c || c.historyMenu.classList.contains('hidden')) continue;
+        if (c.historyMenu.contains(e.target) || e.target === c.historyBtn) continue;
+        hideHistoryMenu(pane);
+      }
+    }
+  }
+}, true);
 
 function findPane(id) {
   for (const g of grids.values()) {
@@ -1669,7 +3134,17 @@ function showEmpty() {
     planToggle.classList.remove('active');
   }
   if (typeof planPanel !== 'undefined' && planPanel) planPanel.classList.add('hidden');
-  const sb = $('sidebar'); if (sb) sb.classList.remove('git-open', 'files-open');
+  if (typeof todoToggle !== 'undefined' && todoToggle) {
+    todoToggle.disabled = true;
+    todoToggle.classList.remove('active');
+  }
+  if (typeof todoPanel !== 'undefined' && todoPanel) todoPanel.classList.add('hidden');
+  if (typeof kanbanToggle !== 'undefined' && kanbanToggle) {
+    kanbanToggle.disabled = true;
+    kanbanToggle.classList.remove('active');
+  }
+  if (typeof kanbanPanel !== 'undefined' && kanbanPanel) kanbanPanel.classList.add('hidden');
+  const sb = $('sidebar'); if (sb) sb.classList.remove('git-open', 'files-open', 'plan-open', 'todo-open', 'kanban-open');
 }
 
 // ---------------------------------------------------------------------------
@@ -1719,8 +3194,11 @@ function cycleFocus(dir) {
 document.addEventListener('keydown', (e) => {
   if (!(e.ctrlKey || e.metaKey) || e.altKey) return;
   const t = e.target;
-  const isXterm = t && t.classList && t.classList.contains('xterm-helper-textarea');
-  const editable = t && !isXterm && (
+  // xterm's hidden textarea and the chat composer count as "the pane", not as
+  // form fields — pane shortcuts must keep working while typing in them.
+  const isPaneInput = t && t.classList &&
+    (t.classList.contains('xterm-helper-textarea') || t.classList.contains('chat-input'));
+  const editable = t && !isPaneInput && (
     t.isContentEditable || t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.tagName === 'SELECT'
   );
   if (editable) return; // don't hijack our own text fields
@@ -1754,6 +3232,19 @@ window.api.onFsChanged(({ cwd }) => {
   }
   // The thread may have just (re)written its plan file — re-render it live.
   if (typeof planPanelOpen === 'function' && planPanelOpen()) refreshPlan();
+  // Todos may have changed on disk (a thread edited todos.json). Re-render, but
+  // not while the user is mid-edit in the panel — that would clobber their input.
+  if (typeof todoPanelOpen === 'function' && todoPanelOpen() &&
+      !(document.activeElement && todoPanel.contains(document.activeElement))) {
+    refreshTodo();
+  }
+  // Kanban cards may have changed on disk (a thread edited kanban.json).
+  // Re-render unless the user is mid-drag or mid-edit in the panel.
+  if (typeof kanbanPanelOpen === 'function' && kanbanPanelOpen() && !kanbanDragId &&
+      !(document.activeElement && kanbanPanel.contains(document.activeElement) &&
+        document.activeElement.tagName === 'INPUT')) {
+    refreshKanban();
+  }
 });
 
 // ---------------------------------------------------------------------------
@@ -1807,6 +3298,7 @@ function buildStageLabel(line) {
   if (l.includes('packaging')) return 'Packaging';
   if (l.includes('signing') || l.includes('signtool')) return 'Signing';
   if (l.includes('block map')) return 'Finalizing';
+  if (l.includes('committing version') || l.includes('publishing release') || l.includes('uploading')) return 'Publishing';
   if (l.includes('target=portable') || l.includes('building')) return 'Compressing';
   return null;
 }
@@ -1841,8 +3333,11 @@ if (buildBtn) {
     buildBtn.classList.remove('building');
     buildBtn.textContent = BUILD_BTN_TEXT;
     buildBtn.title = BUILD_BTN_TITLE;
-    if (res && res.ok) {
-      window.api.notify({ title: 'Hivemind', body: 'Portable build finished — opening the dist folder.' });
+    if (res && res.ok && res.published) {
+      window.api.notify({ title: 'Hivemind', body: `v${res.version} built and published to GitHub — opening the dist folder.` });
+      window.api.files.reveal(dir, 'dist');
+    } else if (res && res.ok) {
+      window.api.notify({ title: 'Hivemind', body: `v${res.version} built, but publishing to GitHub failed: ${res.publishMessage || 'unknown error'}` });
       window.api.files.reveal(dir, 'dist');
     } else {
       window.api.notify({ title: 'Hivemind', body: 'Portable build failed: ' + ((res && res.message) || 'see terminal output') });
@@ -1871,6 +3366,8 @@ const sidebarEl = $('sidebar');
 function setGitOpen(open) {
   if (open && typeof setFilesOpen === 'function') setFilesOpen(false); // one panel at a time
   if (open && typeof setPlanOpen === 'function') setPlanOpen(false);
+  if (open && typeof setTodoOpen === 'function') setTodoOpen(false);
+  if (open && typeof setKanbanOpen === 'function') setKanbanOpen(false);
   gitPanel.classList.toggle('hidden', !open);
   gitToggle.classList.toggle('active', open);
   sidebarEl.classList.toggle('git-open', open); // board list yields its space
@@ -2304,6 +3801,8 @@ function setFilesMsg(text, kind) {
 function setFilesOpen(open) {
   if (open) setGitOpen(false); // one panel at a time
   if (open && typeof setPlanOpen === 'function') setPlanOpen(false);
+  if (open && typeof setTodoOpen === 'function') setTodoOpen(false);
+  if (open && typeof setKanbanOpen === 'function') setKanbanOpen(false);
   filesPanel.classList.toggle('hidden', !open);
   filesToggle.classList.toggle('active', open);
   sidebarEl.classList.toggle('files-open', open); // board list yields its space
@@ -2437,6 +3936,713 @@ function insertPathIntoPane(rel) {
 }
 
 // ---------------------------------------------------------------------------
+// Todo panel
+//
+// A per-hive checklist, docked in the sidebar like Source Control / Explorer.
+// The list lives in `.hivemind/todos.json` in the project dir; add items, tick
+// them off, double-click to rename, delete, or clear completed. Items nest to
+// any depth — each has a `children` array, and hovering a row reveals a ＋ to
+// add a sub-item. Scoped to the active board (cwd), not the focused thread —
+// one shared list per hive. A thread may also edit the file directly, so we
+// re-render on fs changes.
+// ---------------------------------------------------------------------------
+const todoToggle = $('todo-toggle');
+const todoPanel = $('todo-panel');
+const todoBody = $('todo-body');
+const todoMsgbar = $('todo-msgbar');
+const todoInput = $('todo-input');
+
+let todoItems = []; // tree of { id, text, done, collapsed, children: [...] }
+let todoPendingEdit = null; // { item, span } to focus once the tree is in the DOM
+
+function todoPanelOpen() { return todoPanel && !todoPanel.classList.contains('hidden'); }
+
+function setTodoMsg(text, kind) {
+  if (!text) { todoMsgbar.classList.add('hidden'); todoMsgbar.textContent = ''; return; }
+  todoMsgbar.textContent = text;
+  todoMsgbar.className = 'git-msgbar' + (kind ? ' ' + kind : '');
+}
+
+function setTodoOpen(open) {
+  if (open) { // one panel at a time
+    setGitOpen(false);
+    setFilesOpen(false);
+    if (typeof setPlanOpen === 'function') setPlanOpen(false);
+    if (typeof setKanbanOpen === 'function') setKanbanOpen(false);
+  }
+  todoPanel.classList.toggle('hidden', !open);
+  todoToggle.classList.toggle('active', open);
+  sidebarEl.classList.toggle('todo-open', open); // board list yields its space
+}
+
+todoToggle.onclick = () => {
+  const open = todoPanel.classList.contains('hidden');
+  setTodoOpen(open);
+  if (open) refreshTodo();
+};
+$('todo-close').onclick = () => setTodoOpen(false);
+$('todo-refresh').onclick = () => refreshTodo();
+
+function todoOnBoardChange() { if (todoPanelOpen()) refreshTodo(); }
+
+async function refreshTodo() {
+  if (!todoPanelOpen()) return;
+  setTodoMsg('');
+  const dir = activeDir();
+  if (!dir) { todoItems = []; renderTodo({ ok: false, reason: 'no-dir' }); return; }
+  const res = await window.api.todo.read(dir);
+  todoItems = (res && res.ok && Array.isArray(res.todos)) ? normalizeTodos(res.todos) : [];
+  renderTodo(res);
+}
+
+// Persist the current list. `.hivemind/` is kept out of Git the same way plans
+// are. Failures surface in the message bar but don't lose the in-memory list.
+async function saveTodo() {
+  const dir = activeDir();
+  if (!dir) return;
+  window.api.todo.ensureIgnored(dir);
+  const res = await window.api.todo.write(dir, todoItems);
+  if (!res || !res.ok) setTodoMsg((res && res.message) || 'Could not save todos.', 'err');
+  else setTodoMsg('');
+}
+
+function addTodo(text) {
+  const t = (text || '').trim();
+  if (!t || !activeDir()) return;
+  todoItems.push({ id: nextId('todo'), text: t, done: false, children: [] });
+  saveTodo();
+  renderTodo({ ok: true });
+}
+
+// -- "todo …" capture from the composer / dictation ---------------------------
+// A message starting with "todo" (or "TODO:", "to-do", …) is a checklist entry
+// for this hive's Todo panel, not a prompt for Claude. Matches only the exact
+// word at the start ("todos need work" is not captured). Returns the item text
+// ('' if the word stood alone) or null when the message isn't a todo.
+const TODO_PREFIX_RE = /^to-?do\b[\s:,.!?-]*/i;
+function matchTodoPrefix(text) {
+  const t = String(text || '').trim();
+  const m = TODO_PREFIX_RE.exec(t);
+  return m ? t.slice(m[0].length).trim() : null;
+}
+
+// Append one item to this hive's todos. Reads the list from disk first — the
+// panel's in-memory copy is only current while the panel is open, and saving a
+// stale copy would clobber items added elsewhere (e.g. by a Claude thread).
+async function addTodoItem(text) {
+  const t = String(text || '').trim();
+  const dir = activeDir();
+  if (!dir) return { ok: false, message: 'No hive is open.' };
+  if (!t) return { ok: false, message: 'Nothing to add.' };
+  const res = await window.api.todo.read(dir);
+  const list = (res && res.ok && Array.isArray(res.todos)) ? normalizeTodos(res.todos) : [];
+  list.push({ id: nextId('todo'), text: t, done: false, children: [] });
+  window.api.todo.ensureIgnored(dir);
+  const w = await window.api.todo.write(dir, list);
+  if (!w || !w.ok) return { ok: false, message: (w && w.message) || 'Could not save the todo.' };
+  todoItems = list;
+  if (todoPanelOpen()) renderTodo({ ok: true });
+  return { ok: true };
+}
+
+// Shared entry point for the "todo …" prefix and the "Hivemind, add a todo …"
+// command: add the item and confirm with a toast. A bare "todo" with no text
+// just opens the panel.
+async function captureTodo(text) {
+  const t = String(text || '').trim();
+  if (!t) {
+    setTodoOpen(true);
+    refreshTodo();
+    hmToast('Todo panel opened — say "todo <something>" to add an item.');
+    return;
+  }
+  const res = await addTodoItem(t);
+  if (res.ok) hmToast('Added todo: ' + t);
+  else hmToast('Could not add todo: ' + res.message, 'err');
+}
+
+// Add a blank sub-item under `parent`, expand it, and open the editor on the new
+// row. A blank row abandoned (Esc, or blurred empty) is discarded.
+function addSubTodo(parent) {
+  if (!activeDir()) return;
+  parent.children = parent.children || [];
+  parent.collapsed = false;
+  const child = { id: nextId('todo'), text: '', done: false, children: [] };
+  parent.children.push(child);
+  renderTodo({ ok: true }, child.id);
+}
+
+// Older todos.json (pre-nesting) has no `children`; give every node one so the
+// tree helpers below can recurse freely.
+function normalizeTodos(list) {
+  if (!Array.isArray(list)) return [];
+  list.forEach((it) => { it.children = normalizeTodos(it.children || []); });
+  return list;
+}
+
+// Remove `item` from whichever list holds it, searching the whole tree.
+function removeTodo(item, list) {
+  const i = list.indexOf(item);
+  if (i !== -1) { list.splice(i, 1); return true; }
+  return list.some((it) => removeTodo(item, it.children || []));
+}
+
+// Set `item` and every descendant to `done` (checking a parent checks its kids).
+function setSubtreeDone(item, done) {
+  item.done = done;
+  (item.children || []).forEach((c) => setSubtreeDone(c, done));
+}
+
+// Checking sub-items never auto-checks the parent — the parent is ticked only
+// by hand (which then checks its whole subtree). But a checked parent can't
+// stay done once any of its sub-items is undone, so clear it bottom-up.
+function reconcileTodos(list) {
+  list.forEach((it) => {
+    const kids = it.children || [];
+    if (kids.length) {
+      reconcileTodos(kids);
+      if (!kids.every((c) => c.done)) it.done = false;
+    }
+  });
+}
+
+// done/total counted over leaf items only — parents are containers, not tasks.
+function todoStats(list) {
+  let done = 0, total = 0;
+  const walk = (arr) => arr.forEach((it) => {
+    const kids = it.children || [];
+    if (kids.length) walk(kids);
+    else { total++; if (it.done) done++; }
+  });
+  walk(list);
+  return { done, total };
+}
+
+// Prune done items without orphaning an undone descendant: a done parent stays
+// as long as any child survives.
+function pruneDoneTodos(list) {
+  return list.filter((it) => {
+    it.children = pruneDoneTodos(it.children || []);
+    return !it.done || it.children.length > 0;
+  });
+}
+
+// Swap a todo's label for an inline text editor; Enter/blur commits, Esc cancels.
+// `removeIfEmpty` (used for freshly-added sub-items) discards a never-named row.
+function startEditTodo(item, span, opts) {
+  const removeIfEmpty = !!(opts && opts.removeIfEmpty);
+  const input = document.createElement('input');
+  input.type = 'text';
+  input.className = 'todo-edit';
+  input.value = item.text;
+  let committed = false;
+  const finish = (cancel) => {
+    if (committed) return;
+    committed = true;
+    const t = input.value.trim();
+    if (!cancel && t) item.text = t;
+    if (removeIfEmpty && !item.text) removeTodo(item, todoItems);
+    saveTodo();
+    renderTodo({ ok: true });
+  };
+  input.onkeydown = (e) => {
+    if (e.key === 'Enter') { e.preventDefault(); finish(false); }
+    else if (e.key === 'Escape') { finish(true); }
+  };
+  input.onblur = () => finish(false);
+  span.replaceWith(input);
+  input.focus();
+  input.select();
+}
+
+function renderTodo(res, focusEditId) {
+  todoBody.innerHTML = '';
+  todoPendingEdit = null;
+  if (res && !res.ok && res.reason === 'no-dir') {
+    const wrap = document.createElement('div');
+    wrap.className = 'git-empty';
+    wrap.textContent = 'This hive has no project directory set. Edit the hive to choose one.';
+    todoBody.appendChild(wrap);
+  } else if (!todoItems.length) {
+    const wrap = document.createElement('div');
+    wrap.className = 'git-empty';
+    wrap.textContent = 'No todos yet. Add one above to get started.';
+    todoBody.appendChild(wrap);
+  } else {
+    todoBody.appendChild(buildTodoList(todoItems, 0, focusEditId));
+  }
+  // The edited row's span must be in the document before we can focus it.
+  if (todoPendingEdit) {
+    const { item, span } = todoPendingEdit;
+    todoPendingEdit = null;
+    startEditTodo(item, span, { removeIfEmpty: true });
+  }
+  renderTodoCount();
+}
+
+// Build a <ul> for `list` at nesting `depth`, recursing into children. Rows are
+// indented by depth; items with children get a collapse caret.
+function buildTodoList(list, depth, focusEditId) {
+  const ul = document.createElement('ul');
+  ul.className = 'todo-list';
+  list.forEach((item) => {
+    const kids = item.children || [];
+    const hasKids = kids.length > 0;
+
+    const li = document.createElement('li');
+    li.className = 'todo-item' + (item.done ? ' done' : '');
+    li.style.paddingLeft = (6 + depth * 16) + 'px';
+
+    const caret = document.createElement('button');
+    caret.className = 'todo-caret';
+    if (hasKids) {
+      caret.textContent = item.collapsed ? '▸' : '▾';
+      caret.title = item.collapsed ? 'Expand' : 'Collapse';
+      caret.onclick = () => { item.collapsed = !item.collapsed; saveTodo(); renderTodo({ ok: true }); };
+    } else {
+      caret.classList.add('todo-caret-empty');
+      caret.tabIndex = -1;
+    }
+
+    const cb = document.createElement('input');
+    cb.type = 'checkbox';
+    cb.className = 'todo-check';
+    cb.checked = !!item.done;
+    if (hasKids) {
+      const s = todoStats([item]);
+      cb.indeterminate = s.done > 0 && s.done < s.total;
+    }
+    cb.title = 'Toggle done';
+    cb.onchange = () => {
+      setSubtreeDone(item, cb.checked);
+      reconcileTodos(todoItems);
+      saveTodo();
+      renderTodo({ ok: true });
+    };
+
+    const span = document.createElement('span');
+    span.className = 'todo-text';
+    span.textContent = item.text;
+    span.title = 'Double-click to edit';
+    span.ondblclick = () => startEditTodo(item, span);
+
+    const addSub = document.createElement('button');
+    addSub.className = 'todo-sub';
+    addSub.title = 'Add sub-item';
+    addSub.textContent = '＋';
+    addSub.onclick = () => addSubTodo(item);
+
+    const del = document.createElement('button');
+    del.className = 'todo-del';
+    del.title = 'Delete';
+    del.textContent = '✕';
+    del.onclick = () => {
+      removeTodo(item, todoItems);
+      reconcileTodos(todoItems);
+      saveTodo();
+      renderTodo({ ok: true });
+    };
+
+    li.appendChild(caret);
+    li.appendChild(cb);
+    li.appendChild(span);
+    li.appendChild(addSub);
+    li.appendChild(del);
+    ul.appendChild(li);
+
+    if (focusEditId && item.id === focusEditId) todoPendingEdit = { item, span };
+
+    if (hasKids && !item.collapsed) ul.appendChild(buildTodoList(kids, depth + 1, focusEditId));
+  });
+  return ul;
+}
+
+// Footer: "<done>/<total> done" plus a "Clear completed" action when relevant.
+function renderTodoCount() {
+  const footer = $('todo-footer');
+  const countEl = $('todo-count');
+  const clearBtn = $('todo-clear-done');
+  if (!footer || !countEl || !clearBtn) return;
+  const { done, total } = todoStats(todoItems);
+  if (!total) { footer.classList.add('hidden'); return; }
+  footer.classList.remove('hidden');
+  countEl.textContent = `${done}/${total} done`;
+  clearBtn.style.display = done ? '' : 'none';
+}
+
+if (todoInput) {
+  todoInput.onkeydown = (e) => {
+    if (e.key === 'Enter') { e.preventDefault(); addTodo(todoInput.value); todoInput.value = ''; }
+  };
+}
+$('todo-add').onclick = () => { addTodo(todoInput.value); todoInput.value = ''; todoInput.focus(); };
+$('todo-clear-done').onclick = () => {
+  todoItems = pruneDoneTodos(todoItems);
+  saveTodo();
+  renderTodo({ ok: true });
+};
+
+// ---------------------------------------------------------------------------
+// Board panel (Kanban)
+//
+// A per-hive kanban — To do / In progress / Done — whose cards dispatch
+// threads: ▶ (or dragging a card into "In progress") opens a new Claude
+// thread with the card's text as its initial prompt. A dispatched card
+// follows its thread: it shows the thread's live status dot, clicking it
+// jumps to the thread, and when the thread finishes its turn the card moves
+// to Done on its own (setPaneState calls kanbanOnPaneState on the busy→idle
+// transition). Cards live in `.hivemind/kanban.json`, shared per-hive like
+// todos. Card→thread links are held in memory only — threads don't survive a
+// restart, so a card left "In progress" simply offers ▶ again.
+// ---------------------------------------------------------------------------
+const kanbanToggle = $('kanban-toggle');
+const kanbanPanel = $('kanban-panel');
+const kanbanBody = $('kanban-body');
+const kanbanMsgbar = $('kanban-msgbar');
+const kanbanInput = $('kanban-input');
+
+const KANBAN_LANES = [
+  { key: 'todo', label: 'To do' },
+  { key: 'doing', label: 'In progress' },
+  { key: 'done', label: 'Done' },
+];
+
+let kanbanCards = [];    // [{ id, text, status: 'todo'|'doing'|'done' }]
+let kanbanDragId = null; // card id mid-drag (also suppresses fs re-renders)
+const kanbanLinks = new Map(); // card id -> { pane, dir } for this session's dispatches
+
+function kanbanPanelOpen() { return kanbanPanel && !kanbanPanel.classList.contains('hidden'); }
+
+function setKanbanMsg(text, kind) {
+  if (!text) { kanbanMsgbar.classList.add('hidden'); kanbanMsgbar.textContent = ''; return; }
+  kanbanMsgbar.textContent = text;
+  kanbanMsgbar.className = 'git-msgbar' + (kind ? ' ' + kind : '');
+}
+
+function setKanbanOpen(open) {
+  if (open) { // one panel at a time
+    setGitOpen(false);
+    setFilesOpen(false);
+    if (typeof setPlanOpen === 'function') setPlanOpen(false);
+    if (typeof setTodoOpen === 'function') setTodoOpen(false);
+  }
+  kanbanPanel.classList.toggle('hidden', !open);
+  kanbanToggle.classList.toggle('active', open);
+  sidebarEl.classList.toggle('kanban-open', open); // board list yields its space
+}
+
+kanbanToggle.onclick = () => {
+  const open = kanbanPanel.classList.contains('hidden');
+  setKanbanOpen(open);
+  if (open) refreshKanban();
+};
+$('kanban-close').onclick = () => setKanbanOpen(false);
+$('kanban-refresh').onclick = () => refreshKanban();
+
+function kanbanOnBoardChange() { if (kanbanPanelOpen()) refreshKanban(); }
+
+// Cards written by hand (or by a thread) may be missing fields; make each one
+// renderable and give it an id so drag/drop and links can address it.
+function normalizeKanban(list) {
+  if (!Array.isArray(list)) return [];
+  return list
+    .filter((c) => c && typeof c.text === 'string' && c.text.trim())
+    .map((c) => ({
+      id: typeof c.id === 'string' && c.id ? c.id : nextId('card'),
+      text: c.text,
+      status: ['todo', 'doing', 'done'].includes(c.status) ? c.status : 'todo',
+    }));
+}
+
+async function refreshKanban() {
+  if (!kanbanPanelOpen()) return;
+  setKanbanMsg('');
+  const dir = activeDir();
+  if (!dir) { kanbanCards = []; renderKanban({ ok: false, reason: 'no-dir' }); return; }
+  const res = await window.api.kanban.read(dir);
+  kanbanCards = (res && res.ok) ? normalizeKanban(res.cards) : [];
+  renderKanban(res);
+}
+
+// Persist the current cards. `.hivemind/` is kept out of Git the same way
+// plans/todos are. Failures surface in the message bar but keep the in-memory list.
+async function saveKanban() {
+  const dir = activeDir();
+  if (!dir) return;
+  window.api.kanban.ensureIgnored(dir);
+  const res = await window.api.kanban.write(dir, kanbanCards);
+  if (!res || !res.ok) setKanbanMsg((res && res.message) || 'Could not save the board.', 'err');
+  else setKanbanMsg('');
+}
+
+function addKanbanCard(text) {
+  const t = (text || '').trim();
+  if (!t || !activeDir()) return;
+  kanbanCards.push({ id: nextId('card'), text: t, status: 'todo' });
+  saveKanban();
+  renderKanban({ ok: true });
+}
+
+// The pane a card dispatched, if it is still alive on some hive.
+function kanbanLivePane(cardId) {
+  const link = kanbanLinks.get(cardId);
+  if (!link || link.pane.disposed || link.pane.state === 'dead') return null;
+  return link.pane;
+}
+
+// ▶ — open a new thread on the active hive working on the card's text. The
+// prompt rides along as claude's positional argument (same path as "Hivemind,
+// open a new thread and…"), so the thread starts on it the moment it boots.
+function dispatchKanbanCard(card) {
+  const board = activeBoard();
+  if (!board) { setKanbanMsg('No hive is open.', 'err'); return; }
+  const p = addTerminal(board, { initialPrompt: card.text });
+  if (!p) { setKanbanMsg('Could not open a thread.', 'err'); return; }
+  setPaneCaption(p, card.text);
+  card.status = 'doing';
+  kanbanLinks.set(card.id, { pane: p, dir: board.dir });
+  saveKanban();
+  renderKanban({ ok: true });
+}
+
+// Drag/drop between lanes. Dropping onto "In progress" dispatches unless the
+// card already has a live thread; leaving "In progress" detaches the thread
+// (it keeps running — the card just stops following it).
+function moveKanbanCard(card, lane) {
+  if (lane === 'doing') {
+    if (!kanbanLivePane(card.id)) { dispatchKanbanCard(card); return; }
+    card.status = 'doing';
+  } else {
+    kanbanLinks.delete(card.id);
+    card.status = lane;
+  }
+  saveKanban();
+  renderKanban({ ok: true });
+}
+
+// Called from setPaneState for every pane transition. If the pane belongs to a
+// dispatched card: a finished turn (busy → idle) completes the card; any other
+// change just refreshes the card's status dot.
+function kanbanOnPaneState(pane, state, prev) {
+  let cardId = null, link = null;
+  for (const [cid, l] of kanbanLinks) {
+    if (l.pane === pane) { cardId = cid; link = l; break; }
+  }
+  if (!cardId) return;
+  if (state === 'idle' && prev === 'busy') {
+    kanbanLinks.delete(cardId);
+    kanbanCardDone(link.dir, cardId);
+    return;
+  }
+  if (kanbanPanelOpen() && !kanbanDragId) renderKanban({ ok: true });
+}
+
+// Move a dispatched card to Done. The panel may be closed or showing another
+// hive when the thread finishes, so fall back to read-modify-write on the file
+// the card came from.
+async function kanbanCardDone(dir, cardId) {
+  if (kanbanPanelOpen() && activeDir() === dir) {
+    const card = kanbanCards.find((c) => c.id === cardId);
+    if (card && card.status === 'doing') {
+      card.status = 'done';
+      await saveKanban();
+      if (!kanbanDragId) renderKanban({ ok: true });
+    }
+    return;
+  }
+  const res = await window.api.kanban.read(dir);
+  if (!res || !res.ok) return;
+  const cards = normalizeKanban(res.cards);
+  const card = cards.find((c) => c.id === cardId);
+  if (!card || card.status !== 'doing') return;
+  card.status = 'done';
+  await window.api.kanban.write(dir, cards);
+}
+
+// Swap a card's label for an inline text editor; Enter/blur commits, Esc cancels.
+function startEditKanban(card, span) {
+  const input = document.createElement('input');
+  input.type = 'text';
+  input.className = 'kb-edit';
+  input.value = card.text;
+  let committed = false;
+  const finish = (cancel) => {
+    if (committed) return;
+    committed = true;
+    const t = input.value.trim();
+    if (!cancel && t) card.text = t;
+    saveKanban();
+    renderKanban({ ok: true });
+  };
+  input.onkeydown = (e) => {
+    if (e.key === 'Enter') { e.preventDefault(); finish(false); }
+    else if (e.key === 'Escape') { finish(true); }
+  };
+  input.onblur = () => finish(false);
+  span.replaceWith(input);
+  input.focus();
+  input.select();
+}
+
+function buildKanbanCard(card) {
+  const el = document.createElement('div');
+  el.className = 'kb-card' + (card.status === 'done' ? ' done' : '');
+  el.draggable = true;
+  el.ondragstart = (e) => {
+    kanbanDragId = card.id;
+    el.classList.add('dragging');
+    try {
+      e.dataTransfer.setData('text/plain', card.id);
+      e.dataTransfer.effectAllowed = 'move';
+    } catch (_) { /* ignore */ }
+  };
+  el.ondragend = () => { kanbanDragId = null; el.classList.remove('dragging'); };
+
+  const live = kanbanLivePane(card.id);
+  if (card.status === 'doing') {
+    const dot = document.createElement('span');
+    dot.className = 'dot ' + (live ? (live.state || 'idle') : 'dead');
+    dot.title = live
+      ? 'Thread: ' + paneLabel(live)
+      : 'The dispatched thread is gone (closed, or from a previous session)';
+    el.appendChild(dot);
+    if (live) {
+      el.classList.add('linked');
+      el.title = 'Click to jump to the thread working on this card';
+      el.onclick = () => focusPane(live);
+    }
+  }
+
+  const span = document.createElement('span');
+  span.className = 'kb-text';
+  span.textContent = card.text;
+  if (card.status !== 'done') {
+    span.title = (span.title ? span.title + ' — ' : '') + 'Double-click to edit';
+    span.ondblclick = (e) => { e.stopPropagation(); startEditKanban(card, span); };
+  }
+  el.appendChild(span);
+
+  if (card.status === 'todo' || (card.status === 'doing' && !live)) {
+    const go = document.createElement('button');
+    go.className = 'kb-go';
+    go.textContent = '▶';
+    go.title = card.status === 'todo'
+      ? 'Dispatch: open a new thread working on this card'
+      : 'Dispatch again in a new thread';
+    go.onclick = (e) => { e.stopPropagation(); dispatchKanbanCard(card); };
+    el.appendChild(go);
+  }
+  if (card.status === 'doing') {
+    const done = document.createElement('button');
+    done.className = 'kb-done';
+    done.textContent = '✓';
+    done.title = 'Mark done';
+    done.onclick = (e) => { e.stopPropagation(); moveKanbanCard(card, 'done'); };
+    el.appendChild(done);
+  }
+
+  const del = document.createElement('button');
+  del.className = 'kb-del';
+  del.textContent = '✕';
+  del.title = 'Delete card';
+  del.onclick = (e) => {
+    e.stopPropagation();
+    kanbanLinks.delete(card.id);
+    kanbanCards = kanbanCards.filter((c) => c !== card);
+    saveKanban();
+    renderKanban({ ok: true });
+  };
+  el.appendChild(del);
+
+  return el;
+}
+
+function renderKanban(res) {
+  kanbanBody.innerHTML = '';
+  if (res && !res.ok && res.reason === 'no-dir') {
+    const wrap = document.createElement('div');
+    wrap.className = 'git-empty';
+    wrap.textContent = 'This hive has no project directory set. Edit the hive to choose one.';
+    kanbanBody.appendChild(wrap);
+    renderKanbanFooter();
+    return;
+  }
+  for (const lane of KANBAN_LANES) {
+    const cards = kanbanCards.filter((c) => c.status === lane.key);
+
+    const sec = document.createElement('section');
+    sec.className = 'kb-lane';
+    sec.ondragover = (e) => {
+      if (!kanbanDragId) return;
+      e.preventDefault();
+      sec.classList.add('drag-over');
+    };
+    sec.ondragleave = () => sec.classList.remove('drag-over');
+    sec.ondrop = (e) => {
+      e.preventDefault();
+      sec.classList.remove('drag-over');
+      const card = kanbanCards.find((c) => c.id === kanbanDragId);
+      kanbanDragId = null;
+      if (card && card.status !== lane.key) moveKanbanCard(card, lane.key);
+    };
+
+    const head = document.createElement('div');
+    head.className = 'kb-lane-head';
+    const label = document.createElement('span');
+    label.textContent = lane.label;
+    const count = document.createElement('span');
+    count.className = 'kb-lane-count';
+    count.textContent = String(cards.length);
+    head.append(label, count);
+    sec.appendChild(head);
+
+    const list = document.createElement('div');
+    list.className = 'kb-cards';
+    for (const card of cards) list.appendChild(buildKanbanCard(card));
+    if (!cards.length) {
+      const hint = document.createElement('div');
+      hint.className = 'kb-hint';
+      hint.textContent = lane.key === 'todo'
+        ? 'Add a card above to get started.'
+        : (lane.key === 'doing'
+          ? 'Drop a card here (or click its ▶) to dispatch a thread.'
+          : 'Finished cards land here.');
+      list.appendChild(hint);
+    }
+    sec.appendChild(list);
+    kanbanBody.appendChild(sec);
+  }
+  renderKanbanFooter();
+}
+
+// Footer: "<done>/<total> done" plus "Clear done" when relevant.
+function renderKanbanFooter() {
+  const footer = $('kanban-footer');
+  const countEl = $('kanban-count');
+  const clearBtn = $('kanban-clear-done');
+  if (!footer || !countEl || !clearBtn) return;
+  const total = kanbanCards.length;
+  const done = kanbanCards.filter((c) => c.status === 'done').length;
+  if (!total) { footer.classList.add('hidden'); return; }
+  footer.classList.remove('hidden');
+  countEl.textContent = `${done}/${total} done`;
+  clearBtn.style.display = done ? '' : 'none';
+}
+
+if (kanbanInput) {
+  kanbanInput.onkeydown = (e) => {
+    if (e.key === 'Enter') { e.preventDefault(); addKanbanCard(kanbanInput.value); kanbanInput.value = ''; }
+  };
+}
+$('kanban-add').onclick = () => { addKanbanCard(kanbanInput.value); kanbanInput.value = ''; kanbanInput.focus(); };
+$('kanban-clear-done').onclick = () => {
+  for (const c of kanbanCards) if (c.status === 'done') kanbanLinks.delete(c.id);
+  kanbanCards = kanbanCards.filter((c) => c.status !== 'done');
+  saveKanban();
+  renderKanban({ ok: true });
+};
+
+// ---------------------------------------------------------------------------
 // Plan panel
 //
 // Renders the *focused thread's* plan. The thread writes its plan to
@@ -2471,7 +4677,12 @@ function setPlanMsg(text, kind) {
 }
 
 function setPlanOpen(open) {
-  if (open) { setGitOpen(false); setFilesOpen(false); } // one panel at a time
+  if (open) { // one panel at a time
+    setGitOpen(false);
+    setFilesOpen(false);
+    if (typeof setTodoOpen === 'function') setTodoOpen(false);
+    if (typeof setKanbanOpen === 'function') setKanbanOpen(false);
+  }
   planPanel.classList.toggle('hidden', !open);
   planToggle.classList.toggle('active', open);
   sidebarEl.classList.toggle('plan-open', open); // board list yields its space
@@ -3412,20 +5623,45 @@ function commitVoiceText(raw) {
   const trimmed = (raw || '').trim();
   if (!trimmed) return;
 
+  const pane = currentVoicePane();
+  if (!pane) { flagVoiceError('No live thread to type into — click a thread and try again.'); return; }
+  // In chat view the terminal is covered — dictation must land in the visible
+  // composer textarea, not the hidden TUI behind it.
+  const chatInput = (pane.view === 'chat' && pane.chat) ? pane.chat.input : null;
+
   // A bare command phrase submits the line rather than typing the words.
   if (voiceAutoEnter && VOICE_ENTER_RE.test(trimmed)) {
-    const pane = currentVoicePane();
-    if (pane) sendToPane(pane, '\r');
+    if (chatInput) sendChatMessage(pane);
+    else sendToPane(pane, '\r');
     return;
   }
 
   let text = applyVoiceDict(trimmed);
   if (!text) return;
+
+  // A dictated utterance addressed to Hivemind ("Hivemind, open a new thread…")
+  // runs as an app command instead of being typed into the thread; unrecognized
+  // phrasing falls through and is typed as normal.
+  const hmCmd = matchHivemindCommand(text);
+  if (hmCmd !== null && runHivemindCommand(hmCmd, pane)) return;
+
+  // A dictated utterance starting with "todo" becomes a Todo-panel item
+  // instead of being typed into the thread.
+  const todoText = hmCmd === null ? matchTodoPrefix(text) : null;
+  if (todoText !== null) { captureTodo(todoText); return; }
+
   if (voiceAutoSpace) text += ' ';
 
-  const pane = currentVoicePane();
-  if (!pane) { flagVoiceError('No live thread to type into — click a thread and try again.'); return; }
-  sendToPane(pane, text);
+  if (chatInput) {
+    const start = chatInput.selectionStart != null ? chatInput.selectionStart : chatInput.value.length;
+    const end = chatInput.selectionEnd != null ? chatInput.selectionEnd : start;
+    chatInput.value = chatInput.value.slice(0, start) + text + chatInput.value.slice(end);
+    chatInput.selectionStart = chatInput.selectionEnd = start + text.length;
+    // Fire the composer's input handler (autosize + autocomplete refresh).
+    chatInput.dispatchEvent(new Event('input', { bubbles: true }));
+  } else {
+    sendToPane(pane, text);
+  }
   updateVoiceHudTarget();
 }
 
@@ -3792,13 +6028,16 @@ function clearVoiceError() {
 // A single capture-phase listener covers the whole app, terminals included, so
 // it fires before xterm consumes the key. We let the backquote through only
 // when the user is typing into one of our own text fields (so a literal ` can
-// still be entered there); inside a thread it toggles voice.
+// still be entered there); inside a thread — the terminal's xterm textarea or
+// the chat view's composer — it toggles voice instead.
 document.addEventListener('keydown', (e) => {
   if (!voiceHotkeyEnabled) return;
   if (e.code !== 'Backquote' || e.ctrlKey || e.altKey || e.metaKey) return;
   const t = e.target;
-  const isXtermInput = t && t.classList && t.classList.contains('xterm-helper-textarea');
-  const editable = t && !isXtermInput && (
+  const isThreadInput = t && t.classList && (
+    t.classList.contains('xterm-helper-textarea') || t.classList.contains('chat-input')
+  );
+  const editable = t && !isThreadInput && (
     t.isContentEditable ||
     t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.tagName === 'SELECT'
   );
@@ -3972,7 +6211,7 @@ function renderUsagePill() {
   usageBtn.classList.remove('ok', 'warn', 'crit');
   const d = usageData;
   if (!d || !d.limits || !d.limits.length) {
-    usageBtn.textContent = '📊 Usage';
+    usageBtn.textContent = 'Usage';
     usageBtn.title = d && d.limitsError
       ? 'Claude usage — ' + d.limitsError
       : 'Claude usage — how much of your plan\'s limits you\'ve used';
@@ -3981,7 +6220,7 @@ function renderUsagePill() {
   // The binding constraint is whichever window is fullest — that's the number
   // that decides how much Claude you have left right now.
   const top = d.limits.reduce((a, b) => (b.percent > a.percent ? b : a), d.limits[0]);
-  usageBtn.textContent = `📊 ${Math.round(top.percent)}%`;
+  usageBtn.textContent = `${Math.round(top.percent)}%`;
   usageBtn.classList.add(usageSeverity(top.percent));
   usageBtn.title = d.limits
     .map((l) => `${l.label}: ${Math.round(l.percent)}% used — ${fmtReset(l.resetsAt)}`)

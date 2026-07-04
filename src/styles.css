@@ -123,7 +123,7 @@ body.col-resizing { cursor: col-resize; user-select: none; }
 
 /* Per-board status summary dot */
 .board-item .status-dot { width: 8px; height: 8px; border-radius: 50%; flex: none; background: transparent; }
-.board-item .status-dot.busy { background: var(--yellow); }
+.board-item .status-dot.busy { background: var(--yellow); width: 11px; height: 11px; }
 .board-item .status-dot.idle { background: var(--accent-2); }
 .board-item .status-dot.attention { background: var(--peach); animation: hm-pulse 1.1s ease-in-out infinite; }
 .board-item .status-dot.dead { background: var(--danger); }
@@ -308,7 +308,7 @@ button.usage-pill.crit { color: var(--danger); }
 .pane-header .title-wrap.titled .caption { color: var(--text); font-size: 18px; font-weight: 600; opacity: 1; }
 .pane-header .title-wrap.titled .caption::before { content: none; }
 .pane-header .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); flex: none; }
-.pane-header .dot.busy { background: var(--yellow); }
+.pane-header .dot.busy { background: var(--yellow); width: 12px; height: 12px; }
 .pane-header .dot.idle { background: var(--accent-2); }
 .pane-header .dot.attention { background: var(--peach); animation: hm-pulse 1.1s ease-in-out infinite; }
 .pane-header .dot.dead { background: var(--danger); }
@@ -343,8 +343,497 @@ button.usage-pill.crit { color: var(--danger); }
   color: #f59e0b;
 }
 
+/* A tiled pane is often narrower than the full set of header controls, and
+   .pane's overflow:hidden would clip them from the right — taking ✕/⛶ with
+   it. Shed the low-priority controls first as the pane narrows so view,
+   maximize, and close stay reachable at any width (a maximized pane is wide
+   enough to show everything). */
+.pane { container-type: inline-size; }
+@container (max-width: 560px) { .pane-header .font-btn:not(.view-btn) { display: none; } }
+@container (max-width: 520px) { .pane-header .perm-select { display: none; } }
+@container (max-width: 440px) { .pane-header .model-select:not(.agent-select) { display: none; } }
+@container (max-width: 340px) { .pane-header .agent-select { display: none; } }
+@container (max-width: 240px) { .pane-header .status { display: none; } }
+@container (max-width: 170px) { .pane-header .view-btn { display: none; } }
+@container (max-width: 130px) { .pane-header .zoom-btn { display: none; } }
+
+/* Terminal + chat overlay share a positioned body. The chat covers the xterm
+   (which keeps its real layout box so fit()/ConPTY sizing stay correct while
+   hidden); .term-view lifts the cover to reveal the live terminal. */
+.pane-body { flex: 1; min-height: 0; position: relative; display: flex; flex-direction: column; }
 .pane-term { flex: 1; min-height: 0; padding: 4px 6px; }
 .pane-term .xterm { height: 100%; }
+
+/* ---------------- Chat wrapper ---------------- */
+.chat-wrap {
+  position: absolute;
+  inset: 0;
+  z-index: 5;
+  display: flex;
+  flex-direction: column;
+  background: var(--bg);
+}
+.pane.term-view .chat-wrap { display: none; }
+
+/* Header bar: conversation topic on the left, filter chips on the right. */
+.chat-filters {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 8px;
+  border-bottom: 1px solid var(--border);
+  flex: none;
+  position: relative; /* anchors the history dropdown */
+}
+/* The topic div takes the free space even while empty so the chips stay
+   right-aligned instead of jumping when the first summary lands. */
+.chat-topic {
+  flex: 1;
+  min-width: 0;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text);
+}
+.chat-chip {
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--muted);
+  border-radius: 10px;
+  font-size: 11px;
+  padding: 2px 9px;
+  cursor: pointer;
+}
+.chat-chip:hover { color: var(--text); border-color: var(--accent); }
+.chat-chip.active { background: var(--surface); color: var(--text); border-color: var(--accent); }
+
+/* Kind visibility is pure CSS so filter flips never re-render. */
+.chat-wrap.hide-tool .chat-row[data-kind="tool"],
+.chat-wrap.hide-thinking .chat-row[data-kind="thinking"],
+.chat-wrap.hide-meta .chat-row[data-kind="meta"],
+.chat-wrap.hide-subagent .chat-row[data-kind="subagent"] { display: none; }
+
+/* Attention banner: the hidden TUI wants input the transcript can't show. */
+.chat-banner {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 6px 8px 0;
+  padding: 7px 10px;
+  border: 1px solid var(--peach);
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--peach) 12%, transparent);
+}
+.chat-banner.hidden { display: none; }
+.chat-banner.error { border-color: var(--danger); background: color-mix(in srgb, var(--danger) 12%, transparent); }
+.chat-banner-text {
+  flex: 1;
+  min-width: 0;
+  margin: 0;
+  font-family: 'Cascadia Code', Consolas, monospace;
+  font-size: 11px;
+  color: var(--text);
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 60px;
+  overflow: hidden;
+}
+.chat-banner-actions { flex: none; display: flex; align-items: center; gap: 6px; }
+.chat-banner-keys { display: flex; gap: 4px; }
+.chat-banner.error .chat-banner-keys { display: none; }
+.chat-banner-actions button {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  color: var(--text);
+  border-radius: 5px;
+  font-size: 11px;
+  padding: 3px 8px;
+  cursor: pointer;
+}
+.chat-banner-actions button:hover { border-color: var(--accent); }
+
+/* Transcript-binding trouble notice. */
+.chat-notice {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 6px 8px 0;
+  padding: 7px 10px;
+  border: 1px dashed var(--border);
+  border-radius: 8px;
+  color: var(--muted);
+  font-size: 12px;
+}
+.chat-notice.hidden { display: none; }
+.chat-notice button {
+  background: var(--surface); border: 1px solid var(--border); color: var(--text);
+  border-radius: 5px; font-size: 11px; padding: 3px 8px; cursor: pointer;
+}
+.chat-notice button:hover { border-color: var(--accent); }
+
+/* Conversation-history picker: a dropdown of past sessions, anchored to the
+   filter bar, plus the read-only banner shown while browsing one. */
+.chat-history-btn { white-space: nowrap; }
+.chat-history-menu {
+  position: absolute;
+  top: calc(100% + 4px);
+  right: 8px;
+  z-index: 30;
+  width: 320px;
+  max-width: calc(100% - 16px);
+  max-height: 340px;
+  overflow-y: auto;
+  padding: 4px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35);
+}
+.chat-history-menu.hidden { display: none; }
+.chat-history-empty {
+  padding: 10px 12px;
+  color: var(--muted);
+  font-size: 12px;
+}
+.chat-history-item {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  width: 100%;
+  text-align: left;
+  padding: 7px 9px;
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  cursor: pointer;
+}
+.chat-history-item:hover { background: var(--bg); border-color: var(--accent); }
+.chat-history-item.current { border-color: var(--border); }
+.chat-history-item-title {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.chat-history-item-meta { font-size: 10px; color: var(--muted); }
+.chat-history-item.current .chat-history-item-meta { color: var(--accent); }
+
+/* Read-only banner shown over the chat while a past conversation is open. */
+.chat-history-bar {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 6px 8px 0;
+  padding: 7px 10px;
+  border: 1px solid var(--accent);
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
+}
+.chat-history-bar.hidden { display: none; }
+.chat-history-bar-text {
+  flex: 1;
+  min-width: 0;
+  font-size: 12px;
+  color: var(--text);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.chat-history-bar button {
+  flex: none;
+  background: var(--surface); border: 1px solid var(--border); color: var(--text);
+  border-radius: 5px; font-size: 11px; padding: 3px 8px; cursor: pointer;
+}
+.chat-history-bar button:hover { border-color: var(--accent); }
+
+/* The composer is hidden while viewing a past (read-only) conversation. */
+.chat-wrap.viewing-history .chat-composer { display: none; }
+
+/* Working indicator: a spinning swirl while the thread is busy on a turn.
+   Lives inside .chat-list as its last child, under the newest message. */
+.chat-working {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 0 2px;
+  color: var(--muted);
+  font-size: 12px;
+}
+.chat-working.hidden { display: none; }
+.chat-working-icon {
+  display: inline-block;
+  line-height: 1;
+  animation: hm-swirl 1.4s linear infinite;
+}
+@keyframes hm-swirl { to { transform: rotate(360deg); } }
+
+/* Message list. */
+.chat-list {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 10px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.chat-row { display: flex; flex-direction: column; }
+.chat-row[data-kind="user"] { align-items: flex-end; }
+
+/* Chat text scales with the pane's font size (--pane-font, set per pane by
+   setPaneFontSize). Secondary text keeps its usual offset from the base. */
+.chat-bubble {
+  max-width: 92%;
+  border-radius: 10px;
+  padding: 7px 11px;
+  font-size: var(--pane-font, 13px);
+  line-height: 1.45;
+  color: var(--text);
+  word-break: break-word;
+}
+.chat-bubble.user {
+  background: var(--surface);
+  white-space: pre-wrap;
+}
+.chat-bubble.user.pending { opacity: .6; }
+.chat-echo-note { font-size: calc(var(--pane-font, 13px) - 3px); color: var(--muted); margin-top: 4px; white-space: nowrap; }
+.chat-bubble.assistant { background: transparent; padding: 0 2px; max-width: 100%; }
+
+/* Markdown inside assistant bubbles (mirrors the Plan panel's look). */
+.chat-md p { margin: 0 0 8px; }
+.chat-md p:last-child { margin-bottom: 0; }
+.chat-md h1, .chat-md h2, .chat-md h3, .chat-md h4 { margin: 10px 0 6px; color: var(--text); }
+.chat-md pre {
+  background: var(--bg-alt);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 8px 10px;
+  overflow-x: auto;
+  font-size: calc(var(--pane-font, 13px) - 1px);
+}
+.chat-md code { font-family: 'Cascadia Code', Consolas, monospace; font-size: calc(var(--pane-font, 13px) - 1px); }
+.chat-md :not(pre) > code { background: var(--bg-alt); border-radius: 4px; padding: 1px 4px; }
+.chat-md ul, .chat-md ol { margin: 4px 0 8px; padding-left: 22px; }
+.chat-md blockquote { margin: 6px 0; padding: 2px 10px; border-left: 3px solid var(--border); color: var(--muted); }
+.chat-md table { border-collapse: collapse; margin: 6px 0; }
+.chat-md th, .chat-md td { border: 1px solid var(--border); padding: 4px 8px; font-size: calc(var(--pane-font, 13px) - 1px); }
+
+/* Collapsed rows: tool calls, thinking. */
+.chat-fold { font-size: calc(var(--pane-font, 13px) - 1px); color: var(--muted); }
+.chat-fold summary {
+  cursor: pointer;
+  user-select: none;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.chat-fold summary:hover { color: var(--text); }
+.chat-tool-name { color: var(--accent); font-weight: 600; }
+.chat-tool-sum { font-family: 'Cascadia Code', Consolas, monospace; font-size: calc(var(--pane-font, 13px) - 2px); }
+.chat-row.tool-error .chat-tool-name { color: var(--danger); }
+.chat-pre {
+  margin: 4px 0 0 14px;
+  padding: 6px 8px;
+  background: var(--bg-alt);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  font-family: 'Cascadia Code', Consolas, monospace;
+  font-size: calc(var(--pane-font, 13px) - 2px);
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 260px;
+  overflow-y: auto;
+}
+.chat-pre.hidden { display: none; }
+.chat-meta-line {
+  font-size: calc(var(--pane-font, 13px) - 2px);
+  color: var(--muted);
+  opacity: .8;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* Composer. */
+.chat-composer {
+  flex: none;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 8px;
+  border-top: 1px solid var(--border);
+  background: var(--bg-alt);
+}
+.chat-composer-row {
+  display: flex;
+  align-items: flex-end;
+  gap: 8px;
+}
+
+/* Attachment chips above the input (pasted/dropped/picked files). */
+.chat-attachments {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.chat-attachments.hidden { display: none; }
+.chat-attachment {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 220px;
+  padding: 4px 8px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  font-size: 11px;
+  color: var(--text);
+}
+.chat-attachment.image {
+  padding: 0;
+  overflow: hidden;
+}
+.chat-attachment.image img {
+  display: block;
+  width: 52px;
+  height: 52px;
+  object-fit: cover;
+}
+.chat-attachment .att-label {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  min-width: 0;
+}
+.chat-attachment .att-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.chat-attachment .att-remove {
+  flex: none;
+  border: none;
+  background: none;
+  color: var(--muted);
+  font-size: 10px;
+  line-height: 1;
+  padding: 2px;
+  cursor: pointer;
+}
+.chat-attachment.image .att-remove {
+  position: absolute;
+  top: 2px;
+  right: 2px;
+  border-radius: 50%;
+  background: rgba(0, 0, 0, .55);
+  color: #fff;
+  width: 16px;
+  height: 16px;
+  padding: 0;
+  opacity: 0;
+  transition: opacity .12s;
+}
+.chat-attachment.image:hover .att-remove { opacity: 1; }
+.chat-attachment .att-remove:hover { color: var(--accent); }
+.chat-attachment.image .att-remove:hover { color: #fff; background: rgba(0, 0, 0, .8); }
+
+/* 📎 attach button, matches the send button. */
+.chat-attach {
+  flex: none;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  color: var(--muted);
+  border-radius: 8px;
+  font-size: 13px;
+  padding: 6px 9px;
+  cursor: pointer;
+}
+.chat-attach:hover { border-color: var(--accent); color: var(--accent); }
+
+/* ⏹ interrupt button, same footprint as the attach button; hovers red since
+   it stops the running turn. */
+.chat-interrupt {
+  flex: none;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  color: var(--muted);
+  border-radius: 8px;
+  font-size: 13px;
+  padding: 6px 9px;
+  cursor: pointer;
+}
+.chat-interrupt:hover { border-color: var(--danger); color: var(--danger); }
+
+.chat-input {
+  flex: 1;
+  min-width: 0;
+  resize: none;
+  background: var(--panel);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 7px 10px;
+  font-family: inherit;
+  font-size: var(--pane-font, 13px);
+  line-height: 1.4;
+  max-height: 160px;
+}
+.chat-input:focus { outline: none; border-color: var(--accent); }
+.chat-send {
+  flex: none;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  color: var(--accent);
+  border-radius: 8px;
+  font-size: 14px;
+  padding: 6px 12px;
+  cursor: pointer;
+}
+.chat-send:hover { border-color: var(--accent); }
+
+/* Composer autocomplete (slash commands and @file paths). */
+.chat-composer { position: relative; }
+.chat-autocomplete {
+  position: absolute;
+  left: 8px;
+  right: 48px;
+  bottom: 100%;
+  margin-bottom: 2px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  box-shadow: 0 6px 18px rgba(0,0,0,.35);
+  max-height: 224px;
+  overflow-y: auto;
+  z-index: 20;
+}
+.chat-autocomplete.hidden { display: none; }
+.chat-ac-item {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  padding: 6px 10px;
+  cursor: pointer;
+  font-size: 12px;
+}
+.chat-ac-item.sel { background: var(--surface); }
+.chat-ac-name {
+  color: var(--accent);
+  font-family: 'Cascadia Code', Consolas, monospace;
+  white-space: nowrap;
+}
+.chat-ac-desc {
+  flex: 1;
+  min-width: 0;
+  color: var(--muted);
+  font-size: 11px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
 
 /* Gutters for resizing */
 .gutter-col { width: var(--gutter); cursor: col-resize; background: transparent; }
@@ -493,7 +982,11 @@ button.usage-pill.crit { color: var(--danger); }
 
 /* Commit box */
 #git-msg {
-  width: 100%; resize: vertical; min-height: 58px;
+  /* !important beats the inline width Chromium snapshots onto the textarea the
+     first time you drag its resize grip — without it the box locks to that
+     width and stops following the sidebar when the panel is widened. Vertical
+     (height) resizing still works; only the width stays panel-fluid. */
+  width: 100% !important; resize: vertical; min-height: 58px;
   background: var(--panel); border: 1px solid var(--border); color: var(--text);
   border-radius: 6px; padding: 8px 10px; font-size: 13px;
   font-family: "Segoe UI", system-ui, sans-serif;
@@ -590,6 +1083,162 @@ button.usage-pill.crit { color: var(--danger); }
 .git-msgbar.ok { color: var(--accent-2); }
 .git-msgbar.hidden { display: none; }
 
+/* ---------------- Todo panel ---------------- */
+/* Docked inside the sidebar like Explorer / Source Control: a per-hive checklist. */
+#todo-panel {
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  background: var(--bg-alt);
+  border-top: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+}
+#todo-panel.hidden { display: none; }
+
+/* When the todo panel is open, the board list yields its space to it. */
+#sidebar.todo-open #board-list { display: none; }
+
+.todo-addbar {
+  display: flex; align-items: center; gap: 6px;
+  padding: 8px 10px; border-bottom: 1px solid var(--border);
+}
+.todo-addbar input {
+  flex: 1; min-width: 0;
+  background: var(--surface); color: var(--text); border: none;
+  border-radius: 6px; padding: 7px 10px; font-size: 13px;
+}
+.todo-addbar input::placeholder { color: var(--muted); }
+.todo-addbar input:focus { outline: 1px solid var(--accent); }
+
+#todo-body { flex: 1; overflow-y: auto; padding: 6px 6px; }
+
+.todo-list { list-style: none; margin: 0; padding: 0; }
+.todo-item {
+  display: flex; align-items: center; gap: 8px;
+  padding: 5px 6px; border-radius: 5px; font-size: 13px;
+}
+.todo-item:hover { background: var(--surface); }
+.todo-check { flex: none; cursor: pointer; accent-color: var(--accent); }
+.todo-caret {
+  flex: none; width: 14px; text-align: center;
+  background: transparent; border: none; color: var(--muted);
+  cursor: pointer; font-size: 9px; padding: 0; line-height: 1;
+}
+.todo-caret:hover { color: var(--text); }
+.todo-caret-empty { visibility: hidden; cursor: default; }
+.todo-text {
+  flex: 1; min-width: 0; cursor: text; word-break: break-word;
+}
+.todo-item.done .todo-text { color: var(--muted); text-decoration: line-through; }
+.todo-sub {
+  flex: none; display: none;
+  background: transparent; border: none; color: var(--muted);
+  cursor: pointer; font-size: 13px; padding: 1px 4px; border-radius: 4px;
+}
+.todo-item:hover .todo-sub { display: block; }
+.todo-sub:hover { color: var(--accent); background: var(--bg); }
+.todo-edit {
+  flex: 1; min-width: 0;
+  background: var(--bg); color: var(--text); border: 1px solid var(--accent);
+  border-radius: 5px; padding: 3px 6px; font-size: 13px;
+}
+.todo-edit:focus { outline: none; }
+.todo-del {
+  flex: none; display: none;
+  background: transparent; border: none; color: var(--muted);
+  cursor: pointer; font-size: 13px; padding: 1px 4px; border-radius: 4px;
+}
+.todo-item:hover .todo-del { display: block; }
+.todo-del:hover { color: var(--danger); background: var(--bg); }
+
+.todo-footer {
+  display: flex; align-items: center; gap: 8px;
+  padding: 6px 12px; border-top: 1px solid var(--border);
+  font-size: 12px; color: var(--muted);
+}
+.todo-footer.hidden { display: none; }
+.todo-linkbtn {
+  background: transparent; border: none; color: var(--accent);
+  cursor: pointer; font-size: 12px; padding: 2px 4px; border-radius: 4px;
+}
+.todo-linkbtn:hover { text-decoration: underline; }
+
+/* ---------------- Board panel (Kanban) ---------------- */
+/* Docked inside the sidebar like the Todo panel; lanes stack vertically. */
+#kanban-panel {
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  background: var(--bg-alt);
+  border-top: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+}
+#kanban-panel.hidden { display: none; }
+
+/* When the board panel is open, the board list yields its space to it. */
+#sidebar.kanban-open #board-list { display: none; }
+
+#kanban-body {
+  flex: 1; overflow-y: auto; padding: 8px;
+  display: flex; flex-direction: column; gap: 8px;
+}
+
+.kb-lane {
+  border: 1px solid var(--border); border-radius: 8px;
+  background: var(--bg);
+  display: flex; flex-direction: column;
+}
+.kb-lane.drag-over { border-color: var(--accent-2); box-shadow: inset 0 0 0 1px var(--accent-2); }
+.kb-lane-head {
+  display: flex; align-items: center; gap: 6px;
+  padding: 6px 10px; border-bottom: 1px solid var(--border);
+  font-size: 11px; font-weight: 600; letter-spacing: .4px;
+  text-transform: uppercase; color: var(--muted);
+}
+.kb-lane-count { margin-left: auto; font-weight: 400; }
+.kb-cards { display: flex; flex-direction: column; gap: 6px; padding: 8px; }
+.kb-hint { padding: 0 2px; font-size: 11px; color: var(--muted); }
+
+.kb-card {
+  display: flex; align-items: center; gap: 8px;
+  padding: 7px 9px; border-radius: 6px; font-size: 13px;
+  background: var(--surface); border: 1px solid var(--border);
+  cursor: grab;
+}
+.kb-card.dragging { opacity: .5; }
+.kb-card.linked { cursor: pointer; }
+.kb-card.linked:hover { border-color: var(--accent); }
+.kb-card.done .kb-text { color: var(--muted); text-decoration: line-through; }
+.kb-text { flex: 1; min-width: 0; word-break: break-word; }
+
+/* Live status dot for a dispatched card — mirrors the thread header's dot. */
+.kb-card .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); flex: none; }
+.kb-card .dot.busy { background: var(--yellow); }
+.kb-card .dot.idle { background: var(--accent-2); }
+.kb-card .dot.attention { background: var(--peach); animation: hm-pulse 1.1s ease-in-out infinite; }
+.kb-card .dot.error { background: var(--danger); animation: hm-pulse 1.1s ease-in-out infinite; }
+.kb-card .dot.dead { background: var(--danger); opacity: .55; animation: none; }
+
+.kb-card button {
+  flex: none;
+  background: transparent; border: none; color: var(--muted);
+  cursor: pointer; font-size: 12px; padding: 1px 4px; border-radius: 4px;
+}
+/* ▶ is the card's main action, so it stays visible; ✓/✕ appear on hover. */
+.kb-card .kb-done, .kb-card .kb-del { display: none; }
+.kb-card:hover .kb-done, .kb-card:hover .kb-del { display: block; }
+.kb-card .kb-go:hover, .kb-card .kb-done:hover { color: var(--accent-2); background: var(--bg-alt); }
+.kb-card .kb-del:hover { color: var(--danger); background: var(--bg-alt); }
+
+.kb-edit {
+  flex: 1; min-width: 0;
+  background: var(--bg); color: var(--text); border: 1px solid var(--accent);
+  border-radius: 5px; padding: 3px 6px; font-size: 13px;
+}
+.kb-edit:focus { outline: none; }
+
 /* ---------------- Plan panel ---------------- */
 /* Docked inside the sidebar like Explorer / Source Control. */
 #plan-panel {
@@ -679,7 +1328,9 @@ mark.plan-cmt {
 
 .plan-cmt-draft { padding: 8px 10px; border-bottom: 1px solid var(--border); background: var(--panel); }
 .plan-cmt-input {
-  width: 100%; box-sizing: border-box; margin: 6px 0; resize: vertical; min-height: 46px;
+  /* !important for the same reason as #git-msg: keep the width panel-fluid even
+     after Chromium snapshots an inline width when its resize grip is dragged. */
+  width: 100% !important; box-sizing: border-box; margin: 6px 0; resize: vertical; min-height: 46px;
   background: var(--bg); color: var(--text); border: 1px solid var(--border);
   border-radius: 5px; padding: 6px 8px; font: inherit; font-size: 12px;
 }
@@ -883,6 +1534,29 @@ mark.plan-cmt {
 }
 #voice-hud #voice-hud-stop:hover { color: var(--text); background: var(--surface); }
 
+/* Hivemind command toast — feedback for "Hivemind, …" composer/voice commands.
+   Sits above the voice HUD's spot so both can show at once while dictating. */
+#hm-toast {
+  position: absolute;
+  left: 50%;
+  bottom: 58px;
+  transform: translateX(-50%);
+  max-width: min(78%, 900px);
+  padding: 8px 14px;
+  background: var(--bg-alt);
+  border: 1px solid var(--accent);
+  border-radius: 10px;
+  box-shadow: 0 8px 24px rgba(0,0,0,.45);
+  font-size: 13px;
+  color: var(--text);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  z-index: 41;
+}
+#hm-toast.hidden { display: none; }
+#hm-toast.err { border-color: var(--danger); }
+
 /* Workspace must be the positioning context for the absolute HUD. */
 #workspace { position: relative; }
 
@@ -1000,7 +1674,7 @@ mark.plan-cmt {
 }
 .zoom-tab-label { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .zoom-tab-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--muted); flex: none; }
-.zoom-tab-dot.busy { background: var(--yellow); }
+.zoom-tab-dot.busy { background: var(--yellow); width: 10px; height: 10px; }
 .zoom-tab-dot.idle { background: var(--accent-2); }
 .zoom-tab-dot.attention { background: var(--peach); animation: hm-pulse 1.1s ease-in-out infinite; }
 .zoom-tab-dot.dead { background: var(--danger); }
@@ -1156,3 +1830,17 @@ mark.plan-cmt {
 .settings-check span { line-height: 1.4; }
 
 .hidden { display: none !important; }
+
+/* -- "Just finished" glow ---------------------------------------------------
+   When a thread completes a turn (busy -> idle) the whole pane pulses green and
+   its status reads "done" until the user clicks into it, so finished work is
+   obvious across a full board (and from the hive list / zoom tabs). */
+@keyframes hm-done-glow {
+  0%, 100% { box-shadow: 0 0 0 1px var(--accent-2), 0 0 16px -2px var(--accent-2); }
+  50% { box-shadow: 0 0 0 1px var(--accent-2), 0 0 5px -4px var(--accent-2); }
+}
+.pane.done { border-color: var(--accent-2); animation: hm-done-glow 1.5s ease-in-out infinite; }
+.pane.done .pane-header .dot.idle { animation: hm-pulse 1.5s ease-in-out infinite; }
+.pane.done .pane-header .status.idle { font-weight: 600; }
+.zoom-tab-dot.done { background: var(--accent-2); animation: hm-pulse 1.5s ease-in-out infinite; }
+.board-item .status-dot.done { background: var(--accent-2); animation: hm-pulse 1.5s ease-in-out infinite; }

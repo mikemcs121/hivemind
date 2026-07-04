@@ -1,0 +1,143 @@
+'use strict';
+
+// ---------------------------------------------------------------------------
+// Portable self-update.
+//
+// When Hivemind is running as the portable single-exe build (electron-builder
+// sets PORTABLE_EXECUTABLE_FILE in that case, and only that case), check
+// GitHub for a newer release on startup. If one exists, ask the user once;
+// on "Update Now" download the new portable exe next to the current one,
+// launch it, delete the old exe, and quit. Installed (NSIS) and dev runs
+// return immediately.
+// ---------------------------------------------------------------------------
+
+const { app, dialog } = require('electron');
+const https = require('https');
+const fs = require('fs');
+const path = require('path');
+const { spawn } = require('child_process');
+
+const REPO = 'mikemcs121/hivemind';
+const RELEASES_URL = `https://github.com/${REPO}/releases`;
+const USER_AGENT = 'Hivemind-Updater';
+
+function isNewer(latest, current) {
+  const a = latest.replace(/^v/, '').split('.').map(Number);
+  const b = current.split('.').map(Number);
+  for (let i = 0; i < 3; i++) {
+    if ((a[i] || 0) > (b[i] || 0)) return true;
+    if ((a[i] || 0) < (b[i] || 0)) return false;
+  }
+  return false;
+}
+
+function httpsGet(url, redirectsLeft = 5) {
+  return new Promise((resolve, reject) => {
+    const req = https.get(url, {
+      headers: { 'User-Agent': USER_AGENT },
+    }, res => {
+      if ([301, 302, 303, 307, 308].includes(res.statusCode) && res.headers.location && redirectsLeft > 0) {
+        resolve(httpsGet(res.headers.location, redirectsLeft - 1));
+        return;
+      }
+      let data = '';
+      res.on('data', chunk => { data += chunk; });
+      res.on('end', () => resolve({ statusCode: res.statusCode, body: data }));
+    });
+    req.setTimeout(5000, () => req.destroy());
+    req.on('error', reject);
+  });
+}
+
+function downloadToFile(url, destPath) {
+  return new Promise((resolve, reject) => {
+    const file = fs.createWriteStream(destPath);
+    function download(u, redirectsLeft = 5) {
+      https.get(u, { headers: { 'User-Agent': USER_AGENT } }, res => {
+        if ([301, 302, 303, 307, 308].includes(res.statusCode) && res.headers.location && redirectsLeft > 0) {
+          download(res.headers.location, redirectsLeft - 1);
+          return;
+        }
+        if (res.statusCode !== 200) {
+          reject(new Error(`Download failed (HTTP ${res.statusCode})`));
+          return;
+        }
+        res.pipe(file);
+        file.on('finish', () => file.close(resolve));
+      }).on('error', reject);
+    }
+    download(url);
+  });
+}
+
+async function checkForUpdates(win) {
+  if (!process.env.PORTABLE_EXECUTABLE_FILE) return;
+
+  try {
+    const { statusCode, body } = await httpsGet(`https://api.github.com/repos/${REPO}/releases/latest`);
+    if (statusCode !== 200) return;
+
+    const release = JSON.parse(body);
+    const latestTag = release.tag_name || '';
+    if (!isNewer(latestTag, app.getVersion())) return;
+
+    const portableAsset = (release.assets || []).find(a =>
+      /portable/i.test(a.name) && /\.exe$/i.test(a.name)
+    );
+
+    // Single confirmation — on "Update Now" the app downloads and relaunches itself.
+    const { response: updateResponse } = await dialog.showMessageBox(win, {
+      type: 'info',
+      title: 'Update Available',
+      message: `A new version (${latestTag}) is available.\nYou are on v${app.getVersion()}.\n\nHivemind will download the update and restart automatically. Your boards and settings are not affected.\n\nUpdate now?`,
+      buttons: ['Update Now', 'Later'],
+      defaultId: 0,
+      cancelId: 1,
+    });
+    if (updateResponse !== 0) return;
+
+    if (!portableAsset) {
+      await dialog.showMessageBox(win, {
+        type: 'info',
+        title: 'Update',
+        message: `Couldn't find a portable download in release ${latestTag}.\nDownload it manually from:\n${RELEASES_URL}`,
+      });
+      return;
+    }
+
+    const oldExePath = process.env.PORTABLE_EXECUTABLE_FILE;
+    const currentDir = path.dirname(oldExePath);
+    const newExePath = path.join(currentDir, `Hivemind ${latestTag.replace(/^v/, '')} portable.exe`);
+    const partPath = `${newExePath}.part`;
+
+    try {
+      // Download to a .part file first so a failed/partial download can never
+      // leave a half-written, launchable exe behind.
+      await downloadToFile(portableAsset.browser_download_url, partPath);
+
+      // Promote the completed download to its final name.
+      try { fs.unlinkSync(newExePath); } catch (_) { /* didn't exist */ }
+      fs.renameSync(partPath, newExePath);
+
+      // Launch the new version, schedule deletion of the old exe, then quit.
+      spawn(newExePath, [], { detached: true, stdio: 'ignore' }).unref();
+
+      const batPath = path.join(app.getPath('temp'), 'hivemind-update-cleanup.bat');
+      fs.writeFileSync(batPath, `@echo off\r\n:loop\r\ntimeout /t 1 /nobreak >nul\r\ndel /f /q "${oldExePath}" 2>nul\r\nif exist "${oldExePath}" goto loop\r\ndel /f /q "%~f0"\r\n`);
+      spawn('cmd.exe', ['/c', batPath], { detached: true, stdio: 'ignore' }).unref();
+
+      app.quit();
+    } catch (dlErr) {
+      try { fs.unlinkSync(partPath); } catch (_) { /* nothing to clean */ }
+      await dialog.showMessageBox(win, {
+        type: 'error',
+        title: 'Update Failed',
+        message: `The update could not be downloaded:\n${dlErr.message}\n\nYou can try again later, or download it manually from:\n${RELEASES_URL}`,
+      });
+    }
+  } catch (_) {
+    // Network unavailable or any other error before the user opted in — ignore.
+  }
+}
+
+module.exports = { checkForUpdates };

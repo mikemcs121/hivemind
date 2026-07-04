@@ -37,8 +37,14 @@
       "node_modules/@huggingface/transformers/dist/**"
     ],
     "win": {
-      "target": "nsis",
+      "target": [
+        "nsis",
+        "portable"
+      ],
       "icon": "build/icon.ico"
+    },
+    "portable": {
+      "artifactName": "${productName} ${version} portable.exe"
     }
   }
 }

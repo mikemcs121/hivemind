@@ -71,6 +71,49 @@
           <button id="plan-comment-btn" class="plan-comment-btn hidden" title="Comment on the selected text">＋ Comment</button>
         </aside>
 
+        <!-- Todo panel — a per-hive checklist stored in .hivemind/todos.json -->
+        <aside id="todo-panel" class="hidden">
+          <div class="git-header">
+            <span class="git-title">Todo</span>
+            <div class="spacer"></div>
+            <button id="todo-refresh" class="git-icon" title="Refresh">⟳</button>
+            <button id="todo-close" class="git-icon" title="Close">✕</button>
+          </div>
+          <div class="todo-addbar">
+            <input id="todo-input" type="text" placeholder="Add a todo…" autocomplete="off" spellcheck="false" />
+            <button id="todo-add" class="git-icon" title="Add todo">＋</button>
+          </div>
+          <div id="todo-body"></div>
+          <div id="todo-footer" class="todo-footer hidden">
+            <span id="todo-count"></span>
+            <div class="spacer"></div>
+            <button id="todo-clear-done" class="todo-linkbtn">Clear completed</button>
+          </div>
+          <div id="todo-msgbar" class="git-msgbar hidden"></div>
+        </aside>
+
+        <!-- Board panel — a per-hive kanban whose cards dispatch threads;
+             stored in .hivemind/kanban.json -->
+        <aside id="kanban-panel" class="hidden">
+          <div class="git-header">
+            <span class="git-title">Board</span>
+            <div class="spacer"></div>
+            <button id="kanban-refresh" class="git-icon" title="Refresh">⟳</button>
+            <button id="kanban-close" class="git-icon" title="Close">✕</button>
+          </div>
+          <div class="todo-addbar">
+            <input id="kanban-input" type="text" placeholder="Add a card…" autocomplete="off" spellcheck="false" />
+            <button id="kanban-add" class="git-icon" title="Add card">＋</button>
+          </div>
+          <div id="kanban-body"></div>
+          <div id="kanban-footer" class="todo-footer hidden">
+            <span id="kanban-count"></span>
+            <div class="spacer"></div>
+            <button id="kanban-clear-done" class="todo-linkbtn">Clear done</button>
+          </div>
+          <div id="kanban-msgbar" class="git-msgbar hidden"></div>
+        </aside>
+
         <div class="sidebar-actions">
           <button id="files-toggle" class="sidebar-action-btn" title="File Explorer" aria-label="File Explorer" disabled>
             <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor"
@@ -96,6 +139,21 @@
               <line x1="8" y1="17" x2="13" y2="17" />
             </svg>
           </button>
+          <button id="todo-toggle" class="sidebar-action-btn" title="Todo" aria-label="Todo" disabled>
+            <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor"
+                 stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M9 11l3 3L22 4" />
+              <path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11" />
+            </svg>
+          </button>
+          <button id="kanban-toggle" class="sidebar-action-btn" title="Board (Kanban) — cards that dispatch threads" aria-label="Board (Kanban)" disabled>
+            <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor"
+                 stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <rect x="3" y="4" width="4.5" height="12" rx="1" />
+              <rect x="9.75" y="4" width="4.5" height="8" rx="1" />
+              <rect x="16.5" y="4" width="4.5" height="16" rx="1" />
+            </svg>
+          </button>
         </div>
         <div class="sidebar-footer">Hivemind</div>
       </aside>
@@ -104,11 +162,11 @@
 
       <main id="workspace">
         <header id="board-bar">
+          <button id="build-portable" class="pill-btn hidden" title="Build a portable copy of Hivemind from this checkout">📦</button>
           <div id="board-title">No hive selected</div>
           <div id="board-meta"></div>
           <div class="spacer"></div>
-          <button id="build-portable" class="pill-btn hidden" title="Build a portable copy of Hivemind from this checkout">📦 Build Portable</button>
-          <button id="usage-btn" class="pill-btn usage-pill" title="Claude usage — how much of your plan's limits you've used">📊 Usage</button>
+          <button id="usage-btn" class="pill-btn usage-pill" title="Claude usage — how much of your plan's limits you've used">Usage</button>
           <button id="voice-toggle" class="icon-btn" title="Voice typing — dictate into the focused thread (toggle with the ~ key)" disabled>🎤</button>
           <button id="settings-btn" class="icon-btn" title="Settings">⚙</button>
           <button id="help-btn" class="icon-btn" title="Help">❔</button>
@@ -124,6 +182,8 @@
           <span class="vh-target" id="voice-hud-target"></span>
           <button id="voice-hud-stop" title="Stop voice typing (~)">✕</button>
         </div>
+        <!-- Feedback toast for Hivemind commands ("Hivemind, open a new thread…") -->
+        <div id="hm-toast" class="hidden"></div>
         <div id="empty-state" class="empty">
           <h2>Welcome 👋</h2>
           <p>Create a hive, point it at a project directory, and open as many
@@ -300,8 +360,12 @@
                 <strong><svg class="help-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><line x1="6" y1="3" x2="6" y2="15" /><circle cx="18" cy="6" r="3" /><circle cx="6" cy="18" r="3" /><path d="M18 9a9 9 0 0 1-9 9" /></svg> Source Control</strong>
                 buttons to browse files and manage Git, and the
                 <strong><svg class="help-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" /><path d="M14 2v6h6" /><line x1="8" y1="13" x2="16" y2="13" /><line x1="8" y1="17" x2="13" y2="17" /></svg> Plan</strong>
-                button to review the focused thread's plan.</li>
-              <li><strong>Drag the sidebar's right edge</strong> to make it (and the Explorer, Source Control and Plan panels docked in it) wider or narrower. Double-click the edge to reset the width; it's remembered across restarts.</li>
+                button to review the focused thread's plan, the
+                <strong><svg class="help-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 11l3 3L22 4" /><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11" /></svg> Todo</strong>
+                button to keep a checklist for the hive, and the
+                <strong><svg class="help-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="4" width="4.5" height="12" rx="1" /><rect x="9.75" y="4" width="4.5" height="8" rx="1" /><rect x="16.5" y="4" width="4.5" height="16" rx="1" /></svg> Board</strong>
+                button for a kanban whose cards dispatch threads.</li>
+              <li><strong>Drag the sidebar's right edge</strong> to make it (and the Explorer, Source Control, Plan and Todo panels docked in it) wider or narrower. Double-click the edge to reset the width; it's remembered across restarts.</li>
             </ol>
           </div>
 
@@ -312,9 +376,52 @@
               <li>Each thread's header shows a <strong>caption</strong> built from the last prompt you send it, so you can see what every thread is working on at a glance. Short replies like <em>yes</em>, <em>no</em> or a menu number don't replace the caption, so answering a prompt keeps the real task on show. Once a thread has a caption it takes over as the header title and the default <em>claude&nbsp;#</em> name is hidden. Double-click the title to rename a thread — a name you set yourself always stays shown.</li>
               <li>Each thread can run a different <strong>agent</strong> — pick <em>Claude</em>, <em>ChatGPT</em>, or <em>Gemini</em> from the dropdown in the thread header. One hive can mix them (e.g. three Claude threads and one ChatGPT thread). Switching a running thread restarts it with the new agent. ChatGPT needs OpenAI's Codex CLI (<code>npm install -g @openai/codex</code>) and Gemini needs Google's Gemini CLI (<code>npm install -g @google/gemini-cli</code>) installed and signed in; the model dropdown applies to Claude threads only.</li>
               <li>Each Claude thread has a <strong>permission mode</strong> dropdown in its header — <em>Default</em>, <em>Accept&nbsp;Edits</em>, <em>Plan</em>, or <em>Bypass&nbsp;⚠</em> — so you can see and set the mode without hunting for it in Claude's own display. It's handed to Claude Code as a startup flag (<em>Bypass</em> skips the accept-permissions screen entirely). Since Claude has no command to change mode mid-session, switching a running thread restarts it (resuming the conversation when there is one). <em>Bypass</em> turns the dropdown amber as a reminder that permissions are being skipped. The choice is remembered as the default for new threads.</li>
-              <li>Change a thread's model or font from its header, or with <kbd>A−</kbd>/<kbd>A+</kbd> and <kbd>Ctrl</kbd>+scroll.</li>
+              <li>When a thread <strong>finishes its turn</strong>, its whole pane pulses green and the header status shows <strong>✓ done</strong> until you click into that thread — so completed work stands out across a busy hive. The hive list's status dot and the maximize tab strip's dots pulse green too. (Threads that need an answer or hit an error still pulse amber/red as before.)</li>
+              <li>Change a thread's model or font from its header, or with <kbd>A−</kbd>/<kbd>A+</kbd> and <kbd>Ctrl</kbd>+scroll. A <strong>narrow thread hides</strong> its lower-priority header controls (font buttons first, then the permission, model, and agent dropdowns, then the view toggle) so the <strong>⛶ maximize</strong> and <strong>✕ close</strong> buttons always stay reachable — widen or maximize the thread to get the hidden controls back.</li>
               <li><strong>⛶ Maximize</strong> (or <kbd>Ctrl</kbd>+<kbd>Enter</kbd>) blows the focused thread up to fill the hive. A <strong>tab strip</strong> appears across the top listing every other thread — each with a live status dot — so you can see what's hidden behind it and click a tab to jump straight to that thread. Press <kbd>Ctrl</kbd>+<kbd>Enter</kbd> or ⛶ again to restore the tiled layout.</li>
             </ul>
+          </div>
+
+          <div class="settings-group">
+            <div class="settings-group-title">Chat view</div>
+            <ul class="help-list">
+              <li>Claude threads open in a <strong>chat view</strong>: a clean transcript of the conversation — your messages, Claude's replies as formatted markdown, and collapsible tool calls — instead of the raw terminal. The real terminal keeps running underneath, untouched; click <strong>&gt;_</strong> in the thread header to reveal it (find and scrollback live there) and <strong>💬</strong> to come back. The choice is remembered per thread. ChatGPT and Gemini threads are terminal-only.</li>
+              <li>The bar at the top shows the <strong>conversation topic</strong> — Claude Code's own running summary of the session — once the session has one.</li>
+              <li>Click <strong>🕘 History</strong> in the top bar to browse this thread's <strong>past conversations</strong>. The menu lists earlier sessions in the project (newest first, titled by their topic or first message); pick one to view it <strong>read-only</strong> over the live chat. A banner marks the read-only view — click <strong>Back to live</strong> (or the <em>live</em> entry in the menu) to return to the running conversation, which keeps updating underneath the whole time.</li>
+              <li>While the thread is working on a turn, a spinning <strong>🌀 swirl</strong> appears below the last message; it disappears when the turn finishes.</li>
+              <li><strong>Filter chips</strong> at the top right (<em>Tools</em>, <em>Thinking</em>, <em>Meta</em>, <em>Subagents</em>) control exactly what the chat shows. Tool calls appear as collapsed one-liners — click one to expand its input and result. Your choices persist per thread and become the default for new threads.</li>
+              <li>The <strong>composer</strong> at the bottom sends to the thread: <kbd>Enter</kbd> sends, <kbd>Shift</kbd>+<kbd>Enter</kbd> adds a line — multi-line messages arrive as one message. Press <kbd>↑</kbd> in an empty composer (or on the first line) to <strong>recall</strong> messages you've sent before, <kbd>↓</kbd> to come back — editing keeps whatever you land on. Misspelled words get a red squiggle — <strong>right-click</strong> for suggestions or to add a word to the dictionary.</li>
+              <li>Click <strong>⏹ Interrupt</strong> next to the composer's Send button to stop whatever the thread is running — it sends the same <kbd>Ctrl</kbd>+<kbd>C</kbd> the terminal would, without you having to open the terminal view first. Handy for cutting off a long-running command or a turn that's gone down the wrong path.</li>
+              <li><strong>Attachments</strong>: paste an image (including Win+Shift+S screenshots), drag files onto the chat, or click <strong>📎</strong> to pick files — each shows as a chip above the input (images get a thumbnail preview). Click a chip's <strong>✕</strong> to remove it; when you send, the attached files' paths go along with your message so Claude can read them.</li>
+              <li>The composer <strong>autocompletes</strong> as you type: start a message with <kbd>/</kbd> for slash-command suggestions (Claude Code built-ins plus your project's <code>.claude/commands</code> and <code>.claude/skills</code>), or type <kbd>@</kbd> anywhere for file paths from the project directory — completing a folder steps into it. <kbd>↑</kbd>/<kbd>↓</kbd> pick a suggestion, <kbd>Tab</kbd> or <kbd>Enter</kbd> accepts it, <kbd>Esc</kbd> dismisses the menu.</li>
+              <li>When the hidden terminal needs something the chat can't show — a permission prompt, a menu, an error — a <strong>banner</strong> appears with quick keys (<em>1</em>, <em>2</em>, <em>Enter</em>, <em>Esc</em>) and an <strong>Open terminal</strong> button showing the real prompt.</li>
+              <li>The chat is read from the thread's local Claude Code transcript. If Hivemind can't find it (e.g. a custom startup command that isn't <code>claude</code>), a notice appears and the terminal view still works as always.</li>
+            </ul>
+          </div>
+
+          <div class="settings-group">
+            <div class="settings-group-title">Hivemind commands</div>
+            <p class="help-note">Start a composer message (or a single dictated sentence) with
+              <strong>“Hivemind”</strong> and the rest is a command Hivemind itself carries out instead of
+              text sent to Claude — e.g. <em>“Hivemind, open a new thread and fix the failing login test.”</em>
+              A toast at the bottom of the workspace confirms what it did. If the rest isn't a command
+              Hivemind recognizes, the message is sent to the thread as normal — so talking
+              <em>about</em> Hivemind never gets swallowed.</p>
+            <ul class="help-list">
+              <li><strong>open a new thread</strong> <em>[and/to &lt;task&gt;]</em> — opens a thread on this hive; with a task, the new Claude starts working on it the moment it boots.</li>
+              <li><strong>tell &lt;thread&gt; to &lt;task&gt;</strong> — sends the task to the named thread (names and captions both match, so “tell claude 2 to…” or “tell the login thread to…” work).</li>
+              <li><strong>close this thread</strong> / <strong>close thread &lt;name&gt;</strong></li>
+              <li><strong>rename this thread to &lt;name&gt;</strong></li>
+              <li><strong>maximize</strong> / <strong>restore</strong> — zoom the current thread or go back to the tiled layout.</li>
+              <li><strong>focus thread &lt;name&gt;</strong> — jump to a thread by name.</li>
+              <li><strong>stop</strong> / <strong>interrupt</strong> <em>[thread &lt;name&gt;]</em> — sends the same Ctrl+C as the ⏹ button.</li>
+              <li><strong>add a todo &lt;text&gt;</strong> — adds an item to this hive's Todo panel.</li>
+              <li><strong>switch to hive &lt;name&gt;</strong></li>
+              <li><strong>help</strong> — opens this window.</li>
+            </ul>
+            <p class="help-note">“This thread” means the one whose composer you typed into (or the focused
+              one when dictating). If voice typing mishears the wake word (e.g. <em>“hive mine”</em>), add a
+              correction in <strong>⚙ Settings → Voice</strong>'s dictionary.</p>
           </div>
 
           <div class="settings-group">
@@ -339,6 +446,28 @@
           </div>
 
           <div class="settings-group">
+            <div class="settings-group-title">Todo</div>
+            <ul class="help-list">
+              <li>The <strong>Todo</strong> panel is a simple checklist for the hive. Unlike the Plan panel it's shared across every thread in the hive, not tied to the focused one.</li>
+              <li>Type in the box at the top and press <strong>Enter</strong> (or <strong>＋</strong>) to add an item. <strong>Tick the checkbox</strong> to mark it done, <strong>double-click</strong> an item to rename it, and hover to reveal a <strong>✕</strong> to delete it.</li>
+              <li><strong>Quick add from anywhere</strong>: start a composer message (or a dictated sentence) with <strong>todo</strong> — e.g. <em>“todo make the repo public”</em> — and it's added to the panel instead of being sent to Claude (<em>TODO:</em> and <em>to-do</em> work too; a bare <em>todo</em> just opens the panel). <em>“Hivemind, add a todo …”</em> does the same. If dictation hears it as two words (“to do”), add a <strong>Settings → Voice</strong> dictionary correction mapping it to “todo”.</li>
+              <li>Items <strong>nest to any depth</strong>: hover a row and click the <strong>＋</strong> to add a sub-item beneath it. Ticking a parent ticks all of its sub-items, but sub-items never auto-tick their parent — a parent is only done when you tick it yourself (un-ticking a sub-item does un-tick a done parent); a partly-done parent shows a dash. Use the <strong>▾ / ▸</strong> caret to collapse or expand a branch.</li>
+              <li>The footer shows how many leaf items are done and offers <strong>Clear completed</strong> to remove the ticked ones (a done parent stays if it still has unfinished sub-items).</li>
+              <li>The list is saved with the project in <code>.hivemind/todos.json</code> (kept out of Git via <code>.gitignore</code>, like plans), so it survives restarts and updates live if a thread edits the file.</li>
+            </ul>
+          </div>
+
+          <div class="settings-group">
+            <div class="settings-group-title">Board (Kanban)</div>
+            <ul class="help-list">
+              <li>The <strong>Board</strong> panel is a kanban for the hive — <em>To do</em>, <em>In progress</em>, <em>Done</em> — whose cards <strong>dispatch threads</strong>. Add a card describing a task, then click its <strong>▶</strong> (or drag the card into <em>In progress</em>): a new Claude thread opens and starts working on the card's text the moment it boots.</li>
+              <li>A dispatched card <strong>follows its thread</strong>: it shows the thread's live status dot, and clicking the card jumps to that thread. When the thread <strong>finishes its turn</strong>, the card moves to <em>Done</em> on its own — drag it back if there's more to do.</li>
+              <li><strong>Drag cards between columns</strong> any time. Dragging a card out of <em>In progress</em> detaches it from its thread (the thread keeps running); dropping a card with no live thread into <em>In progress</em> dispatches a new one. <strong>Double-click</strong> a card to edit it, hover for <strong>✕</strong> to delete it, and <strong>Clear done</strong> sweeps the <em>Done</em> column.</li>
+              <li>Cards are saved with the project in <code>.hivemind/kanban.json</code> (kept out of Git, like plans and todos), so the board survives restarts and updates live if a thread edits the file. Card→thread links last for the session — after a restart, a card left <em>In progress</em> offers <strong>▶</strong> to dispatch again.</li>
+            </ul>
+          </div>
+
+          <div class="settings-group">
             <div class="settings-group-title">Shortcuts</div>
             <ul class="help-list">
               <li><kbd>~</kbd> — start / stop voice typing</li>
@@ -346,14 +475,14 @@
               <li><kbd>Ctrl</kbd>+<kbd>Enter</kbd> — maximize / restore the focused thread</li>
               <li><kbd>Ctrl</kbd>+<kbd>1</kbd>…<kbd>9</kbd> — focus the 1st–9th thread on the hive</li>
               <li><kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>]</kbd> / <kbd>[</kbd> — cycle focus to the next / previous thread</li>
-              <li><kbd>A−</kbd> / <kbd>A+</kbd> or <kbd>Ctrl</kbd>+scroll — change the focused thread's font size</li>
+              <li><kbd>A−</kbd> / <kbd>A+</kbd>, <kbd>Ctrl</kbd>+<kbd>=</kbd>/<kbd>−</kbd>/<kbd>0</kbd>, or <kbd>Ctrl</kbd>+scroll — change the focused thread's font size (works in both the chat and terminal views)</li>
               <li><kbd>Esc</kbd> — close the open dialog</li>
             </ul>
           </div>
 
           <div class="settings-group">
             <div class="settings-group-title">Usage &amp; limits</div>
-            <p class="help-note">The <strong>📊 Usage</strong> pill in the toolbar shows how much of your
+            <p class="help-note">The <strong>Usage</strong> pill in the toolbar shows how much of your
               Claude plan's most-constrained limit is used right now (green → yellow → red as you approach
               it). Click it for the full picture: the 5-hour session window and weekly limits with their
               reset times — the same numbers as Claude Code's <code>/usage</code> — plus how many tokens
@@ -363,11 +492,24 @@
 
           <div class="settings-group">
             <div class="settings-group-title">Building Hivemind</div>
-            <p class="help-note"><strong>📦 Build Portable</strong> appears in the toolbar only when the active
-              hive is pointed at the Hivemind source checkout. It runs electron-builder's portable target to
-              produce a single self-contained <code>.exe</code>, then opens the <code>dist</code> folder when
-              it finishes. While it runs, the button shows the current build stage and a live elapsed timer
-              (a portable build typically takes a few minutes); hover it to see the latest build output line.</p>
+            <p class="help-note">The <strong>📦</strong> button (left of the hive name) appears only when the active
+              hive is pointed at the Hivemind source checkout. It bumps the patch version in
+              <code>package.json</code>, runs electron-builder's portable target to produce a single
+              self-contained <code>.exe</code>, then publishes it as a GitHub release (tag
+              <code>vX.Y.Z</code>, via the <code>gh</code> CLI) and commits &amp; pushes the version bump —
+              this is what portable copies in the wild auto-update from. The <code>dist</code> folder opens
+              when it finishes. While it runs, the button shows the current stage and a live elapsed timer
+              (a build typically takes a few minutes); hover it to see the latest output line. If publishing
+              fails the build itself is kept; a failed build restores the old version number.</p>
+          </div>
+
+          <div class="settings-group">
+            <div class="settings-group-title">Updates (portable build)</div>
+            <p class="help-note">When you run the portable <code>.exe</code>, Hivemind checks GitHub for a
+              newer release on startup. If one exists it asks once; click <strong>Update Now</strong> and it
+              downloads the new version next to the current file, restarts into it, and removes the old
+              <code>.exe</code> automatically. Boards and settings are preserved. Installed and source
+              (<code>npm start</code>) runs never check.</p>
           </div>
 
           <div class="settings-group">

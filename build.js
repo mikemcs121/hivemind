@@ -144,4 +144,98 @@ function buildPortable(cwd, onProgress) {
   });
 }
 
-module.exports = { isHivemindProject, buildPortable };
+// Run a command, streaming trimmed output lines to onProgress. Resolves with
+// { code, output } and never rejects; a spawn failure resolves with code -1.
+function run(cmd, args, cwd, onProgress) {
+  return new Promise((resolve) => {
+    let output = '';
+    let child;
+    try {
+      child = spawn(cmd, args, { cwd, windowsHide: true });
+    } catch (err) {
+      return resolve({ code: -1, output: err.message });
+    }
+    const onChunk = (buf) => {
+      const text = buf.toString();
+      output += text;
+      if (typeof onProgress === 'function') {
+        for (const line of text.split(/\r?\n/)) {
+          const t = line.trim();
+          if (t) onProgress(t);
+        }
+      }
+    };
+    child.stdout.on('data', onChunk);
+    child.stderr.on('data', onChunk);
+    child.on('error', (err) => resolve({ code: -1, output: `${output}${err.message}` }));
+    child.on('close', (code) => resolve({ code, output }));
+  });
+}
+
+function lastLine(s) {
+  return String(s || '').split(/\r?\n/).filter(Boolean).slice(-1)[0] || '';
+}
+
+// Bump the patch version in package.json (0.1.0 → 0.1.1) with a minimal string
+// edit so the file's formatting is untouched. Returns { version, prevRaw } so
+// a failed build can restore the file exactly as it was.
+async function bumpPatchVersion(cwd) {
+  const pkgPath = path.join(cwd, 'package.json');
+  const prevRaw = await fs.promises.readFile(pkgPath, 'utf8');
+  const pkg = JSON.parse(prevRaw);
+  const parts = String(pkg.version || '0.0.0').split('.').map((n) => parseInt(n, 10) || 0);
+  while (parts.length < 3) parts.push(0);
+  parts[2] += 1;
+  const version = parts.slice(0, 3).join('.');
+  const updated = prevRaw.replace(`"version": "${pkg.version}"`, `"version": "${version}"`);
+  if (updated === prevRaw) throw new Error('could not find the version field in package.json');
+  await fs.promises.writeFile(pkgPath, updated);
+  return { version, prevRaw };
+}
+
+async function restoreVersion(cwd, prevRaw) {
+  try {
+    await fs.promises.writeFile(path.join(cwd, 'package.json'), prevRaw);
+  } catch (_) { /* best effort — worst case the bump sticks */ }
+}
+
+// Publish the built portable exe as a GitHub release (tag vX.Y.Z) via the gh
+// CLI, committing and pushing the version bump first so the repo matches the
+// release. The commit/push is best-effort; the release upload is the point.
+async function publishRelease(cwd, version, onProgress) {
+  const log = (m) => { if (typeof onProgress === 'function') onProgress(m); };
+  const exePath = path.join(cwd, 'dist', `Hivemind ${version} portable.exe`);
+  if (!fs.existsSync(exePath)) {
+    return { ok: false, message: `Built exe not found: ${exePath}` };
+  }
+
+  log(`Committing version bump to ${version}…`);
+  await run('git', ['add', 'package.json'], cwd, null);
+  const commit = await run('git', ['commit', '-m', `Bump version to ${version}`], cwd, null);
+  if (commit.code !== 0) {
+    log(`Could not commit the version bump (continuing): ${lastLine(commit.output)}`);
+  } else {
+    const push = await run('git', ['push'], cwd, null);
+    if (push.code !== 0) log(`Could not push the version bump (continuing): ${lastLine(push.output)}`);
+  }
+
+  log(`Publishing release v${version} to GitHub…`);
+  const gh = await run('gh', ['release', 'create', `v${version}`, exePath,
+    '--title', `Hivemind v${version}`,
+    '--notes', `Portable build v${version}. Download the .exe below — existing portable copies offer to update themselves on next launch.`,
+  ], cwd, onProgress);
+  if (gh.code !== 0) {
+    const detail = lastLine(gh.output) || `gh exited with code ${gh.code}`;
+    return {
+      ok: false,
+      message: gh.code === -1
+        ? `GitHub CLI (gh) is required to publish releases: ${detail}`
+        : detail,
+    };
+  }
+  const url = (gh.output.match(/https:\/\/\S+/) || [])[0] || null;
+  log(`Release v${version} published.`);
+  return { ok: true, url };
+}
+
+module.exports = { isHivemindProject, buildPortable, bumpPatchVersion, restoreVersion, publishRelease };

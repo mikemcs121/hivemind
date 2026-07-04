@@ -19,6 +19,8 @@ contextBridge.exposeInMainWorld('api', {
   listBoards: () => ipcRenderer.invoke('boards:list'),
   saveBoards: (boards) => ipcRenderer.invoke('boards:save', boards),
   pickDir: () => ipcRenderer.invoke('dialog:pickDir'),
+  // Composer attachments: pick one or more files to attach to a chat message.
+  pickFiles: () => ipcRenderer.invoke('dialog:pickFiles'),
 
   // Images dragged/pasted into a terminal: persist bytes, get back a path.
   saveTempImage: (bytes, ext) => ipcRenderer.invoke('image:saveTemp', { bytes, ext }),
@@ -98,6 +100,45 @@ contextBridge.exposeInMainWorld('api', {
     writeComments: (cwd, planId, comments) => ipcRenderer.invoke('plan:comments:write', { cwd, planId, comments }),
     clear: (cwd, planId) => ipcRenderer.invoke('plan:clear', { cwd, planId }),
     ensureIgnored: (cwd) => ipcRenderer.invoke('plan:ensureIgnored', { cwd }),
+  },
+
+  // Todo panel. `cwd` is the active board's project directory; the checklist is
+  // shared per-hive (one `.hivemind/todos.json`), not per-thread.
+  todo: {
+    read: (cwd) => ipcRenderer.invoke('todo:read', { cwd }),
+    write: (cwd, todos) => ipcRenderer.invoke('todo:write', { cwd, todos }),
+    ensureIgnored: (cwd) => ipcRenderer.invoke('todo:ensureIgnored', { cwd }),
+  },
+
+  // Board panel (kanban). `cwd` is the active board's project directory; the
+  // cards are shared per-hive (one `.hivemind/kanban.json`), not per-thread.
+  kanban: {
+    read: (cwd) => ipcRenderer.invoke('kanban:read', { cwd }),
+    write: (cwd, cards) => ipcRenderer.invoke('kanban:write', { cwd, cards }),
+    ensureIgnored: (cwd) => ipcRenderer.invoke('kanban:ensureIgnored', { cwd }),
+  },
+
+  // Chat wrapper: bind a pane to its Claude Code session transcript (JSONL
+  // under ~/.claude/projects/) and stream parsed entries back. `noteSent`
+  // reports composer sends so binding can match files by first user message.
+  transcript: {
+    bind: (opts) => ipcRenderer.invoke('transcript:bind', opts),
+    unbind: (paneId) => ipcRenderer.send('transcript:unbind', { paneId }),
+    noteSent: (paneId, text) => ipcRenderer.send('transcript:noteSent', { paneId, text }),
+    // Conversation-history picker: list past sessions, read one, and restore live.
+    listSessions: (opts) => ipcRenderer.invoke('transcript:sessions', opts),
+    readSession: (opts) => ipcRenderer.invoke('transcript:session', opts),
+    refresh: (paneId) => ipcRenderer.send('transcript:refresh', { paneId }),
+    onEntries: (cb) => {
+      const h = (_e, payload) => cb(payload);
+      ipcRenderer.on('transcript:entries', h);
+      return () => ipcRenderer.removeListener('transcript:entries', h);
+    },
+    onStatus: (cb) => {
+      const h = (_e, payload) => cb(payload);
+      ipcRenderer.on('transcript:status', h);
+      return () => ipcRenderer.removeListener('transcript:status', h);
+    },
   },
 
   // Open a web/mail link in the OS default browser (used by plan links).

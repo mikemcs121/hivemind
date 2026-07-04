@@ -100,8 +100,12 @@ const pty = require('@homebridge/node-pty-prebuilt-multiarch');
 const git = require('./git');
 const files = require('./files');
 const plan = require('./plan');
+const todo = require('./todo');
+const kanban = require('./kanban');
 const build = require('./build');
 const usage = require('./usage');
+const transcript = require('./transcript');
+const updater = require('./updater');
 
 // ---------------------------------------------------------------------------
 // Persistence: boards are stored as JSON in the app's userData directory.
@@ -143,7 +147,7 @@ function defaultShell() {
   return process.env.SHELL || 'bash';
 }
 
-function spawnPty({ id, cwd, cols, rows, startupCommand, model, resume, permissionMode }, win) {
+function spawnPty({ id, cwd, cols, rows, startupCommand, model, resume, permissionMode, initialPrompt }, win) {
   const shell = defaultShell();
   let safeCwd = cwd;
   try {
@@ -196,6 +200,17 @@ function spawnPty({ id, cwd, cols, rows, startupCommand, model, resume, permissi
   // directory. Only meaningful for the `claude` command.
   if (resume && /^claude(\.exe)?\b/i.test(cmd) && !/--continue\b|--resume\b/.test(cmd)) {
     cmd = cmd.replace(/^claude(\.exe)?\b/i, (m) => `${m} --continue`);
+  }
+  // An initial prompt (from a "Hivemind, open a new thread and…" command) rides
+  // along as claude's positional argument. That's the only safe delivery: typing
+  // it into the PTY later could hand it to the shell if the CLI is slow to start.
+  if (initialPrompt && /^claude(\.exe)?\b/i.test(cmd)) {
+    const p = String(initialPrompt).replace(/[\x00-\x1f\x7f]+/g, ' ').replace(/\s+/g, ' ').trim();
+    if (p) {
+      cmd += process.platform === 'win32'
+        ? " '" + p.replace(/'/g, "''") + "'"      // PowerShell literal string
+        : " '" + p.replace(/'/g, "'\\''") + "'";  // POSIX shell literal string
+    }
   }
   if (cmd) {
     // Small delay so the shell prompt is ready before we type into it.
@@ -399,6 +414,15 @@ app.whenReady().then(() => {
     return res.filePaths[0];
   });
 
+  // Attach files to a chat message via the composer's 📎 button.
+  ipcMain.handle('dialog:pickFiles', async () => {
+    const res = await dialog.showOpenDialog(mainWindow, {
+      properties: ['openFile', 'multiSelections'],
+      title: 'Attach files to this message',
+    });
+    return res.canceled ? [] : res.filePaths;
+  });
+
   // -- IPC: images ----------------------------------------------------------
   // A screenshot pasted or an image dragged into a terminal arrives as raw
   // bytes. We persist it to a temp file and hand the path back so the renderer
@@ -521,6 +545,20 @@ app.whenReady().then(() => {
   // Add `.hivemind/` to the project's .gitignore so plan files stay out of Git.
   ipcMain.handle('plan:ensureIgnored', (_e, { cwd }) => plan.ensureIgnored(cwd));
 
+  // -- IPC: Todo panel --------------------------------------------------------
+  // A per-hive checklist stored in `.hivemind/todos.json` in the project dir.
+  ipcMain.handle('todo:read', (_e, { cwd }) => todo.readTodos(cwd));
+  ipcMain.handle('todo:write', (_e, { cwd, todos }) => todo.writeTodos(cwd, todos));
+  // Reuse the plan module's helper — both keep the shared `.hivemind/` folder
+  // out of Git via the same .gitignore entry.
+  ipcMain.handle('todo:ensureIgnored', (_e, { cwd }) => plan.ensureIgnored(cwd));
+
+  // -- IPC: Board panel (kanban) ----------------------------------------------
+  // Per-hive kanban cards stored in `.hivemind/kanban.json` in the project dir.
+  ipcMain.handle('kanban:read', (_e, { cwd }) => kanban.readCards(cwd));
+  ipcMain.handle('kanban:write', (_e, { cwd, cards }) => kanban.writeCards(cwd, cards));
+  ipcMain.handle('kanban:ensureIgnored', (_e, { cwd }) => plan.ensureIgnored(cwd));
+
   // -- IPC: open an external link in the OS browser ---------------------------
   // Plan markdown can contain links; the file:// renderer can't navigate to them
   // safely, so route through the OS. Restricted to web / mail schemes.
@@ -539,6 +577,23 @@ app.whenReady().then(() => {
   // Snapshot of the account's rate-limit windows (same data as Claude Code's
   // /usage screen) plus today's token totals from the local transcripts.
   ipcMain.handle('usage:get', () => usage.getUsage());
+
+  // -- IPC: transcript tailing (chat wrapper) --------------------------------
+  // Each chat-view pane binds to its Claude Code session transcript; parsed
+  // JSONL entries stream back over transcript:entries / transcript:status.
+  ipcMain.handle('transcript:bind', (_e, opts) =>
+    transcript.bind(opts, (channel, payload) => {
+      if (mainWindow && !mainWindow.isDestroyed()) {
+        mainWindow.webContents.send(channel, payload);
+      }
+    }));
+  ipcMain.on('transcript:unbind', (_e, { paneId }) => transcript.unbind(paneId));
+  ipcMain.on('transcript:noteSent', (_e, { paneId, text }) => transcript.noteSent(paneId, text));
+  // Conversation history: list a project's past sessions and read one back to
+  // show read-only in the chat overlay; refresh restores the live view.
+  ipcMain.handle('transcript:sessions', (_e, opts) => transcript.listSessions(opts));
+  ipcMain.handle('transcript:session', (_e, opts) => transcript.readSession(opts));
+  ipcMain.on('transcript:refresh', (_e, { paneId }) => transcript.refresh(paneId));
 
   // -- IPC: speech models (download on first use) ---------------------------
   // The default speech model (Moonshine) ships bundled under models/. Any other
@@ -575,17 +630,40 @@ app.whenReady().then(() => {
 
   // -- IPC: portable build --------------------------------------------------
   // Detect whether a hive's directory is the Hivemind source checkout, and (if
-  // so) build a portable copy of the app from it. One build at a time; progress
-  // lines stream to the renderer so the toolbar button can report status.
+  // so) build+release a portable copy of the app from it: bump the patch
+  // version, build, then publish the exe as a GitHub release. One build at a
+  // time; progress lines stream to the renderer so the toolbar button can
+  // report status.
   ipcMain.handle('build:isHivemind', (_e, { cwd }) => build.isHivemindProject(cwd));
   ipcMain.handle('build:portable', async (_e, { cwd }) => {
     if (buildRunning) return { ok: false, message: 'A build is already running.' };
     buildRunning = true;
+    const progress = (line) => {
+      if (mainWindow && !mainWindow.isDestroyed()) {
+        mainWindow.webContents.send('build:progress', { line });
+      }
+    };
     try {
-      return await build.buildPortable(cwd, (line) => {
-        if (mainWindow && !mainWindow.isDestroyed()) {
-          mainWindow.webContents.send('build:progress', { line });
-        }
+      // Bump first so the exe is stamped with the new version; restore on
+      // build failure so failed builds don't burn version numbers.
+      let bump;
+      try {
+        bump = await build.bumpPatchVersion(cwd);
+      } catch (err) {
+        return { ok: false, message: `Could not bump the version: ${err.message}` };
+      }
+      progress(`Version bumped to ${bump.version}`);
+      const res = await build.buildPortable(cwd, progress);
+      if (!res.ok) {
+        await build.restoreVersion(cwd, bump.prevRaw);
+        return res;
+      }
+      const pub = await build.publishRelease(cwd, bump.version, progress);
+      return Object.assign({}, res, {
+        version: bump.version,
+        published: pub.ok,
+        publishMessage: pub.message,
+        releaseUrl: pub.url,
       });
     } finally {
       buildRunning = false;
@@ -594,6 +672,8 @@ app.whenReady().then(() => {
 
   sweepOldTempImages();
   createWindow();
+  // Portable builds only: offer to self-update from the latest GitHub release.
+  updater.checkForUpdates(mainWindow);
 
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow();
@@ -617,6 +697,7 @@ function sweepOldTempImages() {
 }
 
 app.on('window-all-closed', () => {
+  transcript.disposeAll();
   for (const { proc } of ptys.values()) {
     try {
       proc.kill();
