@@ -89,6 +89,20 @@ contextBridge.exposeInMainWorld('api', {
     reveal: (cwd, rel) => ipcRenderer.invoke('files:reveal', { cwd, rel }),
   },
 
+  // Plan pane. `cwd` is the active board's project directory; `planId` keys the
+  // per-thread plan file the thread writes and the comments Hivemind attaches.
+  plan: {
+    read: (cwd, planId) => ipcRenderer.invoke('plan:read', { cwd, planId }),
+    write: (cwd, planId, content) => ipcRenderer.invoke('plan:write', { cwd, planId, content }),
+    readComments: (cwd, planId) => ipcRenderer.invoke('plan:comments:read', { cwd, planId }),
+    writeComments: (cwd, planId, comments) => ipcRenderer.invoke('plan:comments:write', { cwd, planId, comments }),
+    clear: (cwd, planId) => ipcRenderer.invoke('plan:clear', { cwd, planId }),
+    ensureIgnored: (cwd) => ipcRenderer.invoke('plan:ensureIgnored', { cwd }),
+  },
+
+  // Open a web/mail link in the OS default browser (used by plan links).
+  openExternal: (url) => ipcRenderer.invoke('open:external', { url }),
+
   // Portable build (only meaningful when the hive points at the Hivemind source).
   build: {
     isHivemind: (cwd) => ipcRenderer.invoke('build:isHivemind', { cwd }),
@@ -103,6 +117,19 @@ contextBridge.exposeInMainWorld('api', {
   // Claude usage: rate-limit windows + today's token totals.
   usage: {
     get: () => ipcRenderer.invoke('usage:get'),
+  },
+
+  // Speech-to-text models. `ensureModel` makes sure the chosen model's files are
+  // on disk (downloading a non-default one into userData on first use), and
+  // resolves { ok, alreadyPresent } / { ok:false, error }. Download progress for
+  // the current fetch streams via onSttDownloadProgress.
+  stt: {
+    ensureModel: (repo) => ipcRenderer.invoke('stt:ensureModel', { repo }),
+  },
+  onSttDownloadProgress: (cb) => {
+    const h = (_e, payload) => cb(payload);
+    ipcRenderer.on('stt:downloadProgress', h);
+    return () => ipcRenderer.removeListener('stt:downloadProgress', h);
   },
 
   // Notifications

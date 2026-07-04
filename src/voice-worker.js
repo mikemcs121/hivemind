@@ -46,20 +46,27 @@ env.backends.onnx.wasm.numThreads =
     ? Math.max(1, Math.min(navigator.hardwareConcurrency || 4, 4))
     : 1;
 
-// English-only, q8-quantized; bundled under models/ by `npm run fetch-model`.
+// The model id + dtype now come from the renderer's `load` message (see the
+// STT_MODELS registry in renderer.js), so the user can pick between English
+// speech models at runtime. These are the defaults if the message omits them.
 // WASM is the only backend: this Electron (29 / Chromium 122) exposes no
 // navigator.gpu in windows or workers, so a WebGPU path can't run at all —
 // re-probe if Electron is ever upgraded.
-const MODEL = 'onnx-community/moonshine-base-ONNX';
+const DEFAULT_MODEL = 'onnx-community/moonshine-base-ONNX';
+const DEFAULT_DTYPE = { encoder_model: 'q8', decoder_model_merged: 'q8' };
 
 let transcriber = null;
 
-async function load() {
+async function load(msg) {
+  const model = (msg && msg.model) || DEFAULT_MODEL;
+  const dtype = (msg && msg.dtype) || DEFAULT_DTYPE;
   if (transcriber) { self.postMessage({ type: 'ready', device: 'wasm' }); return; }
   try {
-    transcriber = await pipeline('automatic-speech-recognition', MODEL, {
+    // English-only, q8-quantized; the model's files are served over hm://models
+    // (bundled for the default, downloaded into userData for the rest).
+    transcriber = await pipeline('automatic-speech-recognition', model, {
       device: 'wasm',
-      dtype: { encoder_model: 'q8', decoder_model_merged: 'q8' },
+      dtype,
       progress_callback: (p) => self.postMessage({ type: 'progress', data: p }),
     });
     // Warm-up: the first inference pays one-off WASM compilation/allocation
@@ -93,6 +100,6 @@ async function transcribe(id, audio) {
 
 self.onmessage = (ev) => {
   const msg = ev.data || {};
-  if (msg.type === 'load') return void load();
+  if (msg.type === 'load') return void load(msg);
   if (msg.type === 'transcribe') return void transcribe(msg.id, msg.audio);
 };

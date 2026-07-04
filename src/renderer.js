@@ -216,6 +216,26 @@ let defaultModel = localStorage.getItem('hm.model') || 'default';
 if (!isValidModel(defaultModel)) defaultModel = 'default';
 
 // ---------------------------------------------------------------------------
+// Per-thread permission mode
+//
+// Each thread can start Claude Code in a different permission mode, handed to
+// the CLI as a startup flag (see main.js). Claude Code has no slash command to
+// change mode mid-session, so switching a running thread restarts it (resuming
+// the conversation when one exists). The last choice is remembered as the
+// default for new threads.
+// ---------------------------------------------------------------------------
+const PERMS = [
+  { value: 'default',     label: 'Default' },
+  { value: 'acceptEdits', label: 'Accept Edits' },
+  { value: 'plan',        label: 'Plan' },
+  { value: 'bypass',      label: 'Bypass ⚠' },
+];
+const isValidPerm = (p) => PERMS.some((x) => x.value === p);
+
+let defaultPerm = localStorage.getItem('hm.perm') || 'default';
+if (!isValidPerm(defaultPerm)) defaultPerm = 'default';
+
+// ---------------------------------------------------------------------------
 // Per-thread agent
 //
 // Each thread can run a different coding agent CLI: Claude Code (the default),
@@ -247,8 +267,10 @@ function setPaneAgent(pane, agent) {
   if (pane.agent === agent) return;
   pane.agent = agent;
   if (pane.agentSelect && pane.agentSelect.value !== agent) pane.agentSelect.value = agent;
-  // The Claude model dropdown means nothing to other agents — hide it there.
+  // The Claude model / permission dropdowns mean nothing to other agents — hide
+  // them there.
   if (pane.modelSelect) pane.modelSelect.style.display = agent === 'claude' ? '' : 'none';
+  if (pane.permSelect) pane.permSelect.style.display = agent === 'claude' ? '' : 'none';
   // Auto names track the running command ("codex 2"); manual names stay put.
   if (pane.autoName) {
     const num = (/(\d+)\s*$/.exec(pane.name || '') || [])[1];
@@ -260,8 +282,9 @@ function setPaneAgent(pane, agent) {
 
 // Kill a pane's process and start its (possibly new) agent in the same pane.
 // The pane gets a fresh PTY id so late data/exit events from the old process
-// can't reach it.
-function respawnPane(pane) {
+// can't reach it. Pass { resume: true } to continue the thread's conversation
+// (e.g. when only a startup flag changed, not the whole agent).
+function respawnPane(pane, { resume } = {}) {
   window.api.killPty(pane.id);
   pane.id = nextId('term');
   clearTimeout(pane.idleTimer);
@@ -270,7 +293,7 @@ function respawnPane(pane) {
   pane.errored = false;
   pane.hintShown = false;
   try { pane.term.reset(); } catch (_) { /* ignore */ }
-  spawnPanePty(pane);
+  spawnPanePty(pane, { resume: !!resume });
 }
 
 function setPaneModel(pane, model) {
@@ -284,6 +307,31 @@ function setPaneModel(pane, model) {
   if (pane.agent === 'claude' && pane.state !== 'dead') {
     window.api.writePty(pane.id, `/model ${model}\r`);
     markActivity(pane, '');
+  }
+}
+
+// Highlight the permission dropdown when it's in a risky mode (bypass), so the
+// thread's mode is obvious at a glance instead of buried in Claude's TUI.
+function paintPermSelect(pane) {
+  if (pane.permSelect) pane.permSelect.classList.toggle('perm-bypass', pane.permMode === 'bypass');
+}
+
+function setPanePerm(pane, mode) {
+  if (pane.disposed) return;
+  if (!isValidPerm(mode)) mode = 'default';
+  const changed = pane.permMode !== mode;
+  pane.permMode = mode;
+  defaultPerm = mode;
+  localStorage.setItem('hm.perm', mode);
+  if (pane.permSelect && pane.permSelect.value !== mode) pane.permSelect.value = mode;
+  paintPermSelect(pane);
+  // Permission mode is a startup flag with no live slash-command equivalent, so
+  // apply a change to a running Claude thread by restarting it. Resume the
+  // conversation when the thread has already been used (it has a caption), so a
+  // mid-session mode switch doesn't throw the work away; a fresh, unused thread
+  // restarts clean (there's nothing to --continue).
+  if (changed && pane.agent === 'claude' && pane.state !== 'dead') {
+    respawnPane(pane, { resume: !!pane.captionText });
   }
 }
 
@@ -389,6 +437,7 @@ function setPaneState(pane, state) {
     pane.statusEl.className = 'status ' + state;
   }
   updateBoardStatus(pane.board.id);
+  refreshZoomTabs(pane.board.id);
 
   // Notify on the transitions that pull a human back: a terminal asking for
   // input, hitting an error, or finishing a turn while the window is backgrounded.
@@ -492,10 +541,27 @@ function feedCaptionInput(pane, data) {
   pane.capBuf = buf;
 }
 
+// Short confirmations, menu picks and yes/no replies aren't tasks — they answer
+// a prompt Claude is showing. If the thread already has a caption, don't let one
+// of these clobber it; the real task prompt should keep the header.
+const REPLY_WORDS = new Set([
+  'y', 'n', 'yes', 'no', 'yep', 'yeah', 'yup', 'nope', 'ok', 'okay', 'k',
+  'sure', 'continue', 'go', 'proceed', 'stop', 'done', 'skip', 'accept',
+  'approve', 'deny', 'cancel', 'quit', 'exit', 'thanks', 'thank you',
+]);
+
+function isReplyLike(text) {
+  const t = text.toLowerCase();
+  if (/^[0-9]{1,3}$/.test(t)) return true;   // menu selection ("1", "2"…)
+  return REPLY_WORDS.has(t);
+}
+
 function commitCaption(pane, line) {
   const text = (line || '').trim();
   if (!text) return;                 // a bare Enter keeps the existing caption
   if (text.startsWith('/')) return;  // slash commands are controls, not tasks
+  // Keep the existing task caption when the line is just a reply to a prompt.
+  if (pane.captionText && pane.captionText.trim() && isReplyLike(text)) return;
   setPaneCaption(pane, text);
 }
 
@@ -509,6 +575,7 @@ function setPaneCaption(pane, text, { persist = true } = {}) {
     pane.caption.title = full;
   }
   updateTitleVisibility(pane);
+  refreshZoomTabs(pane.board.id);
   if (persist) persistLayout(pane.board.id);
 }
 
@@ -564,6 +631,53 @@ async function typePathIntoPane(pane, p) {
 // DOM refs
 // ---------------------------------------------------------------------------
 const $ = (id) => document.getElementById(id);
+
+// -- Sidebar resizing -------------------------------------------------------
+// Drag the divider between the sidebar and the workspace to set the sidebar
+// width; the docked Explorer/Git/Plan panels resize with it. Width is clamped
+// to the CSS min/max and remembered across restarts. Double-click resets it.
+const SIDEBAR_W_MIN = 180;
+const SIDEBAR_W_MAX = 600;
+const SIDEBAR_W_DEFAULT = 230;
+(() => {
+  const sidebar = $('sidebar');
+  const handle = $('sidebar-resizer');
+  if (!sidebar || !handle) return;
+
+  const clampW = (w) => Math.max(SIDEBAR_W_MIN, Math.min(SIDEBAR_W_MAX, w));
+  const applyW = (w, persist = true) => {
+    const cw = clampW(w);
+    sidebar.style.width = cw + 'px';
+    if (persist) localStorage.setItem('hm.sidebarWidth', String(cw));
+  };
+
+  const saved = parseInt(localStorage.getItem('hm.sidebarWidth'), 10);
+  if (Number.isFinite(saved)) applyW(saved, false);
+
+  let startX = 0;
+  let startW = 0;
+  const refit = () => { if (typeof fitBoard === 'function' && activeBoardId) fitBoard(activeBoardId); };
+  const onMove = (e) => { applyW(startW + (e.clientX - startX)); refit(); };
+  const onUp = () => {
+    document.removeEventListener('mousemove', onMove);
+    document.removeEventListener('mouseup', onUp);
+    handle.classList.remove('dragging');
+    document.body.classList.remove('col-resizing');
+    localStorage.setItem('hm.sidebarWidth', String(Math.round(sidebar.getBoundingClientRect().width)));
+    refit();
+  };
+  handle.addEventListener('mousedown', (e) => {
+    e.preventDefault();
+    startX = e.clientX;
+    startW = sidebar.getBoundingClientRect().width;
+    handle.classList.add('dragging');
+    document.body.classList.add('col-resizing');
+    document.addEventListener('mousemove', onMove);
+    document.addEventListener('mouseup', onUp);
+  });
+  handle.addEventListener('dblclick', () => { applyW(SIDEBAR_W_DEFAULT); refit(); });
+})();
+
 const boardListEl = $('board-list');
 const gridEl = $('grid');
 const emptyState = $('empty-state');
@@ -594,8 +708,9 @@ function serializeLayout(boardId) {
   const cols = g.columns.map((col) => ({
     flex: col.flex,
     panes: col.panes.filter((p) => !p.disposed).map((p) => ({
-      name: p.name, agent: p.agent, model: p.model, fontSize: p.fontSize,
+      name: p.name, agent: p.agent, model: p.model, perm: p.permMode, fontSize: p.fontSize,
       flex: p.flex, caption: p.captionText || '', autoName: !!p.autoName,
+      planId: p.planId || undefined, // stable per-thread key for the Plan pane
     })),
   })).filter((c) => c.panes.length);
   return cols.length ? cols : null;
@@ -625,8 +740,8 @@ function rebuildFromLayout(board) {
       const looksAuto = new RegExp('^' + cmd.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + ' \\d+$').test(pd.name || '');
       const autoName = pd.autoName !== undefined ? pd.autoName : looksAuto;
       const pane = createPane(board, colObj, {
-        name: pd.name, agent, model: pd.model, fontSize: pd.fontSize,
-        flex: pd.flex, caption: pd.caption, autoName,
+        name: pd.name, agent, model: pd.model, perm: pd.perm, fontSize: pd.fontSize,
+        flex: pd.flex, caption: pd.caption, autoName, planId: pd.planId,
       });
       colObj.panes.push(pane);
       const m = /(\d+)\s*$/.exec(pd.name || '');
@@ -778,6 +893,8 @@ function selectBoard(id) {
   if (typeof gitOnBoardChange === 'function') gitOnBoardChange();
   if (typeof filesToggle !== 'undefined' && filesToggle) filesToggle.disabled = false;
   if (typeof filesOnBoardChange === 'function') filesOnBoardChange();
+  if (typeof planToggle !== 'undefined' && planToggle) planToggle.disabled = false;
+  if (typeof planOnBoardChange === 'function') planOnBoardChange();
   fitBoard(id);
 }
 
@@ -792,6 +909,15 @@ function layout(boardId) {
   // Zoom (tmux-style): if a pane is zoomed and still alive, show only it.
   if (g.zoomed && !g.zoomed.disposed) {
     const pane = g.zoomed;
+    // A tab strip across the top surfaces the threads hidden behind the maximized
+    // one — otherwise there's no sign they exist. Click a tab to maximize that one.
+    const allPanes = g.columns.flatMap((c) => c.panes);
+    if (allPanes.length > 1) {
+      g.el.style.flexDirection = 'column';
+      g.el.appendChild(buildZoomTabs(boardId, g, allPanes, pane));
+    } else {
+      g.el.style.flexDirection = '';
+    }
     pane.el.style.flexGrow = 1;
     pane.el.style.flexBasis = '0';
     pane.el.classList.add('zoomed');
@@ -799,6 +925,7 @@ function layout(boardId) {
     fitBoard(boardId);
     return;
   }
+  g.el.style.flexDirection = ''; // back to a row of columns
   if (g.zoomed) g.zoomed = null; // zoomed pane went away
 
   g.columns.forEach((col, ci) => {
@@ -837,6 +964,60 @@ function toggleZoom(pane) {
   }
   layout(pane.board.id);
   focusPane(pane);
+}
+
+// The short label a thread shows in its header: the caption once an auto-named
+// thread has one, otherwise its (possibly manual) name.
+function paneLabel(pane) {
+  const cap = (pane.captionText || '').trim();
+  if (pane.autoName && cap) return cap;
+  return pane.name || 'thread';
+}
+
+// Build the tab strip shown above a maximized thread. One tab per thread on the
+// board; the active tab is highlighted and each carries a status dot mirroring
+// the thread's live state so background activity/errors are visible while zoomed.
+function buildZoomTabs(boardId, g, allPanes, active) {
+  const strip = document.createElement('div');
+  strip.className = 'zoom-tabs';
+  allPanes.forEach((p) => {
+    const tab = document.createElement('button');
+    tab.className = 'zoom-tab' + (p === active ? ' active' : '');
+    const d = document.createElement('span');
+    d.className = 'zoom-tab-dot ' + (p.state || '');
+    const label = document.createElement('span');
+    label.className = 'zoom-tab-label';
+    label.textContent = paneLabel(p);
+    tab.__pane = p; d.__pane = p; label.__pane = p;
+    tab.append(d, label);
+    tab.title = paneLabel(p);
+    tab.onmousedown = (e) => e.stopPropagation();
+    tab.onclick = (e) => {
+      e.stopPropagation();
+      if (p === g.zoomed) return;
+      if (g.zoomed) g.zoomed.el.classList.remove('zoomed');
+      g.zoomed = p;
+      layout(boardId);
+      focusPane(p);
+    };
+    strip.appendChild(tab);
+  });
+  return strip;
+}
+
+// Keep a maximized board's tab strip in sync with live thread state/labels
+// without rebuilding the whole layout.
+function refreshZoomTabs(boardId) {
+  const g = grids.get(boardId);
+  if (!g || !g.zoomed) return;
+  const strip = g.el.querySelector('.zoom-tabs');
+  if (!strip) return;
+  strip.querySelectorAll('.zoom-tab-dot').forEach((d) => {
+    if (d.__pane) d.className = 'zoom-tab-dot ' + (d.__pane.state || '');
+  });
+  strip.querySelectorAll('.zoom-tab-label').forEach((l) => {
+    if (l.__pane) { l.textContent = paneLabel(l.__pane); l.parentElement.title = paneLabel(l.__pane); }
+  });
 }
 
 function makeGutter(kind, boardId, index, subIndex) {
@@ -947,6 +1128,7 @@ function spawnPanePty(pane, { resume } = {}) {
     rows: pane.term.rows,
     startupCommand: paneCommand(pane),
     model: pane.agent === 'claude' ? pane.model : 'default',
+    permissionMode: pane.agent === 'claude' ? pane.permMode : 'default',
     resume: !!resume,
   });
   markActivity(pane, ''); // start out "working" until the first quiet period
@@ -958,6 +1140,7 @@ function createPane(board, col, opts = {}) {
   const startName = opts.name ||
     (startAgent === 'claude' ? (board.startupCommand || 'claude') : agentFor(startAgent).command);
   const startModel = isValidModel(opts.model) ? opts.model : defaultModel;
+  const startPerm = isValidPerm(opts.perm) ? opts.perm : defaultPerm;
   const startFont = opts.fontSize ? clampFont(opts.fontSize) : defaultFontSize;
   const el = document.createElement('div');
   el.className = 'pane';
@@ -1016,12 +1199,24 @@ function createPane(board, col, opts = {}) {
   }
   modelSelect.value = startModel;
   if (startAgent !== 'claude') modelSelect.style.display = 'none';
+  // Permission mode this thread starts Claude Code in (see setPanePerm).
+  const permSelect = document.createElement('select');
+  permSelect.className = 'model-select perm-select';
+  permSelect.title = 'Permission mode for this thread — changing it restarts the thread';
+  for (const p of PERMS) {
+    const opt = document.createElement('option');
+    opt.value = p.value;
+    opt.textContent = p.label;
+    permSelect.appendChild(opt);
+  }
+  permSelect.value = startPerm;
+  if (startAgent !== 'claude') permSelect.style.display = 'none';
   const statusEl = document.createElement('span');
   statusEl.className = 'status';
   const closeBtn = document.createElement('button');
   closeBtn.textContent = '✕';
   closeBtn.title = 'Close thread';
-  header.append(dot, titleWrap, statusEl, agentSelect, modelSelect, fontDownBtn, fontUpBtn, zoomBtn, closeBtn);
+  header.append(dot, titleWrap, statusEl, agentSelect, modelSelect, permSelect, fontDownBtn, fontUpBtn, zoomBtn, closeBtn);
 
   const termWrap = document.createElement('div');
   termWrap.className = 'pane-term';
@@ -1071,11 +1266,13 @@ function createPane(board, col, opts = {}) {
   term.open(termWrap);
 
   const pane = {
-    id, el, term, fitAddon, searchAddon, dot, statusEl, agentSelect, modelSelect, title, caption,
+    id, el, term, fitAddon, searchAddon, dot, statusEl, agentSelect, modelSelect, permSelect, title, caption,
     findBar, findInput, flex: opts.flex || 1, col, board, disposed: false,
     name: startName, state: null, buf: '', idleTimer: null,
-    fontSize: startFont, agent: startAgent, model: startModel, captionText: '', capBuf: '',
+    fontSize: startFont, agent: startAgent, model: startModel, permMode: startPerm, captionText: '', capBuf: '',
     errored: false, hintShown: false,
+    planId: opts.planId || null, // assigned lazily the first time the Plan pane needs it
+
     // Auto names ("claude 1") give way to the caption once the thread has one;
     // a manual rename (autoName=false) always stays visible.
     autoName: opts.autoName !== undefined ? !!opts.autoName : !opts.name,
@@ -1083,6 +1280,7 @@ function createPane(board, col, opts = {}) {
 
   if (opts.caption) setPaneCaption(pane, opts.caption, { persist: false });
   updateTitleVisibility(pane);
+  paintPermSelect(pane);
 
   // Wire IO
   term.onData((data) => sendToPane(pane, data));
@@ -1120,6 +1318,10 @@ function createPane(board, col, opts = {}) {
   // Model dropdown: switch the model this thread runs (live, if it's started).
   modelSelect.addEventListener('mousedown', (e) => e.stopPropagation());
   modelSelect.onchange = (e) => { e.stopPropagation(); setPaneModel(pane, modelSelect.value); persistLayout(board.id); };
+
+  // Permission dropdown: change the mode Claude starts in (restarts the thread).
+  permSelect.addEventListener('mousedown', (e) => e.stopPropagation());
+  permSelect.onchange = (e) => { e.stopPropagation(); setPanePerm(pane, permSelect.value); persistLayout(board.id); };
 
   // Drag-and-drop / paste an image into the pane. We can't feed raw image bytes
   // through the PTY, so instead we drop the image to a file and type its path
@@ -1297,10 +1499,13 @@ function closePane(pane) {
 
 let focusedPane = null;
 function focusPane(pane) {
+  const changed = focusedPane !== pane;
   if (focusedPane && focusedPane !== pane) focusedPane.el.classList.remove('focused');
   focusedPane = pane;
   pane.el.classList.add('focused');
   try { pane.term.focus(); } catch (_) { /* ignore */ }
+  // The Plan pane always mirrors the focused thread's plan.
+  if (changed && typeof planOnFocusChange === 'function') planOnFocusChange();
 }
 
 // ---------------------------------------------------------------------------
@@ -1459,6 +1664,11 @@ function showEmpty() {
     filesToggle.classList.remove('active');
   }
   if (typeof filesPanel !== 'undefined' && filesPanel) filesPanel.classList.add('hidden');
+  if (typeof planToggle !== 'undefined' && planToggle) {
+    planToggle.disabled = true;
+    planToggle.classList.remove('active');
+  }
+  if (typeof planPanel !== 'undefined' && planPanel) planPanel.classList.add('hidden');
   const sb = $('sidebar'); if (sb) sb.classList.remove('git-open', 'files-open');
 }
 
@@ -1472,23 +1682,6 @@ addTermBtn.onclick = () => {
   if (board) addTerminal(board);
 };
 backdrop.addEventListener('mousedown', (e) => { if (e.target === backdrop) closeModal(); });
-
-// Mute / unmute attention notifications (preference persists across sessions).
-const muteBtn = $('mute-toggle');
-function renderMuteBtn() {
-  if (!muteBtn) return;
-  muteBtn.textContent = notifyMuted ? '🔕' : '🔔';
-  muteBtn.title = notifyMuted ? 'Notifications muted — click to enable' : 'Notifications on — click to mute';
-  muteBtn.classList.toggle('muted', notifyMuted);
-}
-if (muteBtn) {
-  muteBtn.onclick = () => {
-    notifyMuted = !notifyMuted;
-    localStorage.setItem('hm.muteNotifications', notifyMuted ? '1' : '0');
-    renderMuteBtn();
-  };
-  renderMuteBtn();
-}
 
 // A clicked notification jumps to the board + pane that needs attention.
 window.api.onFocusPane(({ paneId, boardId }) => {
@@ -1559,6 +1752,8 @@ window.api.onFsChanged(({ cwd }) => {
   if (typeof gitPanelOpen === 'function' && gitPanelOpen() && !gitBusy && !gitMenuOpen) {
     refreshGit({ keepMsg: true });
   }
+  // The thread may have just (re)written its plan file — re-render it live.
+  if (typeof planPanelOpen === 'function' && planPanelOpen()) refreshPlan();
 });
 
 // ---------------------------------------------------------------------------
@@ -1675,6 +1870,7 @@ function gitPanelOpen() { return gitPanel && !gitPanel.classList.contains('hidde
 const sidebarEl = $('sidebar');
 function setGitOpen(open) {
   if (open && typeof setFilesOpen === 'function') setFilesOpen(false); // one panel at a time
+  if (open && typeof setPlanOpen === 'function') setPlanOpen(false);
   gitPanel.classList.toggle('hidden', !open);
   gitToggle.classList.toggle('active', open);
   sidebarEl.classList.toggle('git-open', open); // board list yields its space
@@ -2107,6 +2303,7 @@ function setFilesMsg(text, kind) {
 
 function setFilesOpen(open) {
   if (open) setGitOpen(false); // one panel at a time
+  if (open && typeof setPlanOpen === 'function') setPlanOpen(false);
   filesPanel.classList.toggle('hidden', !open);
   filesToggle.classList.toggle('active', open);
   sidebarEl.classList.toggle('files-open', open); // board list yields its space
@@ -2238,6 +2435,495 @@ function insertPathIntoPane(rel) {
   sendToPane(pane, text);
   setFilesMsg('Inserted ' + rel + ' into the focused thread.', 'ok');
 }
+
+// ---------------------------------------------------------------------------
+// Plan panel
+//
+// Renders the *focused thread's* plan. The thread writes its plan to
+// `.hivemind/plans/<planId>.md` in the project dir (the ⟳ button types that
+// request into the thread); we render it as markdown and let the user highlight
+// passages and attach comments — like review comments on a document. Comments
+// live in a sidecar `.comments.json` next to the plan, keyed to the quoted text
+// so they re-anchor on every re-render. "Send comments to thread" types them
+// back into the thread so Claude can revise.
+// ---------------------------------------------------------------------------
+const planToggle = $('plan-toggle');
+const planPanel = $('plan-panel');
+const planBody = $('plan-body');
+const planCommentsEl = $('plan-comments');
+const planMsgbar = $('plan-msgbar');
+const planActionbar = $('plan-actionbar');
+const planSendBtn = $('plan-send');
+const planCommentBtn = $('plan-comment-btn');
+
+let planPane = null;         // the pane whose plan is currently shown
+let planText = null;         // raw markdown, or null when there's no plan file
+let planComments = [];       // [{ id, quote, occurrence, body, resolved }]
+let planPendingSel = null;   // { quote, occurrence } captured for a new comment
+let planDrafting = false;    // an inline comment editor is open
+
+function planPanelOpen() { return planPanel && !planPanel.classList.contains('hidden'); }
+
+function setPlanMsg(text, kind) {
+  if (!text) { planMsgbar.classList.add('hidden'); planMsgbar.textContent = ''; return; }
+  planMsgbar.textContent = text;
+  planMsgbar.className = 'git-msgbar' + (kind ? ' ' + kind : '');
+}
+
+function setPlanOpen(open) {
+  if (open) { setGitOpen(false); setFilesOpen(false); } // one panel at a time
+  planPanel.classList.toggle('hidden', !open);
+  planToggle.classList.toggle('active', open);
+  sidebarEl.classList.toggle('plan-open', open); // board list yields its space
+  if (!open) hideCommentBtn();
+}
+
+planToggle.onclick = () => {
+  const open = planPanel.classList.contains('hidden');
+  setPlanOpen(open);
+  if (open) refreshPlan();
+};
+$('plan-close').onclick = () => setPlanOpen(false);
+$('plan-refresh').onclick = () => requestPlanFromThread();
+$('plan-clear').onclick = () => clearPlanForThread();
+
+function planOnBoardChange() { if (planPanelOpen()) refreshPlan(); }
+function planOnFocusChange() { if (planPanelOpen()) refreshPlan(); }
+
+// A live, non-dead focused thread (same guard the voice/insert paths use).
+function livePane() {
+  return focusedPane && !focusedPane.disposed && focusedPane.state !== 'dead' ? focusedPane : null;
+}
+
+// Assign a stable plan id to a pane the first time it's needed, and persist it.
+function ensurePlanId(pane) {
+  if (!pane.planId) {
+    pane.planId = nextId('plan');
+    if (pane.board) persistLayout(pane.board.id);
+  }
+  return pane.planId;
+}
+
+// While waiting for a ⟳-requested rewrite: { planId, since } (the plan file's
+// mtime at request time) so refreshPlan can tell when the thread actually wrote.
+let planAwait = null;
+
+// Type a request into the focused thread asking it to (re)write its plan file.
+async function requestPlanFromThread() {
+  const pane = livePane();
+  if (!pane) { setPlanMsg('Click a thread first, then ask it for a plan.', 'err'); return; }
+  const planId = ensurePlanId(pane);
+  planPane = pane;
+  const dir = activeDir();
+  // Opting into plans → keep `.hivemind/` out of the project's Source Control.
+  if (dir) window.api.plan.ensureIgnored(dir);
+  // Note the plan's current mtime so we can detect the thread's rewrite.
+  let since = 0;
+  if (dir) { const cur = await window.api.plan.read(dir, planId); if (cur && cur.ok) since = cur.mtime || 0; }
+  const rel = '.hivemind/plans/' + planId + '.md';
+  sendToPane(pane, `Write your current plan to ${rel} as GitHub-flavoured markdown, overwriting any existing file. Create the folder if needed.\r`);
+  setPlanMsg('Asked the thread to write its plan — it will appear here once written.', 'ok');
+  const token = { planId, since };
+  planAwait = token;
+  setTimeout(() => {
+    if (planAwait === token) {
+      planAwait = null;
+      setPlanMsg('No plan written yet — the thread may still be working.');
+    }
+  }, 30000);
+}
+
+// Clear the focused thread's plan file and its comment sidecar, then reset the
+// panel to its empty state. Destructive, so confirm first.
+async function clearPlanForThread() {
+  const pane = livePane();
+  if (!pane) { setPlanMsg('Click a thread first.', 'err'); return; }
+  if (!pane.planId) { renderPlanState({ ok: false, reason: 'not-found' }); return; }
+  const dir = activeDir();
+  if (!dir) { setPlanMsg('This hive has no project directory set.', 'err'); return; }
+  if (!confirm("Clear this thread's plan and all its comments? This cannot be undone.")) return;
+  const res = await window.api.plan.clear(dir, pane.planId);
+  if (!res || !res.ok) { setPlanMsg((res && res.message) || 'Could not clear the plan.', 'err'); return; }
+  planAwait = null;
+  planComments = [];
+  planPendingSel = null;
+  renderPlanState({ ok: false, reason: 'not-found' });
+  setPlanMsg('Plan cleared.', 'ok');
+}
+
+// Read the focused thread's plan + comments and render them.
+async function refreshPlan() {
+  if (!planPanelOpen()) return;
+  const pane = livePane();
+  planPane = pane;
+  if (!pane) { renderPlanState({ ok: false, reason: 'no-thread' }); return; }
+  const dir = activeDir();
+  if (!dir) { renderPlanState({ ok: false, reason: 'no-dir' }); return; }
+  if (!pane.planId) { renderPlanState({ ok: false, reason: 'not-found' }); return; }
+  const [planRes, cmtRes] = await Promise.all([
+    window.api.plan.read(dir, pane.planId),
+    window.api.plan.readComments(dir, pane.planId),
+  ]);
+  planComments = (cmtRes && cmtRes.comments) || [];
+  if (!planRes || !planRes.ok) { renderPlanState(planRes || { ok: false, reason: 'not-found' }); return; }
+  planText = planRes.content;
+  // If we were waiting on a ⟳ request and the file is now newer, confirm it.
+  const confirmed = planAwait && planAwait.planId === pane.planId && (planRes.mtime || 0) > planAwait.since;
+  if (confirmed) planAwait = null;
+  renderPlan();
+  if (confirmed) setPlanMsg('Plan updated ✓', 'ok');
+}
+
+function renderPlanState(res) {
+  planText = null;
+  planBody.innerHTML = '';
+  planCommentsEl.innerHTML = '';
+  planActionbar.classList.add('hidden');
+  const wrap = document.createElement('div');
+  wrap.className = 'git-empty';
+  const reason = res && res.reason;
+  if (reason === 'no-dir') {
+    wrap.textContent = 'This hive has no project directory set. Edit the hive to choose one.';
+  } else if (reason === 'no-thread') {
+    wrap.textContent = 'Click a thread to see its plan.';
+  } else if (reason === 'not-found') {
+    wrap.textContent = 'No plan yet — click ⟳ above to ask this thread to write one.';
+  } else {
+    wrap.textContent = (res && res.message ? res.message : 'Could not read the plan.').trim();
+  }
+  planBody.appendChild(wrap);
+}
+
+// Render the markdown, re-anchor comment highlights, and draw the comment list.
+function renderPlan() {
+  setPlanMsg('');
+  planBody.innerHTML = markdownToHtml(planText || '');
+  for (const c of planComments) {
+    if (c.resolved) continue;
+    c._anchored = highlightOccurrence(planBody, c.quote, c.occurrence || 0, c.id);
+  }
+  renderCommentList();
+}
+
+// --- Minimal, dependency-free markdown -> HTML ------------------------------
+// Escapes first, then handles the GitHub-flavoured subset a plan uses: headings,
+// fenced/inline code, bold/italic, links, blockquotes, horizontal rules, pipe
+// tables, and nested unordered/ordered/task lists. Task-list checkboxes carry a
+// `data-line` index back to the source markdown so they can be toggled in place
+// (see the checkbox handler below).
+const MD_LIST_RE = /^(\s*)([-*+]|\d+[.)])\s+(.*)$/;
+const MD_TASK_RE = /^\[([ xX])\]\s+(.*)$/;
+const MD_TABLE_SEP_RE = /^\s*\|?\s*:?-{2,}:?\s*(\|\s*:?-{2,}:?\s*)+\|?\s*$/;
+
+function mdInline(s) {
+  let t = escapeHtml(s);
+  t = t.replace(/`([^`]+)`/g, '<code>$1</code>');
+  // [text](url) — only web/mail links become anchors; anything else stays text.
+  t = t.replace(/\[([^\]]+)\]\(([^)\s]+)\)/g, (m, txt, url) =>
+    /^(https?:|mailto:)/i.test(url) ? `<a href="${url}" class="plan-link">${txt}</a>` : txt);
+  t = t.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
+  t = t.replace(/(^|[^*])\*([^*\n]+)\*/g, '$1<em>$2</em>');
+  return t;
+}
+
+// Split a table row on unescaped pipes, dropping the optional edge pipes.
+function mdTableCells(row) {
+  const cells = row.trim().replace(/^\|/, '').replace(/\|$/, '').split('|');
+  return cells.map((c) => c.trim());
+}
+
+// Render a tree of list items (built by parseMdList) into nested <ul>/<ol>.
+function renderMdItems(children) {
+  if (!children.length) return '';
+  const tag = children[0].ordered ? 'ol' : 'ul';
+  let html = `<${tag}>`;
+  for (const c of children) {
+    const task = MD_TASK_RE.exec(c.content);
+    if (task) {
+      const checked = task[1].toLowerCase() === 'x';
+      html += '<li class="plan-task">' +
+        `<input type="checkbox" class="plan-check" data-line="${c.line}"${checked ? ' checked' : ''}>` +
+        `<span>${mdInline(task[2])}</span>`;
+    } else {
+      html += `<li>${mdInline(c.content)}`;
+    }
+    html += renderMdItems(c.children) + '</li>';
+  }
+  return html + `</${tag}>`;
+}
+
+// Consume consecutive list lines from `start`, building an indent-based tree.
+// Returns [html, nextIndex]. Each node keeps its source line for checkboxes.
+function parseMdList(lines, start) {
+  const root = { indent: -1, children: [] };
+  const stack = [root];
+  let i = start;
+  while (i < lines.length) {
+    const m = MD_LIST_RE.exec(lines[i]);
+    if (!m) break;
+    const indent = m[1].replace(/\t/g, '  ').length;
+    const node = { indent, ordered: /\d/.test(m[2]), content: m[3], line: i, children: [] };
+    while (stack.length > 1 && indent <= stack[stack.length - 1].indent) stack.pop();
+    stack[stack.length - 1].children.push(node);
+    stack.push(node);
+    i++;
+  }
+  return [renderMdItems(root.children), i];
+}
+
+function markdownToHtml(md) {
+  const lines = md.replace(/\r\n?/g, '\n').split('\n');
+  const out = [];
+  let i = 0;
+  while (i < lines.length) {
+    const line = lines[i];
+    if (/^```/.test(line)) {                       // fenced code block
+      const buf = [];
+      i++;
+      while (i < lines.length && !/^```/.test(lines[i])) { buf.push(lines[i]); i++; }
+      i++; // closing fence
+      out.push('<pre><code>' + escapeHtml(buf.join('\n')) + '</code></pre>');
+      continue;
+    }
+    const h = /^(#{1,6})\s+(.*)$/.exec(line);
+    if (h) { const n = h[1].length; out.push(`<h${n}>${mdInline(h[2])}</h${n}>`); i++; continue; }
+    if (/^\s*([-*_])(\s*\1){2,}\s*$/.test(line)) { out.push('<hr>'); i++; continue; } // rule
+    // Pipe table: a header row followed by a --- separator row.
+    if (line.includes('|') && i + 1 < lines.length && MD_TABLE_SEP_RE.test(lines[i + 1])) {
+      const head = mdTableCells(line);
+      i += 2; // header + separator
+      const rows = [];
+      while (i < lines.length && lines[i].includes('|') && lines[i].trim()) { rows.push(mdTableCells(lines[i])); i++; }
+      const th = head.map((c) => `<th>${mdInline(c)}</th>`).join('');
+      const body = rows.map((r) => '<tr>' + head.map((_, k) => `<td>${mdInline(r[k] || '')}</td>`).join('') + '</tr>').join('');
+      out.push(`<table class="plan-table"><thead><tr>${th}</tr></thead><tbody>${body}</tbody></table>`);
+      continue;
+    }
+    if (/^\s*>\s?/.test(line)) {                    // blockquote
+      const buf = [];
+      while (i < lines.length && /^\s*>\s?/.test(lines[i])) { buf.push(lines[i].replace(/^\s*>\s?/, '')); i++; }
+      out.push('<blockquote>' + mdInline(buf.join(' ')) + '</blockquote>');
+      continue;
+    }
+    if (MD_LIST_RE.test(line)) {                    // nested / task list
+      const [html, next] = parseMdList(lines, i);
+      out.push(html);
+      i = next;
+      continue;
+    }
+    if (/^\s*$/.test(line)) { i++; continue; }      // blank
+    const buf = [];                                 // paragraph (until a block)
+    while (i < lines.length && !/^\s*$/.test(lines[i]) &&
+      !/^(#{1,6}\s|```|\s*>\s|\s*([-*_])(\s*\2){2,}\s*$)/.test(lines[i]) && !MD_LIST_RE.test(lines[i])) {
+      buf.push(lines[i]); i++;
+    }
+    out.push('<p>' + mdInline(buf.join(' ')) + '</p>');
+  }
+  return out.join('\n');
+}
+
+// Wrap the Nth (0-based) occurrence of `quote` inside `root` in a <mark>, even
+// when it spans element boundaries. Returns true if it anchored.
+function highlightOccurrence(root, quote, occurrence, id) {
+  if (!quote) return false;
+  const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, null);
+  const nodes = [];
+  let full = '';
+  let n;
+  while ((n = walker.nextNode())) { nodes.push({ node: n, start: full.length }); full += n.nodeValue; }
+  let idx = -1;
+  for (let k = 0; k <= occurrence; k++) { idx = full.indexOf(quote, idx + 1); if (idx === -1) return false; }
+  const gStart = idx, gEnd = idx + quote.length;
+  const segs = [];
+  for (const { node, start } of nodes) {
+    const nEnd = start + node.nodeValue.length;
+    const s = Math.max(gStart, start), e = Math.min(gEnd, nEnd);
+    if (s < e) segs.push({ node, s: s - start, e: e - start });
+  }
+  // Apply last-to-first so earlier offsets stay valid as text nodes split.
+  for (let j = segs.length - 1; j >= 0; j--) {
+    const r = document.createRange();
+    r.setStart(segs[j].node, segs[j].s);
+    r.setEnd(segs[j].node, segs[j].e);
+    const mark = document.createElement('mark');
+    mark.className = 'plan-cmt';
+    mark.dataset.id = id;
+    try { r.surroundContents(mark); } catch (_) { /* skip un-wrappable segment */ }
+  }
+  return segs.length > 0;
+}
+
+// Links in a plan open in the OS browser, not the file:// renderer window.
+planBody.addEventListener('click', (e) => {
+  const a = e.target.closest && e.target.closest('a.plan-link');
+  if (a) {
+    e.preventDefault();
+    const href = a.getAttribute('href');
+    if (href) window.api.openExternal(href);
+  }
+});
+
+// Toggling a task checkbox flips `[ ]`<->`[x]` on its source line and writes the
+// plan file back, so plan progress edited here persists (and the thread sees it).
+planBody.addEventListener('change', async (e) => {
+  const cb = e.target;
+  if (!cb || !cb.classList || !cb.classList.contains('plan-check')) return;
+  const ln = parseInt(cb.dataset.line, 10);
+  const dir = activeDir();
+  const pane = planPane;
+  if (!Number.isInteger(ln) || planText == null || !dir || !pane || !pane.planId) return;
+  const lines = planText.split('\n');
+  if (ln < 0 || ln >= lines.length) return;
+  const mark = cb.checked ? 'x' : ' ';
+  const next = lines[ln].replace(/^(\s*(?:[-*+]|\d+[.)])\s+)\[[ xX]\]/, `$1[${mark}]`);
+  if (next === lines[ln]) return;       // source line didn't match — leave it be
+  lines[ln] = next;
+  planText = lines.join('\n');
+  renderPlan();                          // instant feedback; re-anchors comments
+  const res = await window.api.plan.write(dir, pane.planId, planText);
+  if (res && !res.ok) setPlanMsg(res.message || 'Could not update the plan file.', 'err');
+});
+
+// --- Highlight-to-comment ---------------------------------------------------
+function hideCommentBtn() { planCommentBtn.classList.add('hidden'); }
+
+// Show the floating "＋ Comment" button when the user selects plan text.
+planBody.addEventListener('mouseup', () => {
+  setTimeout(() => {
+    const sel = window.getSelection();
+    if (!sel || sel.isCollapsed || !sel.toString().trim()) { hideCommentBtn(); return; }
+    const range = sel.getRangeAt(0);
+    if (!planBody.contains(range.commonAncestorContainer)) { hideCommentBtn(); return; }
+    const rect = range.getBoundingClientRect();
+    const host = planPanel.getBoundingClientRect();
+    planCommentBtn.style.top = (rect.bottom - host.top + 4) + 'px';
+    planCommentBtn.style.left = Math.max(4, rect.left - host.left) + 'px';
+    planCommentBtn.classList.remove('hidden');
+  }, 0);
+});
+
+// Capture the selection's quote + occurrence and open an inline editor.
+planCommentBtn.onclick = () => {
+  const sel = window.getSelection();
+  if (!sel || sel.isCollapsed) { hideCommentBtn(); return; }
+  const quote = sel.toString();
+  const range = sel.getRangeAt(0);
+  // Global offset of the selection start within the plan's plaintext.
+  const pre = document.createRange();
+  pre.setStart(planBody, 0);
+  pre.setEnd(range.startContainer, range.startOffset);
+  const startIndex = pre.toString().length;
+  const full = planBody.textContent;
+  let occ = 0, from = 0, at;
+  while ((at = full.indexOf(quote, from)) !== -1 && at < startIndex) { occ++; from = at + 1; }
+  planPendingSel = { quote, occurrence: occ };
+  sel.removeAllRanges();
+  hideCommentBtn();
+  planDrafting = true;
+  renderCommentList();
+};
+
+// Draw the comment list (plus an inline draft editor when adding one).
+function renderCommentList() {
+  planCommentsEl.innerHTML = '';
+  const unresolved = planComments.filter((c) => !c.resolved);
+  planActionbar.classList.toggle('hidden', unresolved.length === 0);
+
+  if (planDrafting && planPendingSel) {
+    const box = document.createElement('div');
+    box.className = 'plan-cmt-draft';
+    const q = document.createElement('div');
+    q.className = 'plan-cmt-quote';
+    q.textContent = '“' + planPendingSel.quote + '”';
+    const ta = document.createElement('textarea');
+    ta.className = 'plan-cmt-input';
+    ta.placeholder = 'Add a comment…';
+    const row = document.createElement('div');
+    row.className = 'plan-cmt-actions';
+    const save = document.createElement('button');
+    save.className = 'plan-send-btn';
+    save.textContent = 'Comment';
+    save.onclick = () => saveDraftComment(ta.value);
+    const cancel = document.createElement('button');
+    cancel.className = 'plan-mini-btn';
+    cancel.textContent = 'Cancel';
+    cancel.onclick = () => { planDrafting = false; planPendingSel = null; renderCommentList(); };
+    row.append(save, cancel);
+    box.append(q, ta, row);
+    planCommentsEl.appendChild(box);
+    ta.focus();
+    ta.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); saveDraftComment(ta.value); }
+    });
+  }
+
+  if (!unresolved.length && !planDrafting) return;
+
+  unresolved.forEach((c, n) => {
+    const item = document.createElement('div');
+    item.className = 'plan-cmt-item' + (c._anchored === false ? ' orphaned' : '');
+    const num = document.createElement('span');
+    num.className = 'plan-cmt-num';
+    num.textContent = String(n + 1);
+    const main = document.createElement('div');
+    main.className = 'plan-cmt-main';
+    const q = document.createElement('div');
+    q.className = 'plan-cmt-quote';
+    q.textContent = '“' + c.quote + '”' + (c._anchored === false ? '  (not found in current plan)' : '');
+    q.onclick = () => {
+      const mark = planBody.querySelector('mark.plan-cmt[data-id="' + c.id + '"]');
+      if (mark) mark.scrollIntoView({ block: 'center' });
+    };
+    const body = document.createElement('div');
+    body.className = 'plan-cmt-text';
+    body.textContent = c.body;
+    main.append(q, body);
+    const act = document.createElement('div');
+    act.className = 'plan-cmt-act';
+    act.appendChild(mkMini('✓', 'Resolve (remove) this comment', () => resolveComment(c.id)));
+    item.append(num, main, act);
+    planCommentsEl.appendChild(item);
+  });
+}
+
+async function saveDraftComment(text) {
+  const body = (text || '').trim();
+  if (!body || !planPendingSel) { planDrafting = false; planPendingSel = null; renderCommentList(); return; }
+  planComments.push({
+    id: nextId('cmt'), quote: planPendingSel.quote,
+    occurrence: planPendingSel.occurrence, body, resolved: false,
+  });
+  planDrafting = false;
+  planPendingSel = null;
+  await persistComments();
+  renderPlan();
+}
+
+async function resolveComment(id) {
+  planComments = planComments.filter((c) => c.id !== id);
+  await persistComments();
+  renderPlan();
+}
+
+async function persistComments() {
+  const dir = activeDir();
+  const pane = planPane;
+  if (!dir || !pane || !pane.planId) return;
+  const res = await window.api.plan.writeComments(dir, pane.planId, planComments);
+  if (res && !res.ok) setPlanMsg(res.message || 'Could not save comments.', 'err');
+}
+
+// Type the unresolved comments into the thread so it can revise the plan.
+planSendBtn.onclick = () => {
+  const pane = (planPane && !planPane.disposed && planPane.state !== 'dead') ? planPane : livePane();
+  if (!pane) { setPlanMsg('The thread for this plan is no longer open.', 'err'); return; }
+  const unresolved = planComments.filter((c) => !c.resolved);
+  if (!unresolved.length) { setPlanMsg('No comments to send.', 'err'); return; }
+  const parts = unresolved.map((c, n) => `[${n + 1}] on "${c.quote}": ${c.body}`);
+  const msg = 'Please revise your plan based on these comments, then rewrite the plan file. Comments: ' + parts.join('  ');
+  sendToPane(pane, msg);
+  setPlanMsg('Sent ' + unresolved.length + ' comment(s) to the thread.', 'ok');
+};
 
 // -- Diff viewer ------------------------------------------------------------
 const diffBackdrop = $('diff-backdrop');
@@ -2624,6 +3310,22 @@ let voiceHotkeyEnabled = localStorage.getItem('hm.voiceHotkey') !== '0';   // de
 let voiceAutoEnter = localStorage.getItem('hm.voiceAutoEnter') === '1';    // default off
 let voiceAutoSpace = localStorage.getItem('hm.voiceAutoSpace') !== '0';    // default on
 
+// Speech-to-text model registry. Each entry is a transformers.js ASR model
+// served offline over hm://models (see voice-worker.js). The first is bundled;
+// the rest download into userData on first use via window.api.stt.ensureModel —
+// keep the repo ids in sync with STT_DOWNLOADS in main.js. `dtype` is passed
+// straight to the pipeline. Every entry must be English-only, so the worker's
+// audio-only transcribe path (no language/task) stays valid.
+const STT_MODELS = [
+  { value: 'onnx-community/moonshine-base-ONNX', label: 'Moonshine Base — fast & accurate (default)',
+    dtype: { encoder_model: 'q8', decoder_model_merged: 'q8' } },
+  { value: 'onnx-community/whisper-base.en', label: 'Whisper Base (English) — downloads on first use',
+    dtype: { encoder_model: 'q8', decoder_model_merged: 'q8' } },
+];
+const isValidSttModel = (m) => STT_MODELS.some((x) => x.value === m);
+let sttModelId = localStorage.getItem('hm.voiceModel') || STT_MODELS[0].value;
+if (!isValidSttModel(sttModelId)) sttModelId = STT_MODELS[0].value;
+
 function saveVoiceDict() {
   try { localStorage.setItem('hm.voiceDict', JSON.stringify(voiceDict)); } catch (_) { /* quota */ }
 }
@@ -2733,17 +3435,46 @@ function commitVoiceText(raw) {
 // cross-origin hm:// worker directly, but it can spawn a same-origin blob
 // worker, and that blob can `import` the real worker over hm:// (CORS-allowed
 // by the protocol handler in main.js).
+// Drop the cached worker so the next ensureSttWorker() boots fresh — used when
+// the user switches speech models (the worker holds one loaded model for its
+// lifetime, so a new model means a new worker).
+function resetSttWorker() {
+  if (sttWorker) { try { sttWorker.terminate(); } catch (_) { /* already gone */ } }
+  sttWorker = null;
+  sttReady = false;
+  sttLoadPromise = null;
+  sttInFlight = 0;
+  sttPending = [];
+}
+
 function ensureSttWorker() {
   if (sttLoadPromise) return sttLoadPromise;
 
-  sttLoadPromise = new Promise((resolve, reject) => {
+  const entry = STT_MODELS.find((m) => m.value === sttModelId) || STT_MODELS[0];
+
+  // Two async steps: make sure the model's files are on disk (a non-default one
+  // downloads on first use), then boot the worker and wait for it to load them.
+  sttLoadPromise = (async () => {
+    const ensured = await window.api.stt.ensureModel(entry.value);
+    if (!ensured || !ensured.ok) {
+      throw new Error((ensured && ensured.error) || 'could not fetch the speech model');
+    }
+    await bootSttWorker(entry);
+  })();
+  // A failed load clears the cache so the next attempt can retry from scratch.
+  sttLoadPromise.catch(() => { sttLoadPromise = null; });
+  return sttLoadPromise;
+}
+
+// Spawn the module worker and resolve once it posts 'ready' for `entry`.
+function bootSttWorker(entry) {
+  return new Promise((resolve, reject) => {
     let worker;
     try {
       const bootstrap = "import 'hm://app/voice-worker.js';";
       const url = URL.createObjectURL(new Blob([bootstrap], { type: 'text/javascript' }));
       worker = new Worker(url, { type: 'module' });
     } catch (err) {
-      sttLoadPromise = null;
       reject(err);
       return;
     }
@@ -2785,10 +3516,8 @@ function ensureSttWorker() {
     };
 
     sttWorker = worker;
-    worker.postMessage({ type: 'load' });
+    worker.postMessage({ type: 'load', model: entry.value, dtype: entry.dtype });
   });
-
-  return sttLoadPromise;
 }
 
 // -- Mic capture + energy-gate VAD ------------------------------------------
@@ -3085,6 +3814,7 @@ const voiceModalMsg = $('voice-modal-msg');
 const vHotkey = $('voice-hotkey-enabled');
 const vAutoEnter = $('voice-auto-enter');
 const vAutoSpace = $('voice-auto-space');
+const vModel = $('voice-model');
 const vFrom = $('voice-dict-from');
 const vTo = $('voice-dict-to');
 const vDictList = $('voice-dict-list');
@@ -3148,6 +3878,16 @@ function syncVoiceFields() {
   vHotkey.checked = voiceHotkeyEnabled;
   vAutoEnter.checked = voiceAutoEnter;
   vAutoSpace.checked = voiceAutoSpace;
+  if (vModel) {
+    if (!vModel.options.length) {
+      for (const m of STT_MODELS) {
+        const opt = document.createElement('option');
+        opt.value = m.value; opt.textContent = m.label;
+        vModel.appendChild(opt);
+      }
+    }
+    vModel.value = sttModelId;
+  }
   renderVoiceDict();
   setVoiceModalMsg('');
 }
@@ -3186,14 +3926,8 @@ function openSettings(tab) {
 }
 function closeSettings() { settingsBackdrop.classList.add('hidden'); }
 
-// Back-compat alias: the 📖 button opens straight to the Voice tab.
-function openVoiceModal() { openSettings('voice'); setTimeout(() => vFrom.focus(), 0); }
-function closeVoiceModal() { closeSettings(); }
-
 // -- Wire it all up ----------------------------------------------------------
 if (voiceToggleBtn) voiceToggleBtn.onclick = toggleVoice;
-const voiceSettingsBtn = $('voice-settings');
-if (voiceSettingsBtn) voiceSettingsBtn.onclick = openVoiceModal;
 const settingsBtn = $('settings-btn');
 if (settingsBtn) settingsBtn.onclick = () => openSettings('general');
 $('settings-close').onclick = closeSettings;
@@ -3396,7 +4130,6 @@ const setNotify = $('set-notify');
 if (setNotify) setNotify.addEventListener('change', () => {
   notifyMuted = !setNotify.checked;
   localStorage.setItem('hm.muteNotifications', notifyMuted ? '1' : '0');
-  if (typeof renderMuteBtn === 'function') renderMuteBtn();
 });
 
 $('voice-dict-add').onclick = addVoiceDictEntry;
@@ -3413,6 +4146,24 @@ vAutoEnter.addEventListener('change', () => {
 vAutoSpace.addEventListener('change', () => {
   voiceAutoSpace = vAutoSpace.checked;
   localStorage.setItem('hm.voiceAutoSpace', voiceAutoSpace ? '1' : '0');
+});
+if (vModel) vModel.addEventListener('change', () => {
+  if (!isValidSttModel(vModel.value) || vModel.value === sttModelId) return;
+  sttModelId = vModel.value;
+  localStorage.setItem('hm.voiceModel', sttModelId);
+  // The worker holds one model for its life, so switching means a fresh worker.
+  // If we're mid-dictation, restart so the new model loads (and downloads, if
+  // it's the first time) right away instead of on the next toggle.
+  const wasActive = voiceActive;
+  if (wasActive) stopVoice();
+  resetSttWorker();
+  if (wasActive) startVoice();
+});
+// Model download progress (first use of a non-bundled model) → HUD.
+if (window.api.onSttDownloadProgress) window.api.onSttDownloadProgress((p) => {
+  if (!sttReady && p && p.total) {
+    setVoiceHudText('Downloading speech model… ' + p.done + '/' + p.total + ' files');
+  }
 });
 
 // ---------------------------------------------------------------------------

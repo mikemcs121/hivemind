@@ -53,6 +53,24 @@
           <div id="git-msgbar" class="git-msgbar hidden"></div>
         </aside>
 
+        <!-- Plan panel — renders the focused thread's plan.md + highlight comments -->
+        <aside id="plan-panel" class="hidden">
+          <div class="git-header">
+            <span class="git-title">Plan</span>
+            <div class="spacer"></div>
+            <button id="plan-refresh" class="git-icon" title="Ask the focused thread to (re)write its plan">⟳</button>
+            <button id="plan-clear" class="git-icon" title="Clear this thread's plan and comments">🗑</button>
+            <button id="plan-close" class="git-icon" title="Close">✕</button>
+          </div>
+          <div id="plan-body"></div>
+          <div id="plan-comments"></div>
+          <div id="plan-actionbar" class="plan-actionbar hidden">
+            <button id="plan-send" class="plan-send-btn" title="Type your comments into the focused thread so it can revise the plan">Send comments to thread</button>
+          </div>
+          <div id="plan-msgbar" class="git-msgbar hidden"></div>
+          <button id="plan-comment-btn" class="plan-comment-btn hidden" title="Comment on the selected text">＋ Comment</button>
+        </aside>
+
         <div class="sidebar-actions">
           <button id="files-toggle" class="sidebar-action-btn" title="File Explorer" aria-label="File Explorer" disabled>
             <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor"
@@ -69,9 +87,20 @@
               <path d="M18 9a9 9 0 0 1-9 9" />
             </svg>
           </button>
+          <button id="plan-toggle" class="sidebar-action-btn" title="Plan" aria-label="Plan" disabled>
+            <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor"
+                 stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
+              <path d="M14 2v6h6" />
+              <line x1="8" y1="13" x2="16" y2="13" />
+              <line x1="8" y1="17" x2="13" y2="17" />
+            </svg>
+          </button>
         </div>
         <div class="sidebar-footer">Hivemind</div>
       </aside>
+
+      <div id="sidebar-resizer" title="Drag to resize the sidebar (double-click to reset)"></div>
 
       <main id="workspace">
         <header id="board-bar">
@@ -199,12 +228,18 @@
           <section class="settings-panel hidden" data-panel="voice">
             <p class="voice-intro">
               Dictate straight into the focused thread — transcribed text is typed at
-              the cursor when you pause. Speech is recognized on-device by Moonshine
-              (English), fully offline. Press the <kbd>~</kbd> key any time to start
-              or stop listening. You can start speaking immediately — words spoken
-              while the model is still loading are kept, and toggling off still types
-              whatever you had just said.
+              the cursor when you pause. Speech is recognized on-device (English),
+              fully offline. Press the <kbd>~</kbd> key any time to start or stop
+              listening. You can start speaking immediately — words spoken while the
+              model is still loading are kept, and toggling off still types whatever
+              you had just said.
             </p>
+
+            <label class="voice-model-row">Recognition model
+              <select id="voice-model" title="Speech-to-text model"></select>
+              <small>The default is bundled; other models download once (a few tens of
+                MB) the first time you pick them, then run offline.</small>
+            </label>
 
             <div class="voice-settings-grid">
               <label class="voice-check">
@@ -263,17 +298,22 @@
                 <strong><svg class="help-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z" /></svg> Explorer</strong>
                 and
                 <strong><svg class="help-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><line x1="6" y1="3" x2="6" y2="15" /><circle cx="18" cy="6" r="3" /><circle cx="6" cy="18" r="3" /><path d="M18 9a9 9 0 0 1-9 9" /></svg> Source Control</strong>
-                buttons to browse files and manage Git.</li>
+                buttons to browse files and manage Git, and the
+                <strong><svg class="help-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" /><path d="M14 2v6h6" /><line x1="8" y1="13" x2="16" y2="13" /><line x1="8" y1="17" x2="13" y2="17" /></svg> Plan</strong>
+                button to review the focused thread's plan.</li>
+              <li><strong>Drag the sidebar's right edge</strong> to make it (and the Explorer, Source Control and Plan panels docked in it) wider or narrower. Double-click the edge to reset the width; it's remembered across restarts.</li>
             </ol>
           </div>
 
           <div class="settings-group">
             <div class="settings-group-title">Threads</div>
             <ul class="help-list">
-              <li><strong>🎤 Voice typing</strong> — dictate into the focused thread; speech is transcribed on-device by Moonshine (English, fully offline) and typed at the cursor when you pause. Toggle with the <kbd>~</kbd> key. You can start speaking right away — words spoken while the model loads are kept, and toggling off still types what you had just said. If the HUD says “Didn’t catch that”, the model heard you but couldn’t make out words. Use the user dictionary in <strong>⚙ Settings → Voice</strong> to fix words it mishears.</li>
-              <li>Each thread's header shows a <strong>caption</strong> built from the last prompt you send it, so you can see what every thread is working on at a glance. Once a thread has a caption it takes over as the header title and the default <em>claude&nbsp;#</em> name is hidden. Double-click the title to rename a thread — a name you set yourself always stays shown.</li>
+              <li><strong>🎤 Voice typing</strong> — dictate into the focused thread; speech is transcribed on-device (English, fully offline) and typed at the cursor when you pause. Toggle with the <kbd>~</kbd> key. You can start speaking right away — words spoken while the model loads are kept, and toggling off still types what you had just said. If the HUD says “Didn’t catch that”, the model heard you but couldn’t make out words. In <strong>⚙ Settings → Voice</strong> you can pick the <strong>recognition model</strong> (the default Moonshine model is bundled; others download once, then run offline) and use the user dictionary to fix words it mishears.</li>
+              <li>Each thread's header shows a <strong>caption</strong> built from the last prompt you send it, so you can see what every thread is working on at a glance. Short replies like <em>yes</em>, <em>no</em> or a menu number don't replace the caption, so answering a prompt keeps the real task on show. Once a thread has a caption it takes over as the header title and the default <em>claude&nbsp;#</em> name is hidden. Double-click the title to rename a thread — a name you set yourself always stays shown.</li>
               <li>Each thread can run a different <strong>agent</strong> — pick <em>Claude</em>, <em>ChatGPT</em>, or <em>Gemini</em> from the dropdown in the thread header. One hive can mix them (e.g. three Claude threads and one ChatGPT thread). Switching a running thread restarts it with the new agent. ChatGPT needs OpenAI's Codex CLI (<code>npm install -g @openai/codex</code>) and Gemini needs Google's Gemini CLI (<code>npm install -g @google/gemini-cli</code>) installed and signed in; the model dropdown applies to Claude threads only.</li>
+              <li>Each Claude thread has a <strong>permission mode</strong> dropdown in its header — <em>Default</em>, <em>Accept&nbsp;Edits</em>, <em>Plan</em>, or <em>Bypass&nbsp;⚠</em> — so you can see and set the mode without hunting for it in Claude's own display. It's handed to Claude Code as a startup flag (<em>Bypass</em> skips the accept-permissions screen entirely). Since Claude has no command to change mode mid-session, switching a running thread restarts it (resuming the conversation when there is one). <em>Bypass</em> turns the dropdown amber as a reminder that permissions are being skipped. The choice is remembered as the default for new threads.</li>
               <li>Change a thread's model or font from its header, or with <kbd>A−</kbd>/<kbd>A+</kbd> and <kbd>Ctrl</kbd>+scroll.</li>
+              <li><strong>⛶ Maximize</strong> (or <kbd>Ctrl</kbd>+<kbd>Enter</kbd>) blows the focused thread up to fill the hive. A <strong>tab strip</strong> appears across the top listing every other thread — each with a live status dot — so you can see what's hidden behind it and click a tab to jump straight to that thread. Press <kbd>Ctrl</kbd>+<kbd>Enter</kbd> or ⛶ again to restore the tiled layout.</li>
             </ul>
           </div>
 
@@ -287,10 +327,25 @@
           </div>
 
           <div class="settings-group">
+            <div class="settings-group-title">Plan</div>
+            <ul class="help-list">
+              <li>The <strong>Plan</strong> panel shows the <em>focused thread's</em> plan as formatted markdown. Each thread has its own plan — switch threads and the panel follows.</li>
+              <li>Click <strong>⟳</strong> in the panel header to ask the focused thread to (re)write its plan. It types a request into that thread; Claude writes the plan to <code>.hivemind/plans/</code> in your project and the panel renders it automatically. The panel confirms with <em>“Plan updated ✓”</em> once the thread writes the file (<code>.hivemind/</code> is added to your <code>.gitignore</code> so plans stay out of Source Control).</li>
+              <li>Plans render as rich markdown — headings, tables, links (which open in your browser), block quotes and task lists. <strong>Tick a checkbox</strong> in a <code>- [ ]</code> task list to mark it done; the change is written straight back to the plan file.</li>
+              <li><strong>Highlight any text</strong> in the plan and click <strong>＋ Comment</strong> to attach a note to it — like review comments on a document. Comments are saved with the project, so they survive restarts.</li>
+              <li><strong>Send comments to thread</strong> types your comments (each with the text it refers to) into the focused thread, so Claude can revise the plan. This closes the loop: comment → revise → refresh.</li>
+              <li>Click <strong>🗑</strong> in the panel header to clear this thread's plan and all its comments, resetting the panel to empty. This deletes the files from <code>.hivemind/plans/</code> and cannot be undone.</li>
+            </ul>
+          </div>
+
+          <div class="settings-group">
             <div class="settings-group-title">Shortcuts</div>
             <ul class="help-list">
               <li><kbd>~</kbd> — start / stop voice typing</li>
               <li><kbd>Ctrl</kbd>+<kbd>F</kbd> — find in the focused thread</li>
+              <li><kbd>Ctrl</kbd>+<kbd>Enter</kbd> — maximize / restore the focused thread</li>
+              <li><kbd>Ctrl</kbd>+<kbd>1</kbd>…<kbd>9</kbd> — focus the 1st–9th thread on the hive</li>
+              <li><kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>]</kbd> / <kbd>[</kbd> — cycle focus to the next / previous thread</li>
               <li><kbd>A−</kbd> / <kbd>A+</kbd> or <kbd>Ctrl</kbd>+scroll — change the focused thread's font size</li>
               <li><kbd>Esc</kbd> — close the open dialog</li>
             </ul>

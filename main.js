@@ -1,6 +1,6 @@
 'use strict';
 
-const { app, BrowserWindow, Menu, MenuItem, ipcMain, dialog, Notification, clipboard, protocol, net } = require('electron');
+const { app, BrowserWindow, Menu, MenuItem, ipcMain, dialog, Notification, clipboard, protocol, net, shell } = require('electron');
 const path = require('path');
 const { pathToFileURL } = require('url');
 const fs = require('fs');
@@ -24,14 +24,36 @@ app.commandLine.appendSwitch('enable-features', 'SharedArrayBuffer');
 // hosts map to three on-disk roots (all inside the app, dev or packaged):
 //   hm://app/...     -> src/                                  (the worker)
 //   hm://vendor/...  -> node_modules/@huggingface/transformers/dist/
-//   hm://models/...  -> models/                               (bundled model)
+//   hm://models/...  -> userData/models/ then models/         (see below)
 // The scheme must be registered before app "ready"; see registerSchemes...
 // below. The handler is installed in whenReady().
+//
+// Each host maps to an *ordered list* of on-disk roots; the first root that
+// actually contains the requested file wins. Only `models` uses more than one:
+// speech models the user downloads on demand land in userData/models (writable,
+// survives app updates) and shadow the bundled models/ that ships the default.
 // ---------------------------------------------------------------------------
 const HM_ROOTS = {
-  app: () => path.join(__dirname, 'src'),
-  vendor: () => path.join(__dirname, 'node_modules', '@huggingface', 'transformers', 'dist'),
-  models: () => path.join(__dirname, 'models'),
+  app: () => [path.join(__dirname, 'src')],
+  vendor: () => [path.join(__dirname, 'node_modules', '@huggingface', 'transformers', 'dist')],
+  models: () => [path.join(app.getPath('userData'), 'models'), path.join(__dirname, 'models')],
+};
+
+// Speech models fetched on demand (see the 'stt:ensureModel' IPC). The default
+// Moonshine model is bundled and is NOT listed here. Each entry lists the exact
+// files transformers.js asks for at q8: the config/tokenizer JSON plus the two
+// quantized ONNX graphs. Keep this in sync with the STT_MODELS registry in
+// renderer.js — a repo the renderer offers but omits here can never download.
+const STT_DOWNLOADS = {
+  'onnx-community/whisper-base.en': [
+    'config.json',
+    'generation_config.json',
+    'preprocessor_config.json',
+    'tokenizer.json',
+    'tokenizer_config.json',
+    'onnx/encoder_model_quantized.onnx',
+    'onnx/decoder_model_merged_quantized.onnx',
+  ],
 };
 
 const HM_MIME = {
@@ -50,15 +72,18 @@ function registerHmProtocol() {
   protocol.handle('hm', async (request) => {
     try {
       const url = new URL(request.url);
-      const rootFn = HM_ROOTS[url.host];
-      if (!rootFn) return new Response('Not found', { status: 404 });
-      const root = rootFn();
-      // Decode and normalize, then guard against path traversal outside root.
+      const rootsFn = HM_ROOTS[url.host];
+      if (!rootsFn) return new Response('Not found', { status: 404 });
+      // Decode and normalize once, then try each root in order. Each candidate
+      // is traversal-guarded against its own root; the first existing file wins.
       const rel = decodeURIComponent(url.pathname).replace(/^\/+/, '');
-      const abs = path.normalize(path.join(root, rel));
-      if (abs !== root && !abs.startsWith(root + path.sep)) {
-        return new Response('Forbidden', { status: 403 });
+      let abs = null;
+      for (const root of rootsFn()) {
+        const cand = path.normalize(path.join(root, rel));
+        if (cand !== root && !cand.startsWith(root + path.sep)) continue; // traversal
+        if (fs.existsSync(cand)) { abs = cand; break; }
       }
+      if (!abs) return new Response('Not found', { status: 404 });
       const res = await net.fetch(pathToFileURL(abs).toString());
       const headers = new Headers(res.headers);
       const ext = path.extname(abs).toLowerCase();
@@ -74,6 +99,7 @@ function registerHmProtocol() {
 const pty = require('@homebridge/node-pty-prebuilt-multiarch');
 const git = require('./git');
 const files = require('./files');
+const plan = require('./plan');
 const build = require('./build');
 const usage = require('./usage');
 
@@ -117,7 +143,7 @@ function defaultShell() {
   return process.env.SHELL || 'bash';
 }
 
-function spawnPty({ id, cwd, cols, rows, startupCommand, model, resume }, win) {
+function spawnPty({ id, cwd, cols, rows, startupCommand, model, resume, permissionMode }, win) {
   const shell = defaultShell();
   let safeCwd = cwd;
   try {
@@ -153,6 +179,18 @@ function spawnPty({ id, cwd, cols, rows, startupCommand, model, resume }, win) {
   // etc. still work). Skip for "default" and for non-claude startup commands.
   if (model && model !== 'default' && /^[a-z0-9-]+$/i.test(model)) {
     cmd = cmd.replace(/^claude(\.exe)?\b/i, (m) => `${m} --model ${model}`);
+  }
+  // Permission mode: hand the choice to Claude Code as a startup flag. "default"
+  // adds nothing; "bypass" uses the dedicated skip flag so the thread never shows
+  // the accept-permissions screen. Only meaningful for the `claude` command.
+  const permFlag = {
+    acceptEdits: '--permission-mode acceptEdits',
+    plan: '--permission-mode plan',
+    bypass: '--dangerously-skip-permissions',
+  }[permissionMode];
+  if (permFlag && /^claude(\.exe)?\b/i.test(cmd) &&
+      !/--permission-mode\b|--dangerously-skip-permissions\b/.test(cmd)) {
+    cmd = cmd.replace(/^claude(\.exe)?\b/i, (m) => `${m} ${permFlag}`);
   }
   // Restoring a saved session: continue the most recent conversation in this
   // directory. Only meaningful for the `claude` command.
@@ -312,7 +350,7 @@ function createWindow() {
 
 app.whenReady().then(() => {
   // Required on Windows for native notifications to show the app name/icon.
-  if (process.platform === 'win32') app.setAppUserModelId('com.hivemind.app');
+  if (process.platform === 'win32') app.setAppUserModelId('com.mikem.hivemind');
 
   // Serve the speech-to-text assets over hm:// (see top of file).
   registerHmProtocol();
@@ -472,10 +510,68 @@ app.whenReady().then(() => {
   ipcMain.handle('files:open', (_e, { cwd, rel }) => files.open(cwd, rel));
   ipcMain.handle('files:reveal', (_e, { cwd, rel }) => files.reveal(cwd, rel));
 
+  // -- IPC: Plan pane ---------------------------------------------------------
+  // The thread writes its plan to `.hivemind/plans/<planId>.md`; Hivemind reads
+  // it and stores highlight-comments in a sidecar JSON alongside it.
+  ipcMain.handle('plan:read', (_e, { cwd, planId }) => plan.readPlan(cwd, planId));
+  ipcMain.handle('plan:write', (_e, { cwd, planId, content }) => plan.writePlan(cwd, planId, content));
+  ipcMain.handle('plan:comments:read', (_e, { cwd, planId }) => plan.readComments(cwd, planId));
+  ipcMain.handle('plan:comments:write', (_e, { cwd, planId, comments }) => plan.writeComments(cwd, planId, comments));
+  ipcMain.handle('plan:clear', (_e, { cwd, planId }) => plan.clearPlan(cwd, planId));
+  // Add `.hivemind/` to the project's .gitignore so plan files stay out of Git.
+  ipcMain.handle('plan:ensureIgnored', (_e, { cwd }) => plan.ensureIgnored(cwd));
+
+  // -- IPC: open an external link in the OS browser ---------------------------
+  // Plan markdown can contain links; the file:// renderer can't navigate to them
+  // safely, so route through the OS. Restricted to web / mail schemes.
+  ipcMain.handle('open:external', (_e, { url }) => {
+    try {
+      const u = new URL(String(url));
+      if (!['http:', 'https:', 'mailto:'].includes(u.protocol)) return { ok: false };
+      shell.openExternal(u.href);
+      return { ok: true };
+    } catch (_) {
+      return { ok: false };
+    }
+  });
+
   // -- IPC: Claude usage ------------------------------------------------------
   // Snapshot of the account's rate-limit windows (same data as Claude Code's
   // /usage screen) plus today's token totals from the local transcripts.
   ipcMain.handle('usage:get', () => usage.getUsage());
+
+  // -- IPC: speech models (download on first use) ---------------------------
+  // The default speech model (Moonshine) ships bundled under models/. Any other
+  // model the user picks is fetched from the Hugging Face Hub into userData/models
+  // the first time it's selected, then served offline over hm://models forever
+  // after (the protocol handler above prefers userData). Renderer calls this and
+  // waits for { ok:true } before booting the worker with that model.
+  ipcMain.handle('stt:ensureModel', async (evt, { repo }) => {
+    const files = STT_DOWNLOADS[repo];
+    if (!files) return { ok: true, alreadyPresent: true };   // bundled/default: nothing to fetch
+    const dest = path.join(app.getPath('userData'), 'models', repo);
+    if (files.every((f) => fs.existsSync(path.join(dest, f)))) {
+      return { ok: true, alreadyPresent: true };
+    }
+    try {
+      for (let i = 0; i < files.length; i++) {
+        const f = files[i];
+        const out = path.join(dest, f);
+        if (fs.existsSync(out)) continue;
+        const res = await net.fetch(`https://huggingface.co/${repo}/resolve/main/${f}`);
+        if (!res.ok) throw new Error(`${f}: HTTP ${res.status} ${res.statusText}`);
+        const buf = Buffer.from(await res.arrayBuffer());
+        fs.mkdirSync(path.dirname(out), { recursive: true });
+        fs.writeFileSync(out, buf);
+        if (evt.sender && !evt.sender.isDestroyed()) {
+          evt.sender.send('stt:downloadProgress', { repo, done: i + 1, total: files.length });
+        }
+      }
+      return { ok: true, alreadyPresent: false };
+    } catch (err) {
+      return { ok: false, error: (err && err.message) || String(err) };
+    }
+  });
 
   // -- IPC: portable build --------------------------------------------------
   // Detect whether a hive's directory is the Hivemind source checkout, and (if
@@ -496,12 +592,29 @@ app.whenReady().then(() => {
     }
   });
 
+  sweepOldTempImages();
   createWindow();
 
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow();
   });
 });
+
+// Pasted/dropped screenshots are persisted to os.tmpdir()/hivemind-images so
+// Claude Code can read them by path; nothing else ever deletes them. Sweep files
+// older than a week on startup so the temp dir doesn't grow without bound.
+function sweepOldTempImages() {
+  try {
+    const dir = path.join(os.tmpdir(), 'hivemind-images');
+    const cutoff = Date.now() - 7 * 24 * 60 * 60 * 1000;
+    for (const name of fs.readdirSync(dir)) {
+      const file = path.join(dir, name);
+      try {
+        if (fs.statSync(file).mtimeMs < cutoff) fs.unlinkSync(file);
+      } catch (_) { /* skip files we can't stat/remove */ }
+    }
+  } catch (_) { /* no temp dir yet, or unreadable — nothing to sweep */ }
+}
 
 app.on('window-all-closed', () => {
   for (const { proc } of ptys.values()) {
