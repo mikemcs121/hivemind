@@ -464,10 +464,6 @@ function setPaneState(pane, state) {
   refreshZoomTabs(pane.board.id);
   updateChatBanner(pane);
 
-  // A kanban card dispatched this thread: keep the card in step (live status
-  // dot; finished turn moves the card to Done).
-  if (typeof kanbanOnPaneState === 'function') kanbanOnPaneState(pane, state, prev);
-
   // Notify on the transitions that pull a human back: a terminal asking for
   // input, hitting an error, or finishing a turn while the window is backgrounded.
   const focusedHere = pane === focusedPane && document.hasFocus();
@@ -2302,8 +2298,6 @@ function selectBoard(id) {
   if (typeof planOnBoardChange === 'function') planOnBoardChange();
   if (typeof todoToggle !== 'undefined' && todoToggle) todoToggle.disabled = false;
   if (typeof todoOnBoardChange === 'function') todoOnBoardChange();
-  if (typeof kanbanToggle !== 'undefined' && kanbanToggle) kanbanToggle.disabled = false;
-  if (typeof kanbanOnBoardChange === 'function') kanbanOnBoardChange();
   fitBoard(id);
 }
 
@@ -3139,12 +3133,7 @@ function showEmpty() {
     todoToggle.classList.remove('active');
   }
   if (typeof todoPanel !== 'undefined' && todoPanel) todoPanel.classList.add('hidden');
-  if (typeof kanbanToggle !== 'undefined' && kanbanToggle) {
-    kanbanToggle.disabled = true;
-    kanbanToggle.classList.remove('active');
-  }
-  if (typeof kanbanPanel !== 'undefined' && kanbanPanel) kanbanPanel.classList.add('hidden');
-  const sb = $('sidebar'); if (sb) sb.classList.remove('git-open', 'files-open', 'plan-open', 'todo-open', 'kanban-open');
+  const sb = $('sidebar'); if (sb) sb.classList.remove('git-open', 'files-open', 'plan-open', 'todo-open');
 }
 
 // ---------------------------------------------------------------------------
@@ -3237,13 +3226,6 @@ window.api.onFsChanged(({ cwd }) => {
   if (typeof todoPanelOpen === 'function' && todoPanelOpen() &&
       !(document.activeElement && todoPanel.contains(document.activeElement))) {
     refreshTodo();
-  }
-  // Kanban cards may have changed on disk (a thread edited kanban.json).
-  // Re-render unless the user is mid-drag or mid-edit in the panel.
-  if (typeof kanbanPanelOpen === 'function' && kanbanPanelOpen() && !kanbanDragId &&
-      !(document.activeElement && kanbanPanel.contains(document.activeElement) &&
-        document.activeElement.tagName === 'INPUT')) {
-    refreshKanban();
   }
 });
 
@@ -3367,7 +3349,6 @@ function setGitOpen(open) {
   if (open && typeof setFilesOpen === 'function') setFilesOpen(false); // one panel at a time
   if (open && typeof setPlanOpen === 'function') setPlanOpen(false);
   if (open && typeof setTodoOpen === 'function') setTodoOpen(false);
-  if (open && typeof setKanbanOpen === 'function') setKanbanOpen(false);
   gitPanel.classList.toggle('hidden', !open);
   gitToggle.classList.toggle('active', open);
   sidebarEl.classList.toggle('git-open', open); // board list yields its space
@@ -3678,8 +3659,8 @@ async function doPush() {
 let gitDraftMsg = '';
 
 // Ask Claude to draft a commit message from the current diff and drop it into
-// the message box. Reuses the focused thread's terminal? No — runs a one-shot
-// `claude -p` in the project dir via the main process.
+// the message box. Runs a one-shot `claude -p` via the main process (in a
+// scratch dir, so the session never shows up in the hive's chat threads).
 async function doGenerateCommitMsg(btn) {
   const dir = activeDir();
   if (!dir) { setGitMsg('This hive has no project directory set.', 'err'); return; }
@@ -3802,7 +3783,6 @@ function setFilesOpen(open) {
   if (open) setGitOpen(false); // one panel at a time
   if (open && typeof setPlanOpen === 'function') setPlanOpen(false);
   if (open && typeof setTodoOpen === 'function') setTodoOpen(false);
-  if (open && typeof setKanbanOpen === 'function') setKanbanOpen(false);
   filesPanel.classList.toggle('hidden', !open);
   filesToggle.classList.toggle('active', open);
   sidebarEl.classList.toggle('files-open', open); // board list yields its space
@@ -3968,7 +3948,6 @@ function setTodoOpen(open) {
     setGitOpen(false);
     setFilesOpen(false);
     if (typeof setPlanOpen === 'function') setPlanOpen(false);
-    if (typeof setKanbanOpen === 'function') setKanbanOpen(false);
   }
   todoPanel.classList.toggle('hidden', !open);
   todoToggle.classList.toggle('active', open);
@@ -4281,367 +4260,6 @@ $('todo-clear-done').onclick = () => {
   saveTodo();
   renderTodo({ ok: true });
 };
-
-// ---------------------------------------------------------------------------
-// Board panel (Kanban)
-//
-// A per-hive kanban — To do / In progress / Done — whose cards dispatch
-// threads: ▶ (or dragging a card into "In progress") opens a new Claude
-// thread with the card's text as its initial prompt. A dispatched card
-// follows its thread: it shows the thread's live status dot, clicking it
-// jumps to the thread, and when the thread finishes its turn the card moves
-// to Done on its own (setPaneState calls kanbanOnPaneState on the busy→idle
-// transition). Cards live in `.hivemind/kanban.json`, shared per-hive like
-// todos. Card→thread links are held in memory only — threads don't survive a
-// restart, so a card left "In progress" simply offers ▶ again.
-// ---------------------------------------------------------------------------
-const kanbanToggle = $('kanban-toggle');
-const kanbanPanel = $('kanban-panel');
-const kanbanBody = $('kanban-body');
-const kanbanMsgbar = $('kanban-msgbar');
-const kanbanInput = $('kanban-input');
-
-const KANBAN_LANES = [
-  { key: 'todo', label: 'To do' },
-  { key: 'doing', label: 'In progress' },
-  { key: 'done', label: 'Done' },
-];
-
-let kanbanCards = [];    // [{ id, text, status: 'todo'|'doing'|'done' }]
-let kanbanDragId = null; // card id mid-drag (also suppresses fs re-renders)
-const kanbanLinks = new Map(); // card id -> { pane, dir } for this session's dispatches
-
-function kanbanPanelOpen() { return kanbanPanel && !kanbanPanel.classList.contains('hidden'); }
-
-function setKanbanMsg(text, kind) {
-  if (!text) { kanbanMsgbar.classList.add('hidden'); kanbanMsgbar.textContent = ''; return; }
-  kanbanMsgbar.textContent = text;
-  kanbanMsgbar.className = 'git-msgbar' + (kind ? ' ' + kind : '');
-}
-
-function setKanbanOpen(open) {
-  if (open) { // one panel at a time
-    setGitOpen(false);
-    setFilesOpen(false);
-    if (typeof setPlanOpen === 'function') setPlanOpen(false);
-    if (typeof setTodoOpen === 'function') setTodoOpen(false);
-  }
-  kanbanPanel.classList.toggle('hidden', !open);
-  kanbanToggle.classList.toggle('active', open);
-  sidebarEl.classList.toggle('kanban-open', open); // board list yields its space
-}
-
-kanbanToggle.onclick = () => {
-  const open = kanbanPanel.classList.contains('hidden');
-  setKanbanOpen(open);
-  if (open) refreshKanban();
-};
-$('kanban-close').onclick = () => setKanbanOpen(false);
-$('kanban-refresh').onclick = () => refreshKanban();
-
-function kanbanOnBoardChange() { if (kanbanPanelOpen()) refreshKanban(); }
-
-// Cards written by hand (or by a thread) may be missing fields; make each one
-// renderable and give it an id so drag/drop and links can address it.
-function normalizeKanban(list) {
-  if (!Array.isArray(list)) return [];
-  return list
-    .filter((c) => c && typeof c.text === 'string' && c.text.trim())
-    .map((c) => ({
-      id: typeof c.id === 'string' && c.id ? c.id : nextId('card'),
-      text: c.text,
-      status: ['todo', 'doing', 'done'].includes(c.status) ? c.status : 'todo',
-    }));
-}
-
-async function refreshKanban() {
-  if (!kanbanPanelOpen()) return;
-  setKanbanMsg('');
-  const dir = activeDir();
-  if (!dir) { kanbanCards = []; renderKanban({ ok: false, reason: 'no-dir' }); return; }
-  const res = await window.api.kanban.read(dir);
-  kanbanCards = (res && res.ok) ? normalizeKanban(res.cards) : [];
-  renderKanban(res);
-}
-
-// Persist the current cards. `.hivemind/` is kept out of Git the same way
-// plans/todos are. Failures surface in the message bar but keep the in-memory list.
-async function saveKanban() {
-  const dir = activeDir();
-  if (!dir) return;
-  window.api.kanban.ensureIgnored(dir);
-  const res = await window.api.kanban.write(dir, kanbanCards);
-  if (!res || !res.ok) setKanbanMsg((res && res.message) || 'Could not save the board.', 'err');
-  else setKanbanMsg('');
-}
-
-function addKanbanCard(text) {
-  const t = (text || '').trim();
-  if (!t || !activeDir()) return;
-  kanbanCards.push({ id: nextId('card'), text: t, status: 'todo' });
-  saveKanban();
-  renderKanban({ ok: true });
-}
-
-// The pane a card dispatched, if it is still alive on some hive.
-function kanbanLivePane(cardId) {
-  const link = kanbanLinks.get(cardId);
-  if (!link || link.pane.disposed || link.pane.state === 'dead') return null;
-  return link.pane;
-}
-
-// ▶ — open a new thread on the active hive working on the card's text. The
-// prompt rides along as claude's positional argument (same path as "Hivemind,
-// open a new thread and…"), so the thread starts on it the moment it boots.
-function dispatchKanbanCard(card) {
-  const board = activeBoard();
-  if (!board) { setKanbanMsg('No hive is open.', 'err'); return; }
-  const p = addTerminal(board, { initialPrompt: card.text });
-  if (!p) { setKanbanMsg('Could not open a thread.', 'err'); return; }
-  setPaneCaption(p, card.text);
-  card.status = 'doing';
-  kanbanLinks.set(card.id, { pane: p, dir: board.dir });
-  saveKanban();
-  renderKanban({ ok: true });
-}
-
-// Drag/drop between lanes. Dropping onto "In progress" dispatches unless the
-// card already has a live thread; leaving "In progress" detaches the thread
-// (it keeps running — the card just stops following it).
-function moveKanbanCard(card, lane) {
-  if (lane === 'doing') {
-    if (!kanbanLivePane(card.id)) { dispatchKanbanCard(card); return; }
-    card.status = 'doing';
-  } else {
-    kanbanLinks.delete(card.id);
-    card.status = lane;
-  }
-  saveKanban();
-  renderKanban({ ok: true });
-}
-
-// Called from setPaneState for every pane transition. If the pane belongs to a
-// dispatched card: a finished turn (busy → idle) completes the card; any other
-// change just refreshes the card's status dot.
-function kanbanOnPaneState(pane, state, prev) {
-  let cardId = null, link = null;
-  for (const [cid, l] of kanbanLinks) {
-    if (l.pane === pane) { cardId = cid; link = l; break; }
-  }
-  if (!cardId) return;
-  if (state === 'idle' && prev === 'busy') {
-    kanbanLinks.delete(cardId);
-    kanbanCardDone(link.dir, cardId);
-    return;
-  }
-  if (kanbanPanelOpen() && !kanbanDragId) renderKanban({ ok: true });
-}
-
-// Move a dispatched card to Done. The panel may be closed or showing another
-// hive when the thread finishes, so fall back to read-modify-write on the file
-// the card came from.
-async function kanbanCardDone(dir, cardId) {
-  if (kanbanPanelOpen() && activeDir() === dir) {
-    const card = kanbanCards.find((c) => c.id === cardId);
-    if (card && card.status === 'doing') {
-      card.status = 'done';
-      await saveKanban();
-      if (!kanbanDragId) renderKanban({ ok: true });
-    }
-    return;
-  }
-  const res = await window.api.kanban.read(dir);
-  if (!res || !res.ok) return;
-  const cards = normalizeKanban(res.cards);
-  const card = cards.find((c) => c.id === cardId);
-  if (!card || card.status !== 'doing') return;
-  card.status = 'done';
-  await window.api.kanban.write(dir, cards);
-}
-
-// Swap a card's label for an inline text editor; Enter/blur commits, Esc cancels.
-function startEditKanban(card, span) {
-  const input = document.createElement('input');
-  input.type = 'text';
-  input.className = 'kb-edit';
-  input.value = card.text;
-  let committed = false;
-  const finish = (cancel) => {
-    if (committed) return;
-    committed = true;
-    const t = input.value.trim();
-    if (!cancel && t) card.text = t;
-    saveKanban();
-    renderKanban({ ok: true });
-  };
-  input.onkeydown = (e) => {
-    if (e.key === 'Enter') { e.preventDefault(); finish(false); }
-    else if (e.key === 'Escape') { finish(true); }
-  };
-  input.onblur = () => finish(false);
-  span.replaceWith(input);
-  input.focus();
-  input.select();
-}
-
-function buildKanbanCard(card) {
-  const el = document.createElement('div');
-  el.className = 'kb-card' + (card.status === 'done' ? ' done' : '');
-  el.draggable = true;
-  el.ondragstart = (e) => {
-    kanbanDragId = card.id;
-    el.classList.add('dragging');
-    try {
-      e.dataTransfer.setData('text/plain', card.id);
-      e.dataTransfer.effectAllowed = 'move';
-    } catch (_) { /* ignore */ }
-  };
-  el.ondragend = () => { kanbanDragId = null; el.classList.remove('dragging'); };
-
-  const live = kanbanLivePane(card.id);
-  if (card.status === 'doing') {
-    const dot = document.createElement('span');
-    dot.className = 'dot ' + (live ? (live.state || 'idle') : 'dead');
-    dot.title = live
-      ? 'Thread: ' + paneLabel(live)
-      : 'The dispatched thread is gone (closed, or from a previous session)';
-    el.appendChild(dot);
-    if (live) {
-      el.classList.add('linked');
-      el.title = 'Click to jump to the thread working on this card';
-      el.onclick = () => focusPane(live);
-    }
-  }
-
-  const span = document.createElement('span');
-  span.className = 'kb-text';
-  span.textContent = card.text;
-  if (card.status !== 'done') {
-    span.title = (span.title ? span.title + ' — ' : '') + 'Double-click to edit';
-    span.ondblclick = (e) => { e.stopPropagation(); startEditKanban(card, span); };
-  }
-  el.appendChild(span);
-
-  if (card.status === 'todo' || (card.status === 'doing' && !live)) {
-    const go = document.createElement('button');
-    go.className = 'kb-go';
-    go.textContent = '▶';
-    go.title = card.status === 'todo'
-      ? 'Dispatch: open a new thread working on this card'
-      : 'Dispatch again in a new thread';
-    go.onclick = (e) => { e.stopPropagation(); dispatchKanbanCard(card); };
-    el.appendChild(go);
-  }
-  if (card.status === 'doing') {
-    const done = document.createElement('button');
-    done.className = 'kb-done';
-    done.textContent = '✓';
-    done.title = 'Mark done';
-    done.onclick = (e) => { e.stopPropagation(); moveKanbanCard(card, 'done'); };
-    el.appendChild(done);
-  }
-
-  const del = document.createElement('button');
-  del.className = 'kb-del';
-  del.textContent = '✕';
-  del.title = 'Delete card';
-  del.onclick = (e) => {
-    e.stopPropagation();
-    kanbanLinks.delete(card.id);
-    kanbanCards = kanbanCards.filter((c) => c !== card);
-    saveKanban();
-    renderKanban({ ok: true });
-  };
-  el.appendChild(del);
-
-  return el;
-}
-
-function renderKanban(res) {
-  kanbanBody.innerHTML = '';
-  if (res && !res.ok && res.reason === 'no-dir') {
-    const wrap = document.createElement('div');
-    wrap.className = 'git-empty';
-    wrap.textContent = 'This hive has no project directory set. Edit the hive to choose one.';
-    kanbanBody.appendChild(wrap);
-    renderKanbanFooter();
-    return;
-  }
-  for (const lane of KANBAN_LANES) {
-    const cards = kanbanCards.filter((c) => c.status === lane.key);
-
-    const sec = document.createElement('section');
-    sec.className = 'kb-lane';
-    sec.ondragover = (e) => {
-      if (!kanbanDragId) return;
-      e.preventDefault();
-      sec.classList.add('drag-over');
-    };
-    sec.ondragleave = () => sec.classList.remove('drag-over');
-    sec.ondrop = (e) => {
-      e.preventDefault();
-      sec.classList.remove('drag-over');
-      const card = kanbanCards.find((c) => c.id === kanbanDragId);
-      kanbanDragId = null;
-      if (card && card.status !== lane.key) moveKanbanCard(card, lane.key);
-    };
-
-    const head = document.createElement('div');
-    head.className = 'kb-lane-head';
-    const label = document.createElement('span');
-    label.textContent = lane.label;
-    const count = document.createElement('span');
-    count.className = 'kb-lane-count';
-    count.textContent = String(cards.length);
-    head.append(label, count);
-    sec.appendChild(head);
-
-    const list = document.createElement('div');
-    list.className = 'kb-cards';
-    for (const card of cards) list.appendChild(buildKanbanCard(card));
-    if (!cards.length) {
-      const hint = document.createElement('div');
-      hint.className = 'kb-hint';
-      hint.textContent = lane.key === 'todo'
-        ? 'Add a card above to get started.'
-        : (lane.key === 'doing'
-          ? 'Drop a card here (or click its ▶) to dispatch a thread.'
-          : 'Finished cards land here.');
-      list.appendChild(hint);
-    }
-    sec.appendChild(list);
-    kanbanBody.appendChild(sec);
-  }
-  renderKanbanFooter();
-}
-
-// Footer: "<done>/<total> done" plus "Clear done" when relevant.
-function renderKanbanFooter() {
-  const footer = $('kanban-footer');
-  const countEl = $('kanban-count');
-  const clearBtn = $('kanban-clear-done');
-  if (!footer || !countEl || !clearBtn) return;
-  const total = kanbanCards.length;
-  const done = kanbanCards.filter((c) => c.status === 'done').length;
-  if (!total) { footer.classList.add('hidden'); return; }
-  footer.classList.remove('hidden');
-  countEl.textContent = `${done}/${total} done`;
-  clearBtn.style.display = done ? '' : 'none';
-}
-
-if (kanbanInput) {
-  kanbanInput.onkeydown = (e) => {
-    if (e.key === 'Enter') { e.preventDefault(); addKanbanCard(kanbanInput.value); kanbanInput.value = ''; }
-  };
-}
-$('kanban-add').onclick = () => { addKanbanCard(kanbanInput.value); kanbanInput.value = ''; kanbanInput.focus(); };
-$('kanban-clear-done').onclick = () => {
-  for (const c of kanbanCards) if (c.status === 'done') kanbanLinks.delete(c.id);
-  kanbanCards = kanbanCards.filter((c) => c.status !== 'done');
-  saveKanban();
-  renderKanban({ ok: true });
-};
-
 // ---------------------------------------------------------------------------
 // Plan panel
 //
@@ -4681,7 +4299,6 @@ function setPlanOpen(open) {
     setGitOpen(false);
     setFilesOpen(false);
     if (typeof setTodoOpen === 'function') setTodoOpen(false);
-    if (typeof setKanbanOpen === 'function') setKanbanOpen(false);
   }
   planPanel.classList.toggle('hidden', !open);
   planToggle.classList.toggle('active', open);

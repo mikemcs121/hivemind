@@ -110,14 +110,6 @@ contextBridge.exposeInMainWorld('api', {
     ensureIgnored: (cwd) => ipcRenderer.invoke('todo:ensureIgnored', { cwd }),
   },
 
-  // Board panel (kanban). `cwd` is the active board's project directory; the
-  // cards are shared per-hive (one `.hivemind/kanban.json`), not per-thread.
-  kanban: {
-    read: (cwd) => ipcRenderer.invoke('kanban:read', { cwd }),
-    write: (cwd, cards) => ipcRenderer.invoke('kanban:write', { cwd, cards }),
-    ensureIgnored: (cwd) => ipcRenderer.invoke('kanban:ensureIgnored', { cwd }),
-  },
-
   // Chat wrapper: bind a pane to its Claude Code session transcript (JSONL
   // under ~/.claude/projects/) and stream parsed entries back. `noteSent`
   // reports composer sends so binding can match files by first user message.

@@ -92,28 +92,6 @@
           <div id="todo-msgbar" class="git-msgbar hidden"></div>
         </aside>
 
-        <!-- Board panel — a per-hive kanban whose cards dispatch threads;
-             stored in .hivemind/kanban.json -->
-        <aside id="kanban-panel" class="hidden">
-          <div class="git-header">
-            <span class="git-title">Board</span>
-            <div class="spacer"></div>
-            <button id="kanban-refresh" class="git-icon" title="Refresh">⟳</button>
-            <button id="kanban-close" class="git-icon" title="Close">✕</button>
-          </div>
-          <div class="todo-addbar">
-            <input id="kanban-input" type="text" placeholder="Add a card…" autocomplete="off" spellcheck="false" />
-            <button id="kanban-add" class="git-icon" title="Add card">＋</button>
-          </div>
-          <div id="kanban-body"></div>
-          <div id="kanban-footer" class="todo-footer hidden">
-            <span id="kanban-count"></span>
-            <div class="spacer"></div>
-            <button id="kanban-clear-done" class="todo-linkbtn">Clear done</button>
-          </div>
-          <div id="kanban-msgbar" class="git-msgbar hidden"></div>
-        </aside>
-
         <div class="sidebar-actions">
           <button id="files-toggle" class="sidebar-action-btn" title="File Explorer" aria-label="File Explorer" disabled>
             <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor"
@@ -144,14 +122,6 @@
                  stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
               <path d="M9 11l3 3L22 4" />
               <path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11" />
-            </svg>
-          </button>
-          <button id="kanban-toggle" class="sidebar-action-btn" title="Board (Kanban) — cards that dispatch threads" aria-label="Board (Kanban)" disabled>
-            <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor"
-                 stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-              <rect x="3" y="4" width="4.5" height="12" rx="1" />
-              <rect x="9.75" y="4" width="4.5" height="8" rx="1" />
-              <rect x="16.5" y="4" width="4.5" height="16" rx="1" />
             </svg>
           </button>
         </div>
@@ -360,11 +330,9 @@
                 <strong><svg class="help-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><line x1="6" y1="3" x2="6" y2="15" /><circle cx="18" cy="6" r="3" /><circle cx="6" cy="18" r="3" /><path d="M18 9a9 9 0 0 1-9 9" /></svg> Source Control</strong>
                 buttons to browse files and manage Git, and the
                 <strong><svg class="help-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" /><path d="M14 2v6h6" /><line x1="8" y1="13" x2="16" y2="13" /><line x1="8" y1="17" x2="13" y2="17" /></svg> Plan</strong>
-                button to review the focused thread's plan, the
+                button to review the focused thread's plan, and the
                 <strong><svg class="help-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 11l3 3L22 4" /><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11" /></svg> Todo</strong>
-                button to keep a checklist for the hive, and the
-                <strong><svg class="help-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="4" width="4.5" height="12" rx="1" /><rect x="9.75" y="4" width="4.5" height="8" rx="1" /><rect x="16.5" y="4" width="4.5" height="16" rx="1" /></svg> Board</strong>
-                button for a kanban whose cards dispatch threads.</li>
+                button to keep a checklist for the hive.</li>
               <li><strong>Drag the sidebar's right edge</strong> to make it (and the Explorer, Source Control, Plan and Todo panels docked in it) wider or narrower. Double-click the edge to reset the width; it's remembered across restarts.</li>
             </ol>
           </div>
@@ -454,16 +422,6 @@
               <li>Items <strong>nest to any depth</strong>: hover a row and click the <strong>＋</strong> to add a sub-item beneath it. Ticking a parent ticks all of its sub-items, but sub-items never auto-tick their parent — a parent is only done when you tick it yourself (un-ticking a sub-item does un-tick a done parent); a partly-done parent shows a dash. Use the <strong>▾ / ▸</strong> caret to collapse or expand a branch.</li>
               <li>The footer shows how many leaf items are done and offers <strong>Clear completed</strong> to remove the ticked ones (a done parent stays if it still has unfinished sub-items).</li>
               <li>The list is saved with the project in <code>.hivemind/todos.json</code> (kept out of Git via <code>.gitignore</code>, like plans), so it survives restarts and updates live if a thread edits the file.</li>
-            </ul>
-          </div>
-
-          <div class="settings-group">
-            <div class="settings-group-title">Board (Kanban)</div>
-            <ul class="help-list">
-              <li>The <strong>Board</strong> panel is a kanban for the hive — <em>To do</em>, <em>In progress</em>, <em>Done</em> — whose cards <strong>dispatch threads</strong>. Add a card describing a task, then click its <strong>▶</strong> (or drag the card into <em>In progress</em>): a new Claude thread opens and starts working on the card's text the moment it boots.</li>
-              <li>A dispatched card <strong>follows its thread</strong>: it shows the thread's live status dot, and clicking the card jumps to that thread. When the thread <strong>finishes its turn</strong>, the card moves to <em>Done</em> on its own — drag it back if there's more to do.</li>
-              <li><strong>Drag cards between columns</strong> any time. Dragging a card out of <em>In progress</em> detaches it from its thread (the thread keeps running); dropping a card with no live thread into <em>In progress</em> dispatches a new one. <strong>Double-click</strong> a card to edit it, hover for <strong>✕</strong> to delete it, and <strong>Clear done</strong> sweeps the <em>Done</em> column.</li>
-              <li>Cards are saved with the project in <code>.hivemind/kanban.json</code> (kept out of Git, like plans and todos), so the board survives restarts and updates live if a thread edits the file. Card→thread links last for the session — after a restart, a card left <em>In progress</em> offers <strong>▶</strong> to dispatch again.</li>
             </ul>
           </div>
 

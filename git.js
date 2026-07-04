@@ -11,6 +11,7 @@
 
 const { execFile, spawn } = require('child_process');
 const fs = require('fs');
+const os = require('os');
 const path = require('path');
 
 // Run an arbitrary CLI (git, gh, …) with no TTY. cwd may be undefined to use
@@ -315,7 +316,19 @@ const COMMIT_INSTRUCTION =
   'short body of bullet points only if the change is non-trivial. ' +
   'Output ONLY the commit message, with no preamble, quoting, or code fences.';
 
-function runClaudePrompt(cwd, instruction, stdinText, timeout = 120000) {
+// Where headless `claude -p` runs matter: Claude Code writes a session
+// transcript under ~/.claude/projects/<cwd-slug>, and the chat view tails the
+// hive's project slug — running in the project dir would make a chat pane
+// adopt the commit-drafting session and display this prompt as a thread.
+// A scratch dir keeps those transcripts out of every hive's history; the diff
+// arrives on stdin, so the repo cwd isn't needed.
+function scratchDir() {
+  const dir = path.join(os.tmpdir(), 'hivemind-ai');
+  try { fs.mkdirSync(dir, { recursive: true }); } catch (_) { /* fall through */ }
+  return fs.existsSync(dir) ? dir : os.tmpdir();
+}
+
+function runClaudePrompt(instruction, stdinText, timeout = 120000) {
   return new Promise((resolve) => {
     let child;
     try {
@@ -323,7 +336,7 @@ function runClaudePrompt(cwd, instruction, stdinText, timeout = 120000) {
       // way the terminal panes do. instruction is a constant; embed it quoted.
       const safe = instruction.replace(/"/g, '');
       child = spawn(`claude -p "${safe}"`, {
-        cwd: cwd || undefined,
+        cwd: scratchDir(),
         shell: true,
         windowsHide: true,
         env: Object.assign({}, process.env, { GIT_TERMINAL_PROMPT: '0' }),
@@ -360,7 +373,7 @@ async function aiCommit(cwd) {
   // Keep the prompt within a sane size; truncate very large diffs.
   if (diffText.length > 60000) diffText = diffText.slice(0, 60000) + '\n…(diff truncated)…';
 
-  const res = await runClaudePrompt(cwd, COMMIT_INSTRUCTION, diffText);
+  const res = await runClaudePrompt(COMMIT_INSTRUCTION, diffText);
   if (res.code !== 0) {
     return { code: res.code, message: (res.stderr || 'Claude failed to produce a message.').trim() };
   }

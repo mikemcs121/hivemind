@@ -101,7 +101,6 @@ const git = require('./git');
 const files = require('./files');
 const plan = require('./plan');
 const todo = require('./todo');
-const kanban = require('./kanban');
 const build = require('./build');
 const usage = require('./usage');
 const transcript = require('./transcript');
@@ -552,12 +551,6 @@ app.whenReady().then(() => {
   // Reuse the plan module's helper — both keep the shared `.hivemind/` folder
   // out of Git via the same .gitignore entry.
   ipcMain.handle('todo:ensureIgnored', (_e, { cwd }) => plan.ensureIgnored(cwd));
-
-  // -- IPC: Board panel (kanban) ----------------------------------------------
-  // Per-hive kanban cards stored in `.hivemind/kanban.json` in the project dir.
-  ipcMain.handle('kanban:read', (_e, { cwd }) => kanban.readCards(cwd));
-  ipcMain.handle('kanban:write', (_e, { cwd, cards }) => kanban.writeCards(cwd, cards));
-  ipcMain.handle('kanban:ensureIgnored', (_e, { cwd }) => plan.ensureIgnored(cwd));
 
   // -- IPC: open an external link in the OS browser ---------------------------
   // Plan markdown can contain links; the file:// renderer can't navigate to them
