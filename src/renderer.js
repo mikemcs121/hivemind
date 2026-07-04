@@ -2539,6 +2539,15 @@ function spawnPanePty(pane, { resume, initialPrompt } = {}) {
   // to create (or, on resume, continue) in the board's project directory.
   if (pane.agent === 'claude') {
     window.api.transcript.bind({ paneId: pane.id, cwd: pane.board.dir, resume: !!resume });
+    // An initial prompt reaches claude as a CLI argument, not via the composer,
+    // so report it to the binder ourselves — otherwise the new session file
+    // can't be text-matched to this pane and can bind to another thread that's
+    // still waiting in the same directory. Mirror main.js's normalization so
+    // the noted text equals the transcript's first user message.
+    if (initialPrompt) {
+      const p = String(initialPrompt).replace(/[\x00-\x1f\x7f]+/g, ' ').replace(/\s+/g, ' ').trim();
+      if (p) window.api.transcript.noteSent(pane.id, p);
+    }
   }
   markActivity(pane, ''); // start out "working" until the first quiet period
 }
@@ -4106,6 +4115,39 @@ function pruneDoneTodos(list) {
   });
 }
 
+// -- Push a todo to a new thread ----------------------------------------------
+// The item's text (plus any unfinished sub-items) becomes a brand-new thread's
+// initial prompt, exactly like "Hivemind, open a new thread and <task>" — the
+// new Claude starts working on it the moment it boots. The todo itself is left
+// unticked; the thread finishing the work is what earns the checkmark.
+
+// Flatten an item into a one-line task: initialPrompt rides along as claude's
+// positional argument (main.js collapses newlines), so sub-items are folded in
+// as a "; "-separated list rather than a multi-line checklist.
+function todoThreadPrompt(item) {
+  const subs = [];
+  (function walk(kids) {
+    (kids || []).forEach((k) => {
+      const t = String(k.text || '').trim();
+      if (!k.done && t) subs.push(t);
+      walk(k.children);
+    });
+  })(item.children);
+  const t = String(item.text || '').trim();
+  if (!t) return '';
+  return subs.length ? t + ' — sub-tasks: ' + subs.join('; ') : t;
+}
+
+function pushTodoToThread(item) {
+  const board = activeBoard();
+  if (!board) { hmToast('No hive is open — create one first.', 'err'); return; }
+  const task = todoThreadPrompt(item);
+  if (!task) { hmToast('This todo is empty — give it some text first.', 'err'); return; }
+  const p = addTerminal(board, { initialPrompt: task });
+  if (p) setPaneCaption(p, String(item.text || '').trim());
+  hmToast('Opened a new thread — starting on: ' + String(item.text || '').trim());
+}
+
 // Swap a todo's label for an inline text editor; Enter/blur commits, Esc cancels.
 // `removeIfEmpty` (used for freshly-added sub-items) discards a never-named row.
 function startEditTodo(item, span, opts) {
@@ -4205,6 +4247,12 @@ function buildTodoList(list, depth, focusEditId) {
     span.title = 'Double-click to edit';
     span.ondblclick = () => startEditTodo(item, span);
 
+    const push = document.createElement('button');
+    push.className = 'todo-push';
+    push.title = 'Start in a new thread';
+    push.textContent = '▶';
+    push.onclick = () => pushTodoToThread(item);
+
     const addSub = document.createElement('button');
     addSub.className = 'todo-sub';
     addSub.title = 'Add sub-item';
@@ -4225,6 +4273,7 @@ function buildTodoList(list, depth, focusEditId) {
     li.appendChild(caret);
     li.appendChild(cb);
     li.appendChild(span);
+    li.appendChild(push);
     li.appendChild(addSub);
     li.appendChild(del);
     ul.appendChild(li);

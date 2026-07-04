@@ -1138,6 +1138,13 @@ button.usage-pill.crit { color: var(--danger); }
 }
 .todo-item:hover .todo-sub { display: block; }
 .todo-sub:hover { color: var(--accent); background: var(--bg); }
+.todo-push {
+  flex: none; display: none;
+  background: transparent; border: none; color: var(--muted);
+  cursor: pointer; font-size: 11px; padding: 1px 4px; border-radius: 4px;
+}
+.todo-item:hover .todo-push { display: block; }
+.todo-push:hover { color: var(--accent); background: var(--bg); }
 .todo-edit {
   flex: 1; min-width: 0;
   background: var(--bg); color: var(--text); border: 1px solid var(--accent);

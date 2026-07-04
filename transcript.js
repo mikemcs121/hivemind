@@ -15,9 +15,9 @@
 //      Code re-emits the resumed history into a new session file — but fall
 //      back to the most recently modified unclaimed pre-existing file if no
 //      new one appears within RESUME_FALLBACK_MS.
-//   4. With several waiting panes, a candidate whose first user message
-//      matches text one specific pane sent (noteSent) binds to that pane;
-//      the rest pair oldest-file-to-oldest-pane.
+//   4. A candidate whose first user message matches text exactly one waiting
+//      pane sent (noteSent — the composer and spawn-time initial prompts both
+//      report) binds to that pane; the rest pair oldest-file-to-oldest-pane.
 //   5. After binding, a new unclaimed file can re-bind a pane (session
 //      rollover via /clear) when the pane is alone in the directory or the
 //      new file's first user text matches something the pane sent.
@@ -333,18 +333,19 @@ function scanDir(dir) {
   if (waiting.length) {
     const taken = new Set();
 
-    // Disambiguate by first user message when several panes wait at once.
-    if (waiting.length >= 2) {
-      for (const file of unclaimed) {
-        const text = firstUserText(file, stats.get(file).size);
-        if (!text) continue;
-        const matches = waiting.filter(
-          (p) => !p.boundFile && p.lastSent.includes(text)
-        );
-        if (matches.length === 1) {
-          claimFile(matches[0], file);
-          taken.add(file);
-        }
+    // Bind by first user message first: a candidate whose opening user text
+    // matches something exactly one waiting pane sent belongs to that pane,
+    // no matter how file/pane ages would pair up below.
+    for (const file of unclaimed) {
+      const st = stats.get(file);
+      const text = firstUserText(file, st.size);
+      if (!text) continue;
+      const matches = waiting.filter(
+        (p) => !p.boundFile && p.lastSent.includes(text) && paneAccepts(p, file, st)
+      );
+      if (matches.length === 1) {
+        claimFile(matches[0], file);
+        taken.add(file);
       }
     }
 
