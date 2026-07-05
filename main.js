@@ -6,6 +6,11 @@ const { pathToFileURL } = require('url');
 const fs = require('fs');
 const os = require('os');
 
+// Dev escape hatch: point userData somewhere else so test runs don't share the
+// real boards.json (plain APPDATA tricks don't isolate Electron on Windows).
+// Must run before anything calls app.getPath('userData').
+if (process.env.HM_USER_DATA) app.setPath('userData', process.env.HM_USER_DATA);
+
 // Force-enable SharedArrayBuffer so the speech-to-text ONNX runtime can run
 // multi-threaded WASM (~4x faster than single-thread). A file:// window is not
 // cross-origin isolated, so without this flag Chromium hides SAB and the voice
@@ -339,8 +344,12 @@ function createWindow() {
     if (params.misspelledWord) {
       menu.append(new MenuItem({
         label: 'Add to dictionary',
-        click: () =>
-          mainWindow.webContents.session.addWordToSpellCheckerDictionary(params.misspelledWord),
+        click: () => {
+          mainWindow.webContents.session.addWordToSpellCheckerDictionary(params.misspelledWord);
+          // Keep autocorrect in agreement: a dictionary word must never be "fixed".
+          if (spell) spell.add(params.misspelledWord);
+          spellCache.clear();
+        },
       }));
       menu.append(new MenuItem({ type: 'separator' }));
     }
@@ -362,9 +371,171 @@ function createWindow() {
   });
 }
 
+// ---------------------------------------------------------------------------
+// Autocorrect service. Chromium's spell-checker paints the squiggles and feeds
+// the right-click suggestions (see the context-menu handler in createWindow)
+// but has no API to *ask* it for a suggestion, so autocorrect-as-you-type runs
+// its own Hunspell pass: nspell over dictionary-en's .aff/.dic files. The
+// renderer sends each word the user finishes typing over a synchronous
+// 'spell:correct' (the reply must land before the Enter that committed the
+// word is acted on); the reply is the replacement, or null to leave the word
+// alone. A word is only "clearly misspelled" when the top suggestion is within
+// edit distance 1 (2 for words of 6+ letters) — anything fuzzier stays a
+// squiggle for the user to resolve by hand.
+// ---------------------------------------------------------------------------
+let spell = null;             // nspell instance; null until the dictionary parses
+const spellCache = new Map(); // word -> replacement|null (suggest() is pricey)
+
+// Classic typos fixed outright, mostly contractions Hunspell ranks poorly
+// ("dont" suggests "cont" before "don't") plus the all-time greats.
+const SPELL_TYPOS = {
+  teh: 'the', adn: 'and', nad: 'and', waht: 'what', taht: 'that', alot: 'a lot',
+  dont: "don't", cant: "can't", wont: "won't", isnt: "isn't", arent: "aren't",
+  wasnt: "wasn't", werent: "weren't", doesnt: "doesn't", didnt: "didn't",
+  hasnt: "hasn't", havent: "haven't", hadnt: "hadn't", couldnt: "couldn't",
+  wouldnt: "wouldn't", shouldnt: "shouldn't", youre: "you're", theyre: "they're",
+  thats: "that's", whats: "what's", theres: "there's",
+};
+
+// Developer vocabulary Hunspell doesn't know. Without these, autocorrect would
+// "fix" real jargon into dictionary words ("linter" → "linger", "json" → "son").
+const SPELL_JARGON = [
+  'todo', 'todos', 'hivemind', 'claude', 'chatgpt', 'gemini', 'github', 'repo',
+  'repos', 'json', 'yaml', 'toml', 'html', 'css', 'svg', 'npm', 'npx', 'nodejs',
+  'lint', 'linter', 'linters', 'linting', 'async', 'await', 'config', 'configs',
+  'backend', 'frontend', 'fullstack', 'middleware', 'endpoint', 'endpoints',
+  'auth', 'oauth', 'api', 'apis', 'cli', 'sdk', 'regex', 'regexes', 'bool',
+  'enum', 'enums', 'struct', 'structs', 'param', 'params', 'arg', 'args',
+  'stdin', 'stdout', 'stderr', 'localhost', 'url', 'urls', 'uri', 'http',
+  'https', 'git', 'gitignore', 'changelog', 'codebase', 'codebases', 'dev',
+  'devs', 'devtools', 'docker', 'kubernetes', 'terraform', 'webpack', 'vite',
+  'eslint', 'typescript', 'javascript', 'jsx', 'tsx', 'electron', 'chromium',
+  'xterm', 'pty', 'markdown', 'readme', 'timestamp', 'timestamps', 'tooltip',
+  'tooltips', 'dropdown', 'dropdowns', 'checkbox', 'checkboxes', 'textarea',
+  'textareas', 'spellcheck', 'autocorrect', 'whitespace', 'backtick',
+  'backticks', 'redis', 'postgres', 'mysql', 'sqlite', 'nginx', 'webhook',
+  'webhooks', 'favicon', 'monorepo', 'stacktrace', 'traceback', 'nullable',
+];
+
+function loadSpell() {
+  try {
+    const nspell = require('nspell');
+    const base = path.dirname(require.resolve('dictionary-en'));
+    spell = nspell(
+      fs.readFileSync(path.join(base, 'index.aff')),
+      fs.readFileSync(path.join(base, 'index.dic'))
+    );
+    for (const w of SPELL_JARGON) spell.add(w);
+    // The user's own additions (right-click → Add to dictionary) carry over.
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      Promise.resolve(mainWindow.webContents.session.listWordsInSpellCheckerDictionary())
+        .then((words) => (words || []).forEach((w) => { if (spell) spell.add(w); }))
+        .catch(() => { /* custom words just won't be exempt */ });
+    }
+  } catch (err) {
+    console.error('Autocorrect dictionary failed to load:', err);
+    spell = null;
+  }
+}
+
+// Optimal-string-alignment distance (Levenshtein + adjacent transposition, so
+// "teh"→"the" counts as 1), bailing out early past `max`.
+function editDistance(a, b, max) {
+  if (Math.abs(a.length - b.length) > max) return max + 1;
+  const d = Array.from({ length: a.length + 1 }, (_, i) => [i]);
+  for (let j = 1; j <= b.length; j++) d[0][j] = j;
+  for (let i = 1; i <= a.length; i++) {
+    for (let j = 1; j <= b.length; j++) {
+      d[i][j] = Math.min(
+        d[i - 1][j] + 1,
+        d[i][j - 1] + 1,
+        d[i - 1][j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1)
+      );
+      if (i > 1 && j > 1 && a[i - 1] === b[j - 2] && a[i - 2] === b[j - 1]) {
+        d[i][j] = Math.min(d[i][j], d[i - 2][j - 2] + 1);
+      }
+    }
+  }
+  return d[a.length][b.length];
+}
+
+function sameLetters(a, b) {
+  return a.length === b.length &&
+    a.split('').sort().join('') === b.split('').sort().join('');
+}
+
+// Does `b` equal `a` with one of a doubled letter pair removed ("untill" → "until")?
+function dropsDoubledLetter(a, b) {
+  for (let i = 0; i < a.length - 1; i++) {
+    if (a[i] === a[i + 1] && a.slice(0, i) + a.slice(i + 1) === b) return true;
+  }
+  return false;
+}
+
+// Autocorrect wants precision over recall — a wrong "fix" is far worse than a
+// squiggle left alone. Score how confidently `sugg` explains `word` as a typo
+// (lower = safer), or null to reject:
+//   0  transposed letters              ("wierd" → "weird")
+//   1  a letter missing or doubled     ("speling" → "spelling", "untill" → "until")
+//   2  one wrong letter                ("definately" → "definitely")
+//   3  two letter-shuffles             (rare, letters all present)
+// A plain deletion ("json" → "son") is rejected outright: that shape is far
+// more often unknown jargon than a typo.
+function suggestionRank(word, sugg) {
+  const a = word.toLowerCase(), b = sugg.toLowerCase();
+  const max = a.length >= 6 ? 2 : 1;
+  const d = editDistance(a, b, max);
+  if (d < 1 || d > max) return null;
+  const anagram = sameLetters(a, b);
+  if (d === 1) {
+    if (b.length > a.length) return 1;
+    if (b.length === a.length) return anagram ? 0 : 2;
+    return dropsDoubledLetter(a, b) ? 1 : null;
+  }
+  return anagram ? 3 : null;
+}
+
+function matchCase(word, fixed) {
+  return /^[A-Z]/.test(word) ? fixed[0].toUpperCase() + fixed.slice(1) : fixed;
+}
+
+function autocorrectWord(word) {
+  if (!spell) return null;
+  const mapped = SPELL_TYPOS[word.toLowerCase()];
+  if (mapped) return matchCase(word, mapped);
+  if (spell.correct(word)) return null;
+  let best = null;
+  for (const s of (spell.suggest(word) || []).slice(0, 5)) {
+    const rank = suggestionRank(word, s);
+    if (rank !== null && (!best || rank < best.rank)) best = { rank, s };
+  }
+  return best ? best.s : null;
+}
+
+ipcMain.on('spell:correct', (event, word) => {
+  let out = null;
+  try {
+    const w = String(word || '');
+    if (spellCache.has(w)) {
+      out = spellCache.get(w);
+    } else {
+      out = autocorrectWord(w);
+      if (spellCache.size > 2000) spellCache.clear();
+      spellCache.set(w, out);
+    }
+  } catch (_) {
+    out = null;
+  }
+  event.returnValue = out; // must always be set or the renderer hangs
+});
+
 app.whenReady().then(() => {
   // Required on Windows for native notifications to show the app name/icon.
   if (process.platform === 'win32') app.setAppUserModelId('com.mikem.hivemind');
+
+  // Parse the autocorrect dictionary once startup has settled — it costs a few
+  // hundred ms of CPU; until it's ready 'spell:correct' just answers null.
+  setTimeout(loadSpell, 1500);
 
   // Serve the speech-to-text assets over hm:// (see top of file).
   registerHmProtocol();

@@ -17,16 +17,25 @@
 //      new one appears within RESUME_FALLBACK_MS.
 //   4. A candidate whose first user message matches text exactly one waiting
 //      pane sent (noteSent — the composer and spawn-time initial prompts both
-//      report) binds to that pane; the rest pair oldest-file-to-oldest-pane.
+//      report) binds to that pane; the rest pair oldest-file-to-oldest-pane,
+//      except that (a) a newborn file whose first user line hasn't hit disk
+//      yet waits TEXT_GRACE_MS so the text-match gets first look, and (b) a
+//      pane that has waited far longer than a Claude boot yields a just-born
+//      file to a just-spawned pane.
 //   5. After binding, a new unclaimed file can re-bind a pane (session
 //      rollover via /clear) when the pane is alone in the directory or the
 //      new file's first user text matches something the pane sent.
+//   6. Self-heal: a waiting pane whose sent text is the first user message of
+//      a file another pane holds — text that owner never sent — takes the
+//      claim; the previous owner rejoins the waiting pool.
 
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
 
 const FRESH_SLACK_MS = 2000;      // spawn-time slack when judging "new" files
+const TEXT_GRACE_MS = 5000;       // newborn file, no user line yet — let text-match see it first
+const SPAWN_WINDOW_MS = 30000;    // a file born this soon after a pane spawned belongs to that spawn
 const RESUME_FALLBACK_MS = 10000; // resume panes wait this long for a new file
 const BIND_TIMEOUT_MS = 15000;    // then tell the renderer we're stuck
 const POLL_MS = 2000;             // fs.watch misses appends on Windows; poll too
@@ -358,9 +367,48 @@ function scanDir(dir) {
       if (pane.allowPreExisting && candidates.length > 1) {
         candidates.sort((a, b) => stats.get(b).mtimeMs - stats.get(a).mtimeMs);
       }
-      if (candidates.length) {
-        claimFile(pane, candidates[0]);
-        taken.add(candidates[0]);
+      const file = candidates.find((f) => {
+        const st = stats.get(f);
+        // A newborn file whose first user line hasn't hit disk yet may
+        // text-match another pane once it lands — don't age-pair it away.
+        if (Date.now() - birthMs(st) < TEXT_GRACE_MS && !firstUserText(f, st.size)) return false;
+        // A pane that has waited far longer than a Claude boot yields a
+        // just-born file to a just-spawned pane: new session files follow new
+        // spawns, not threads whose session never materialized ages ago.
+        if (birthMs(st) - pane.registeredAt > SPAWN_WINDOW_MS &&
+            waiting.some((q) => q !== pane && !q.boundFile &&
+              birthMs(st) >= q.registeredAt - FRESH_SLACK_MS &&
+              birthMs(st) - q.registeredAt <= SPAWN_WINDOW_MS)) return false;
+        return true;
+      });
+      if (file) {
+        claimFile(pane, file);
+        taken.add(file);
+      }
+    }
+
+    // Self-heal a mis-bind: a waiting pane whose sent text is the first user
+    // message of a file some other pane holds — text that owner never sent —
+    // is the rightful owner. Take the claim; the loser rejoins the waiting
+    // pool and re-binds (or times out) on later scans.
+    for (const pane of waiting) {
+      if (pane.boundFile || !pane.lastSent.length) continue;
+      for (const [file, st] of stats) {
+        const ownerId = claims.get(file);
+        if (!ownerId || ownerId === pane.paneId) continue;
+        const owner = panes.get(ownerId);
+        if (!owner || !paneAccepts(pane, file, st)) continue;
+        const text = firstUserText(file, st.size);
+        if (!text || !pane.lastSent.includes(text) || owner.lastSent.includes(text)) continue;
+        releaseFile(owner);
+        emitStatus(owner, 'searching');
+        clearTimeout(owner.timeoutTimer);
+        owner.timeoutTimer = setTimeout(() => {
+          owner.timeoutTimer = null;
+          if (!owner.boundFile) emitStatus(owner, 'timeout');
+        }, BIND_TIMEOUT_MS);
+        claimFile(pane, file);
+        break;
       }
     }
   }

@@ -80,7 +80,7 @@
             <button id="todo-close" class="git-icon" title="Close">✕</button>
           </div>
           <div class="todo-addbar">
-            <input id="todo-input" type="text" placeholder="Add a todo…" autocomplete="off" spellcheck="false" />
+            <input id="todo-input" type="text" placeholder="Add a todo…" autocomplete="off" spellcheck="true" />
             <button id="todo-add" class="git-icon" title="Add todo">＋</button>
           </div>
           <div id="todo-body"></div>
@@ -182,7 +182,7 @@
         <ul id="branch-list"></ul>
         <label>New branch
           <div class="dir-row">
-            <input id="branch-new" type="text" placeholder="feature/my-branch" />
+            <input id="branch-new" type="text" placeholder="feature/my-branch" spellcheck="false" />
             <button id="branch-create">Create</button>
           </div>
         </label>
@@ -251,6 +251,18 @@
                 <span>Notify me when a thread needs input or finishes its turn while
                   Hivemind is in the background</span>
               </label>
+            </div>
+
+            <div class="settings-group">
+              <div class="settings-group-title">Typing</div>
+              <label class="settings-check">
+                <input type="checkbox" id="set-autocorrect" />
+                <span>Autocorrect spelling as you type — clear typos are fixed the
+                  moment you finish a word, everywhere spelling is checked (the chat
+                  composer, todos, commit messages, …)</span>
+              </label>
+              <small>Ctrl+Z undoes a correction. Right-click a squiggled word and
+                choose <em>Add to dictionary</em> to stop it being corrected.</small>
             </div>
           </section>
 
@@ -358,7 +370,7 @@
               <li>Click <strong>🕘 History</strong> in the top bar to browse this thread's <strong>past conversations</strong>. The menu lists earlier sessions in the project (newest first, titled by their topic or first message); pick one to view it <strong>read-only</strong> over the live chat. A banner marks the read-only view — click <strong>Back to live</strong> (or the <em>live</em> entry in the menu) to return to the running conversation, which keeps updating underneath the whole time.</li>
               <li>While the thread is working on a turn, a spinning <strong>🌀 swirl</strong> appears below the last message; it disappears when the turn finishes.</li>
               <li><strong>Filter chips</strong> at the top right (<em>Tools</em>, <em>Thinking</em>, <em>Meta</em>, <em>Subagents</em>) control exactly what the chat shows. Tool calls appear as collapsed one-liners — click one to expand its input and result. Your choices persist per thread and become the default for new threads.</li>
-              <li>The <strong>composer</strong> at the bottom sends to the thread: <kbd>Enter</kbd> sends, <kbd>Shift</kbd>+<kbd>Enter</kbd> adds a line — multi-line messages arrive as one message. Press <kbd>↑</kbd> in an empty composer (or on the first line) to <strong>recall</strong> messages you've sent before, <kbd>↓</kbd> to come back — editing keeps whatever you land on. Misspelled words get a red squiggle — <strong>right-click</strong> for suggestions or to add a word to the dictionary.</li>
+              <li>The <strong>composer</strong> at the bottom sends to the thread: <kbd>Enter</kbd> sends, <kbd>Shift</kbd>+<kbd>Enter</kbd> adds a line — multi-line messages arrive as one message. Press <kbd>↑</kbd> in an empty composer (or on the first line) to <strong>recall</strong> messages you've sent before, <kbd>↓</kbd> to come back — editing keeps whatever you land on. Misspelled words get a red squiggle — <strong>right-click</strong> for suggestions or to add a word to the dictionary — and clear typos are <strong>autocorrected</strong> the moment you finish a word (<kbd>Ctrl</kbd>+<kbd>Z</kbd> undoes a fix; <em>Add to dictionary</em> protects a word; turn it off in <strong>⚙ Settings → General → Typing</strong>).</li>
               <li>Click <strong>⏹ Interrupt</strong> next to the composer's Send button to stop whatever the thread is running — it sends the same <kbd>Ctrl</kbd>+<kbd>C</kbd> the terminal would, without you having to open the terminal view first. Handy for cutting off a long-running command or a turn that's gone down the wrong path.</li>
               <li><strong>Attachments</strong>: paste an image (including Win+Shift+S screenshots), drag files onto the chat, or click <strong>📎</strong> to pick files — each shows as a chip above the input (images get a thumbnail preview). Click a chip's <strong>✕</strong> to remove it; when you send, the attached files' paths go along with your message so Claude can read them.</li>
               <li>The composer <strong>autocompletes</strong> as you type: start a message with <kbd>/</kbd> for slash-command suggestions (Claude Code built-ins plus your project's <code>.claude/commands</code> and <code>.claude/skills</code>), or type <kbd>@</kbd> anywhere for file paths from the project directory — completing a folder steps into it. <kbd>↑</kbd>/<kbd>↓</kbd> pick a suggestion, <kbd>Tab</kbd> or <kbd>Enter</kbd> accepts it, <kbd>Esc</kbd> dismisses the menu.</li>
@@ -417,7 +429,7 @@
             <div class="settings-group-title">Todo</div>
             <ul class="help-list">
               <li>The <strong>Todo</strong> panel is a simple checklist for the hive. Unlike the Plan panel it's shared across every thread in the hive, not tied to the focused one.</li>
-              <li>Type in the box at the top and press <strong>Enter</strong> (or <strong>＋</strong>) to add an item. <strong>Tick the checkbox</strong> to mark it done, <strong>double-click</strong> an item to rename it, and hover to reveal a <strong>✕</strong> to delete it.</li>
+              <li>Type in the box at the top and press <strong>Enter</strong> (or <strong>＋</strong>) to add an item. <strong>Tick the checkbox</strong> to mark it done, <strong>double-click</strong> an item to rename it, and hover to reveal a <strong>✕</strong> to delete it. Spelling is checked as you type — typos get the same red squiggles, right-click suggestions, and autocorrect as the chat composer.</li>
               <li><strong>Push a todo to a new thread</strong>: hover an item and click the <strong>▶</strong> to open a fresh thread that starts working on it right away — the item's text (plus any unfinished sub-items) becomes the new Claude's first prompt. The todo stays unticked until you mark it done yourself.</li>
               <li><strong>Quick add from anywhere</strong>: start a composer message (or a dictated sentence) with <strong>todo</strong> — e.g. <em>“todo make the repo public”</em> — and it's added to the panel instead of being sent to Claude (<em>TODO:</em> and <em>to-do</em> work too; a bare <em>todo</em> just opens the panel). <em>“Hivemind, add a todo …”</em> does the same. If dictation hears it as two words (“to do”), add a <strong>Settings → Voice</strong> dictionary correction mapping it to “todo”.</li>
               <li>Items <strong>nest to any depth</strong>: hover a row and click the <strong>＋</strong> to add a sub-item beneath it. Ticking a parent ticks all of its sub-items, but sub-items never auto-tick their parent — a parent is only done when you tick it yourself (un-ticking a sub-item does un-tick a done parent); a partly-done parent shows a dash. Use the <strong>▾ / ▸</strong> caret to collapse or expand a branch.</li>
@@ -504,16 +516,16 @@
       <div id="modal">
         <h3 id="modal-title">New hive</h3>
         <label>Hive name
-          <input id="modal-name" type="text" placeholder="My project" />
+          <input id="modal-name" type="text" placeholder="My project" spellcheck="false" />
         </label>
         <label>Project directory
           <div class="dir-row">
-            <input id="modal-dir" type="text" placeholder="C:\\path\\to\\project" />
+            <input id="modal-dir" type="text" placeholder="C:\\path\\to\\project" spellcheck="false" />
             <button id="modal-browse">Browse…</button>
           </div>
         </label>
         <label>Startup command
-          <input id="modal-cmd" type="text" placeholder="claude" />
+          <input id="modal-cmd" type="text" placeholder="claude" spellcheck="false" />
           <small>Runs automatically in every new thread on this hive.</small>
         </label>
         <label class="modal-check">

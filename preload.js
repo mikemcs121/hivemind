@@ -133,6 +133,11 @@ contextBridge.exposeInMainWorld('api', {
     },
   },
 
+  // Autocorrect: look up the word just typed; returns the replacement or null
+  // to leave it alone. Synchronous on purpose — the fix has to be in the field
+  // before the Enter that committed the word is acted on (send, add todo, …).
+  spellCorrect: (word) => ipcRenderer.sendSync('spell:correct', word),
+
   // Open a web/mail link in the OS default browser (used by plan links).
   openExternal: (url) => ipcRenderer.invoke('open:external', { url }),
 

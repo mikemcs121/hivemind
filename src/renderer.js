@@ -1530,8 +1530,10 @@ function chatBindStatus(pane, status) {
     c.notice.classList.remove('hidden');
   } else {
     c.notice.classList.add('hidden');
-    // A (re)bind means a fresh source file; render it from scratch.
-    if (status === 'bound') resetChat(pane);
+    // A (re)bind means a fresh source file; render it from scratch. And when
+    // the binder takes a mis-bound file away (self-heal), 'searching' drops
+    // the other thread's conversation instead of leaving it on screen.
+    if (status === 'bound' || status === 'searching') resetChat(pane);
   }
 }
 
@@ -3925,6 +3927,82 @@ function insertPathIntoPane(rel) {
 }
 
 // ---------------------------------------------------------------------------
+// Autocorrect
+//
+// As-you-type spelling autocorrect for every plain text field that has
+// spell-check on: the chat composer, the todo add box and inline edits, the
+// commit message, plan comments… Whenever a word boundary is typed (space,
+// punctuation, Enter) the word just finished goes to the main process
+// ('spell:correct', nspell over the same en-US dictionary that paints the
+// squiggles) and, if it's a clear one-slip typo, is replaced in place. The
+// replacement runs through execCommand so Ctrl+Z undoes it, and right-click →
+// Add to dictionary permanently protects a word. Fields opt out exactly the
+// way they opt out of squiggles — spellcheck=false — which already covers
+// xterm's hidden textarea, find bars, names, branches and paths.
+// ---------------------------------------------------------------------------
+let autocorrectEnabled = localStorage.getItem('hm.autocorrect') !== '0'; // default on
+
+const AC_BOUNDARY = new Set([' ', '.', ',', ';', ':', '!', '?']);
+
+function acEligibleField(el) {
+  if (!autocorrectEnabled || !el || !el.spellcheck) return false;
+  return el.tagName === 'TEXTAREA' || (el.tagName === 'INPUT' && el.type === 'text');
+}
+
+// The word ending at `end` (exclusive) in `value`, or null when the token
+// isn't a plain lower/Capitalized word standing on its own — skips @paths,
+// /commands, --flags, snake_case, dotted.names, camelCase, ALLCAPS, digits.
+function acWordAt(value, end) {
+  let start = end;
+  while (start > 0 && /[A-Za-z']/.test(value[start - 1])) start--;
+  if (end - start < 3) return null;
+  const before = start > 0 ? value[start - 1] : '';
+  if (before && !/[\s"“”‘(\[{]/.test(before)) return null; // part of a bigger token
+  const word = value.slice(start, end);
+  if (!/^[A-Za-z][a-z']*$/.test(word)) return null;
+  return { word, start };
+}
+
+// Fix the word ending at `end`, keeping the caret where the user left it.
+function acApply(el, end) {
+  if (end == null || end <= 0) return;
+  const found = acWordAt(el.value, end);
+  if (!found) return;
+  const fixed = window.api.spellCorrect(found.word);
+  if (!fixed || fixed === found.word) return;
+  const caret = el.selectionStart;
+  el.setSelectionRange(found.start, end);
+  if (!document.execCommand('insertText', false, fixed)) {
+    // execCommand refused (shouldn't happen) — splice directly, losing undo.
+    el.value = el.value.slice(0, found.start) + fixed + el.value.slice(end);
+  }
+  const pos = caret + (fixed.length - found.word.length);
+  el.setSelectionRange(pos, pos);
+}
+
+// Space/punctuation (and Shift+Enter's line break) arrive as input events; the
+// word sits just before the character that was inserted.
+document.addEventListener('input', (e) => {
+  const el = e.target;
+  if (e.isComposing || !acEligibleField(el)) return;
+  const boundary =
+    e.inputType === 'insertLineBreak' ||
+    (e.inputType === 'insertText' && e.data && e.data.length === 1 && AC_BOUNDARY.has(e.data));
+  if (boundary && el.selectionStart === el.selectionEnd) acApply(el, el.selectionStart - 1);
+});
+
+// Enter usually *commits* the field (send the message, add the todo, push the
+// commit) before any input event can fire, so catch it on the way down —
+// document capture runs before the field's own keydown handler — and fix the
+// trailing word first.
+document.addEventListener('keydown', (e) => {
+  const el = e.target;
+  if (e.key !== 'Enter' || e.isComposing || !acEligibleField(el)) return;
+  if (el.selectionStart !== el.selectionEnd) return;
+  acApply(el, el.selectionStart);
+}, true);
+
+// ---------------------------------------------------------------------------
 // Todo panel
 //
 // A per-hive checklist, docked in the sidebar like Source Control / Explorer.
@@ -4155,6 +4233,7 @@ function startEditTodo(item, span, opts) {
   const input = document.createElement('input');
   input.type = 'text';
   input.className = 'todo-edit';
+  input.spellcheck = true;
   input.value = item.text;
   let committed = false;
   const finish = (cancel) => {
@@ -4991,6 +5070,7 @@ function renderCreateForm(gh) {
   nameLabel.append(document.createTextNode('Repository name'));
   const nameInput = document.createElement('input');
   nameInput.type = 'text';
+  nameInput.spellcheck = false; // repo names aren't words — no squiggles/autocorrect
   nameInput.value = folder;
   nameInput.placeholder = 'repo  (or  owner/repo  for an org)';
   nameLabel.appendChild(nameInput);
@@ -5057,6 +5137,7 @@ function renderLinkStep() {
   label.append(document.createTextNode('Repository URL'));
   const input = document.createElement('input');
   input.type = 'text';
+  input.spellcheck = false; // URLs aren't words — no squiggles/autocorrect
   input.placeholder = 'https://github.com/owner/repo.git';
   label.appendChild(input);
   ghBody.appendChild(label);
@@ -5821,6 +5902,8 @@ function syncGeneralFields() {
   if (sf) sf.value = String(defaultFontSize);
   const sn = $('set-notify');
   if (sn) sn.checked = !notifyMuted;
+  const sa = $('set-autocorrect');
+  if (sa) sa.checked = autocorrectEnabled;
 }
 
 function openSettings(tab) {
@@ -6035,6 +6118,11 @@ const setNotify = $('set-notify');
 if (setNotify) setNotify.addEventListener('change', () => {
   notifyMuted = !setNotify.checked;
   localStorage.setItem('hm.muteNotifications', notifyMuted ? '1' : '0');
+});
+const setAutocorrect = $('set-autocorrect');
+if (setAutocorrect) setAutocorrect.addEventListener('change', () => {
+  autocorrectEnabled = setAutocorrect.checked;
+  localStorage.setItem('hm.autocorrect', autocorrectEnabled ? '1' : '0');
 });
 
 $('voice-dict-add').onclick = addVoiceDictEntry;

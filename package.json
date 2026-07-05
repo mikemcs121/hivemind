@@ -17,7 +17,9 @@
     "@huggingface/transformers": "^3.8.1",
     "@xterm/addon-fit": "^0.10.0",
     "@xterm/addon-search": "^0.15.0",
-    "@xterm/xterm": "^5.5.0"
+    "@xterm/xterm": "^5.5.0",
+    "dictionary-en": "^4.0.0",
+    "nspell": "^2.1.5"
   },
   "devDependencies": {
     "@electron/rebuild": "^3.6.0",
