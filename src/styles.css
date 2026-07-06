@@ -1759,6 +1759,8 @@ mark.plan-cmt {
 .settings-group select:focus, .settings-group input:focus { outline: none; border-color: var(--accent); }
 .settings-check { flex-direction: row !important; align-items: flex-start; gap: 8px !important; cursor: pointer; }
 .settings-check input { cursor: pointer; flex: none; margin-top: 2px; }
+.settings-about { font-size: 13px; color: var(--muted); }
+.settings-about #set-app-version { color: var(--text); font-variant-numeric: tabular-nums; }
 .settings-check span { line-height: 1.4; }
 
 .hidden { display: none !important; }

@@ -286,7 +286,12 @@ function createWindow() {
       // The preload runs sandboxed, so it can't require('os') to read the
       // Windows build number that xterm's windowsPty option needs. Compute it
       // here (full Node) and hand it over via argv, which the sandbox allows.
-      additionalArguments: [`--hm-os-build=${(/^\d+\.\d+\.(\d+)/.exec(os.release() || '') || [])[1] || 0}`],
+      additionalArguments: [
+        `--hm-os-build=${(/^\d+\.\d+\.(\d+)/.exec(os.release() || '') || [])[1] || 0}`,
+        // The app version (from package.json) so the renderer can show it in
+        // Settings. Same source the updater uses to compare against releases.
+        `--hm-app-version=${app.getVersion()}`,
+      ],
     },
   });
 
