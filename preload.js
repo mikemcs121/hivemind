@@ -11,9 +11,17 @@ const osBuild = (() => {
   return arg ? Number(arg.slice('--hm-os-build='.length)) || 0 : 0;
 })();
 
+// App version (from package.json), handed over via argv the same way as
+// osBuild since the sandboxed preload can't read package.json itself.
+const appVersion = (() => {
+  const arg = process.argv.find((a) => a.startsWith('--hm-app-version='));
+  return arg ? arg.slice('--hm-app-version='.length) : '';
+})();
+
 contextBridge.exposeInMainWorld('api', {
   platform: process.platform,
   osBuild,
+  appVersion,
 
   // Boards persistence
   listBoards: () => ipcRenderer.invoke('boards:list'),

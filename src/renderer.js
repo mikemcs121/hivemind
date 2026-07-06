@@ -5930,6 +5930,8 @@ function syncGeneralFields() {
   if (sn) sn.checked = !notifyMuted;
   const sa = $('set-autocorrect');
   if (sa) sa.checked = autocorrectEnabled;
+  const sv = $('set-app-version');
+  if (sv) sv.textContent = window.api.appVersion ? `v${window.api.appVersion}` : 'unknown';
 }
 
 function openSettings(tab) {
