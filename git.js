@@ -110,7 +110,26 @@ async function status(cwd) {
   }
 
   out.hasRemote = (await runGit(cwd, ['remote'])).stdout.trim().length > 0;
+  if (out.hasRemote) out.remoteWebUrl = webUrlFromRemote(await getRemoteUrl(cwd));
   return out;
+}
+
+// Turn a git remote URL into a browsable https URL for the project page.
+// Handles the common GitHub forms:
+//   git@github.com:user/repo.git      -> https://github.com/user/repo
+//   ssh://git@github.com/user/repo.git-> https://github.com/user/repo
+//   https://github.com/user/repo.git  -> https://github.com/user/repo
+// Returns null for anything we can't confidently map to an https page.
+function webUrlFromRemote(url) {
+  if (!url) return null;
+  let u = url.trim();
+  // scp-like syntax: git@host:path
+  const scp = u.match(/^[^@/]+@([^:/]+):(.+)$/);
+  if (scp) u = `https://${scp[1]}/${scp[2]}`;
+  u = u.replace(/^ssh:\/\/[^@/]+@/, 'https://').replace(/^git:\/\//, 'https://');
+  u = u.replace(/\.git$/, '').replace(/\/$/, '');
+  if (!/^https?:\/\//.test(u)) return null;
+  return u;
 }
 
 function mkFile(p, xy, extra = {}) {

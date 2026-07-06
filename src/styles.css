@@ -976,6 +976,33 @@ button.usage-pill.crit { color: var(--danger); }
 }
 .branch-select:hover { filter: brightness(1.15); }
 .branch-select .bname { overflow: hidden; text-overflow: ellipsis; }
+.git-openweb {
+  position: relative;
+  display: flex; align-items: center; justify-content: center;
+  flex: 0 0 auto; width: 30px; height: 30px;
+  background: var(--surface); border: 1px solid var(--border); border-radius: 7px;
+  color: var(--muted); cursor: pointer;
+  transition: color .12s ease, background .12s ease, border-color .12s ease, transform .06s ease;
+}
+.git-openweb .gh-mark { display: block; }
+/* External-open arrow: tucked top-right, hidden until hover/focus. */
+.git-openweb .gh-out {
+  position: absolute; top: 3px; right: 3px;
+  opacity: 0; transform: translate(-1px, 1px);
+  transition: opacity .12s ease, transform .12s ease;
+  pointer-events: none;
+}
+.git-openweb:hover {
+  color: var(--text); background: var(--panel);
+  border-color: var(--accent-2); transform: translateY(-1px);
+}
+.git-openweb:hover .gh-out { opacity: .9; transform: translate(0, 0); }
+.git-openweb:active { transform: translateY(0); }
+.git-openweb:focus-visible {
+  outline: none; color: var(--text);
+  border-color: var(--accent-2); box-shadow: 0 0 0 2px var(--accent-2);
+}
+.git-openweb:focus-visible .gh-out { opacity: .9; transform: translate(0, 0); }
 .git-counts { font-size: 12px; color: var(--muted); white-space: nowrap; font-variant-numeric: tabular-nums; }
 .git-counts .ahead { color: var(--accent-2); }
 .git-counts .behind { color: var(--peach); }

@@ -3482,6 +3482,32 @@ function renderBranchBar(st) {
   }
   line.append(branchBtn, counts);
 
+  // Open the project's page on GitHub (or whatever host origin points at) in the
+  // system browser. Only shown when the remote maps to a browsable https URL.
+  if (st.remoteWebUrl) {
+    const gh = document.createElement('button');
+    gh.className = 'git-openweb';
+    gh.title = 'Open project on GitHub';
+    gh.setAttribute('aria-label', 'Open project on GitHub');
+    gh.innerHTML =
+      '<svg class="gh-mark" viewBox="0 0 24 24" width="16" height="16" fill="currentColor" aria-hidden="true">' +
+      '<path d="M12 .5C5.73.5.75 5.48.75 11.75c0 4.98 3.23 9.2 7.71 10.69.56.1.77-.24.77-.54' +
+      'v-1.9c-3.14.68-3.8-1.35-3.8-1.35-.51-1.3-1.25-1.65-1.25-1.65-1.02-.7.08-.68.08-.68' +
+      '1.13.08 1.72 1.16 1.72 1.16 1 1.72 2.63 1.22 3.27.94.1-.73.39-1.22.71-1.5' +
+      '-2.51-.29-5.15-1.25-5.15-5.58 0-1.23.44-2.24 1.16-3.03-.12-.29-.5-1.44.11-3' +
+      '0 0 .95-.3 3.1 1.16a10.7 10.7 0 0 1 5.64 0c2.15-1.46 3.1-1.16 3.1-1.16' +
+      '.61 1.56.23 2.71.11 3 .72.79 1.16 1.8 1.16 3.03 0 4.34-2.64 5.29-5.16 5.57' +
+      '.4.35.76 1.04.76 2.1v3.11c0 .3.2.65.78.54a11.26 11.26 0 0 0 7.7-10.69' +
+      'C23.25 5.48 18.27.5 12 .5z"/></svg>' +
+      // Small "opens externally" arrow that fades in on hover so the control
+      // reads as a link out to the browser, not an in-app action.
+      '<svg class="gh-out" viewBox="0 0 24 24" width="9" height="9" fill="none" ' +
+      'stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' +
+      '<path d="M7 17 17 7M9 7h8v8"/></svg>';
+    gh.onclick = () => window.api.openExternal(st.remoteWebUrl);
+    line.append(gh);
+  }
+
   // Remote actions (Pull / Push / Revert) live in the commit box below, next to
   // the message they act on. The branch bar is just the branch picker + counts.
   bar.append(line);
