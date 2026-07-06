@@ -122,11 +122,33 @@ async function checkForUpdates(win) {
       // Launch the new version, schedule deletion of the old exe, then quit.
       spawn(newExePath, [], { detached: true, stdio: 'ignore' }).unref();
 
+      // The old exe stays locked until this process (and the portable
+      // launcher wrapping it) fully exits, so retry the delete for up to
+      // ~30s and then give up rather than loop forever. `ping` is the delay
+      // because `timeout` refuses to run without console input, which a
+      // hidden window doesn't have.
       const batPath = path.join(app.getPath('temp'), 'hivemind-update-cleanup.bat');
-      fs.writeFileSync(batPath, `@echo off\r\n:loop\r\ntimeout /t 1 /nobreak >nul\r\ndel /f /q "${oldExePath}" 2>nul\r\nif exist "${oldExePath}" goto loop\r\ndel /f /q "%~f0"\r\n`);
-      spawn('cmd.exe', ['/c', batPath], { detached: true, stdio: 'ignore' }).unref();
+      fs.writeFileSync(batPath, [
+        '@echo off',
+        'set tries=0',
+        ':loop',
+        'set /a tries+=1',
+        `del /f /q "${oldExePath}" >nul 2>nul`,
+        `if not exist "${oldExePath}" goto done`,
+        'if %tries% geq 30 goto done',
+        'ping -n 2 127.0.0.1 >nul',
+        'goto loop',
+        ':done',
+        'del /f /q "%~f0"',
+        '',
+      ].join('\r\n'));
+      spawn('cmd.exe', ['/c', batPath], { detached: true, stdio: 'ignore', windowsHide: true }).unref();
 
       app.quit();
+      // node-pty's ConPTY children can keep the main process alive after
+      // quit on Windows, leaving a hidden zombie that holds the old exe
+      // locked forever. If quit hasn't actually exited shortly, force it.
+      setTimeout(() => app.exit(0), 5000);
     } catch (dlErr) {
       try { fs.unlinkSync(partPath); } catch (_) { /* nothing to clean */ }
       await dialog.showMessageBox(win, {
