@@ -151,7 +151,7 @@ function defaultShell() {
   return process.env.SHELL || 'bash';
 }
 
-function spawnPty({ id, cwd, cols, rows, startupCommand, model, resume, permissionMode, initialPrompt }, win) {
+function spawnPty({ id, cwd, cols, rows, startupCommand, model, resume, permissionMode, initialPrompt, sessionId }, win) {
   const shell = defaultShell();
   let safeCwd = cwd;
   try {
@@ -182,11 +182,12 @@ function spawnPty({ id, cwd, cols, rows, startupCommand, model, resume, permissi
 
   // Auto-run the startup command (defaults to `claude`) inside the board's dir.
   let cmd = (startupCommand && startupCommand.trim()) || 'claude';
-  // When a specific model is chosen, hand it to Claude Code via `--model` by
-  // inserting the flag right after the `claude` token (so `claude --resume`
-  // etc. still work). Skip for "default" and for non-claude startup commands.
-  if (model && model !== 'default' && /^[a-z0-9-]+$/i.test(model)) {
-    cmd = cmd.replace(/^claude(\.exe)?\b/i, (m) => `${m} --model ${model}`);
+  // When a specific model is chosen, hand it to the agent CLI via `--model` by
+  // inserting the flag right after the `claude`/`codex` token (so flags like
+  // `claude --resume` still work). Skip for "default" and for other commands.
+  // Codex model ids contain dots (e.g. gpt-5.1-codex), hence the [a-z0-9.-].
+  if (model && model !== 'default' && /^[a-z0-9.-]+$/i.test(model)) {
+    cmd = cmd.replace(/^(claude|codex)(\.exe|\.cmd)?\b/i, (m) => `${m} --model ${model}`);
   }
   // Permission mode: hand the choice to Claude Code as a startup flag. "default"
   // adds nothing; "bypass" uses the dedicated skip flag so the thread never shows
@@ -200,15 +201,29 @@ function spawnPty({ id, cwd, cols, rows, startupCommand, model, resume, permissi
       !/--permission-mode\b|--dangerously-skip-permissions\b/.test(cmd)) {
     cmd = cmd.replace(/^claude(\.exe)?\b/i, (m) => `${m} ${permFlag}`);
   }
-  // Restoring a saved session: continue the most recent conversation in this
-  // directory. Only meaningful for the `claude` command.
+  // Restoring a saved session: `resume: true` continues the most recent
+  // conversation in this directory; a session-id string resumes that specific
+  // conversation (Claude keeps writing to that same session id, so the pane's
+  // transcript binding stays deterministic). Only meaningful for the `claude`
+  // command.
   if (resume && /^claude(\.exe)?\b/i.test(cmd) && !/--continue\b|--resume\b/.test(cmd)) {
-    cmd = cmd.replace(/^claude(\.exe)?\b/i, (m) => `${m} --continue`);
+    const flag = (typeof resume === 'string' && /^[a-zA-Z0-9-]+$/.test(resume))
+      ? `--resume ${resume}`
+      : '--continue';
+    cmd = cmd.replace(/^claude(\.exe)?\b/i, (m) => `${m} ${flag}`);
+  }
+  // Fresh session: pin the session id Hivemind generated for this pane, so the
+  // transcript file is known up front (`<sessionId>.jsonl`) instead of guessed
+  // from timing after the fact. Never combined with a resume flag.
+  if (sessionId && !resume && /^claude(\.exe)?\b/i.test(cmd) &&
+      /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(sessionId) &&
+      !/--session-id\b|--continue\b|--resume\b/.test(cmd)) {
+    cmd = cmd.replace(/^claude(\.exe)?\b/i, (m) => `${m} --session-id ${sessionId}`);
   }
   // An initial prompt (from a "Hivemind, open a new thread and…" command) rides
-  // along as claude's positional argument. That's the only safe delivery: typing
-  // it into the PTY later could hand it to the shell if the CLI is slow to start.
-  if (initialPrompt && /^claude(\.exe)?\b/i.test(cmd)) {
+  // along as the agent CLI's positional argument. That's the only safe delivery:
+  // typing it into the PTY later could hand it to the shell if the CLI is slow.
+  if (initialPrompt && /^(claude|codex)(\.exe|\.cmd)?\b/i.test(cmd)) {
     const p = String(initialPrompt).replace(/[\x00-\x1f\x7f]+/g, ' ').replace(/\s+/g, ' ').trim();
     if (p) {
       cmd += process.platform === 'win32'
@@ -633,6 +648,40 @@ app.whenReady().then(() => {
       return file;
     } catch (err) {
       console.error('Failed to read clipboard image:', err);
+      return null;
+    }
+  });
+
+  // Copy an attachment into the project's `.hivemind/attachments/` folder and
+  // return the new path. The Codex CLI ("ChatGPT") sandbox can only read files
+  // inside its workspace, so temp screenshots and files picked from elsewhere
+  // on disk must be staged into the project before their paths are sent to a
+  // codex thread. `.hivemind/` is kept out of Git by plan.ensureIgnored.
+  ipcMain.handle('attach:stage', (_e, { cwd, srcPath }) => {
+    try {
+      if (typeof cwd !== 'string' || !cwd || typeof srcPath !== 'string' || !srcPath) return null;
+      const dir = path.join(path.resolve(cwd), '.hivemind', 'attachments');
+      fs.mkdirSync(dir, { recursive: true });
+      plan.ensureIgnored(cwd);
+      // Staged copies pile up across sessions; sweep ones older than a week.
+      const WEEK = 7 * 24 * 60 * 60 * 1000;
+      for (const f of fs.readdirSync(dir)) {
+        const full = path.join(dir, f);
+        try {
+          if (Date.now() - fs.statSync(full).mtimeMs > WEEK) fs.unlinkSync(full);
+        } catch (_) { /* ignore sweep races */ }
+      }
+      const base = path.basename(srcPath);
+      let dest = path.join(dir, base);
+      if (fs.existsSync(dest)) {
+        const ext = path.extname(base);
+        const stem = base.slice(0, base.length - ext.length);
+        dest = path.join(dir, `${stem}-${Date.now()}${ext}`);
+      }
+      fs.copyFileSync(srcPath, dest);
+      return dest;
+    } catch (err) {
+      console.error('Failed to stage attachment into workspace:', err);
       return null;
     }
   });

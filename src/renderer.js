@@ -11,6 +11,22 @@ const grids = new Map();         // boardId -> { el, columns: [ { el, flex, pane
 let idCounter = 1;
 const nextId = (p) => `${p}-${Date.now().toString(36)}-${idCounter++}`;
 
+// Claude Code session ids are UUIDs. Hivemind generates one per fresh thread
+// (passed to claude as --session-id) so each pane's transcript file is known
+// up front instead of guessed from timing — see spawnPanePty / transcript.js.
+const SESSION_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const isSessionId = (v) => typeof v === 'string' && SESSION_ID_RE.test(v);
+function newSessionId() {
+  try { return crypto.randomUUID(); } catch (_) { /* very old Chromium */ }
+  const hex = [...crypto.getRandomValues(new Uint8Array(16))]
+    .map((b, i) => {
+      if (i === 6) b = (b & 0x0f) | 0x40; // version 4
+      if (i === 8) b = (b & 0x3f) | 0x80; // variant
+      return b.toString(16).padStart(2, '0');
+    }).join('');
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+}
+
 // ---------------------------------------------------------------------------
 // Themes
 //
@@ -218,6 +234,27 @@ let defaultModel = localStorage.getItem('hm.model') || 'default';
 if (!isValidModel(defaultModel)) defaultModel = 'default';
 
 // ---------------------------------------------------------------------------
+// Per-thread ChatGPT (Codex) model
+//
+// ChatGPT threads get their own model dropdown, mirroring the Claude one. The
+// choice reaches the Codex CLI as `--model <id>` at startup. Codex has no
+// inline slash command to switch models mid-session (its /model opens an
+// interactive picker), so changing a running thread restarts it. The last
+// choice is remembered as the default for new ChatGPT threads.
+// ---------------------------------------------------------------------------
+const CODEX_MODELS = [
+  { value: 'default', label: 'Default' },
+  { value: 'gpt-5.1-codex-max', label: 'Codex Max' },
+  { value: 'gpt-5.1-codex', label: 'Codex' },
+  { value: 'gpt-5.1-codex-mini', label: 'Codex Mini' },
+  { value: 'gpt-5.1', label: 'GPT-5.1' },
+];
+const isValidCodexModel = (m) => CODEX_MODELS.some((x) => x.value === m);
+
+let defaultCodexModel = localStorage.getItem('hm.codexModel') || 'default';
+if (!isValidCodexModel(defaultCodexModel)) defaultCodexModel = 'default';
+
+// ---------------------------------------------------------------------------
 // Per-thread permission mode
 //
 // Each thread can start Claude Code in a different permission mode, handed to
@@ -245,7 +282,8 @@ if (!isValidPerm(defaultPerm)) defaultPerm = 'default';
 // e.g. three Claude threads and one ChatGPT thread. A Claude thread keeps the
 // hive's custom startup command (extra flags etc.); other agents run their own
 // command. Switching a live thread kills its process and starts the new agent
-// in the same pane. The Claude model dropdown only applies to Claude threads.
+// in the same pane. Claude and ChatGPT threads each show their own model
+// dropdown; Gemini threads show none.
 // ---------------------------------------------------------------------------
 const AGENTS = [
   { value: 'claude', label: 'Claude',  command: 'claude', install: null },
@@ -270,10 +308,11 @@ function setPaneAgent(pane, agent) {
   pane.agent = agent;
   if (pane.agentSelect && pane.agentSelect.value !== agent) pane.agentSelect.value = agent;
   // The Claude model / permission dropdowns mean nothing to other agents — hide
-  // them there.
+  // them there. ChatGPT threads get their own model dropdown instead.
   if (pane.modelSelect) pane.modelSelect.style.display = agent === 'claude' ? '' : 'none';
+  if (pane.codexModelSelect) pane.codexModelSelect.style.display = agent === 'codex' ? '' : 'none';
   if (pane.permSelect) pane.permSelect.style.display = agent === 'claude' ? '' : 'none';
-  // The chat view reads Claude Code transcripts — other agents are terminal-only.
+  // Claude and ChatGPT are transcript-backed; Gemini stays terminal-only.
   updateChatAvailability(pane);
   // Auto names track the running command ("codex 2"); manual names stay put.
   if (pane.autoName) {
@@ -287,19 +326,29 @@ function setPaneAgent(pane, agent) {
 // Kill a pane's process and start its (possibly new) agent in the same pane.
 // The pane gets a fresh PTY id so late data/exit events from the old process
 // can't reach it. Pass { resume: true } to continue the thread's conversation
-// (e.g. when only a startup flag changed, not the whole agent).
-function respawnPane(pane, { resume } = {}) {
+// (e.g. when only a startup flag changed, not the whole agent), or a session-id
+// string to resume that specific past conversation. An initialPrompt rides
+// along as claude's CLI argument (see spawnPty).
+function respawnPane(pane, { resume, initialPrompt } = {}) {
   window.api.killPty(pane.id);
   window.api.transcript.unbind(pane.id); // release before the id changes
   pane.id = nextId('term');
   clearTimeout(pane.idleTimer);
+  stopAttentionProbe(pane);
   pane.state = null;
   pane.buf = '';
   pane.errored = false;
   pane.hintShown = false;
   try { pane.term.reset(); } catch (_) { /* ignore */ }
+  // The new process starts a fresh live session — drop any history view so
+  // the rebuilt chat tails it (chatIngest is suppressed while viewingHistory).
+  if (pane.chat && pane.chat.viewingHistory) {
+    pane.chat.viewingHistory = false;
+    pane.chat.historySession = null;
+    updateHistoryChrome(pane, null);
+  }
   resetChat(pane); // the new session's transcript backfills the chat view
-  spawnPanePty(pane, { resume: !!resume });
+  spawnPanePty(pane, { resume: resume || false, initialPrompt });
 }
 
 function setPaneModel(pane, model) {
@@ -314,6 +363,21 @@ function setPaneModel(pane, model) {
     window.api.writePty(pane.id, `/model ${model}\r`);
     markActivity(pane, '');
   }
+}
+
+function setPaneCodexModel(pane, model) {
+  if (pane.disposed) return;
+  if (!isValidCodexModel(model)) model = 'default';
+  const changed = pane.codexModel !== model;
+  pane.codexModel = model;
+  defaultCodexModel = model;
+  localStorage.setItem('hm.codexModel', model);
+  if (pane.codexModelSelect && pane.codexModelSelect.value !== model) pane.codexModelSelect.value = model;
+  // Codex only reads its model at startup (its /model slash command opens an
+  // interactive picker we can't drive), so apply a change to a running ChatGPT
+  // thread by restarting it. Codex rollouts aren't resumable here (see
+  // rebuildFromLayout), so the restart begins a fresh conversation.
+  if (changed && pane.agent === 'codex' && pane.state !== 'dead') respawnPane(pane);
 }
 
 // Highlight the permission dropdown when it's in a risky mode (bypass), so the
@@ -332,23 +396,28 @@ function setPanePerm(pane, mode) {
   if (pane.permSelect && pane.permSelect.value !== mode) pane.permSelect.value = mode;
   paintPermSelect(pane);
   // Permission mode is a startup flag with no live slash-command equivalent, so
-  // apply a change to a running Claude thread by restarting it. Resume the
-  // conversation when the thread has already been used (it has a caption), so a
-  // mid-session mode switch doesn't throw the work away; a fresh, unused thread
-  // restarts clean (there's nothing to --continue).
+  // apply a change to a running Claude thread by restarting it. Resume this
+  // pane's own session (`--resume <id>`) so a mid-session mode switch doesn't
+  // throw the work away — and doesn't `--continue` into another thread's more
+  // recent conversation. A thread that never bound a session but has been used
+  // (it has a caption) still falls back to --continue; a fresh, unused thread
+  // restarts clean (there's nothing to resume).
   if (changed && pane.agent === 'claude' && pane.state !== 'dead') {
-    respawnPane(pane, { resume: !!pane.captionText });
+    respawnPane(pane, { resume: pane.sessionId || !!pane.captionText });
   }
 }
 
 // ---------------------------------------------------------------------------
 // Terminal status detection
 //
-// Claude Code renders an animated spinner while it works, so the PTY emits a
-// steady stream of output during a turn. That makes the signal simple: output
-// flowing => busy; output gone quiet => the turn is done or it is waiting for
-// you. When it goes quiet we scan the recent output for a permission / prompt
-// pattern to tell "needs your input" (attention) apart from "finished" (idle).
+// The agent CLIs render an animated spinner while they work, so the PTY emits
+// a steady stream of output during a turn: output flowing => busy; output
+// gone quiet => the turn is done or the CLI is waiting for you. Quiet panes
+// are told apart by scanning the *visible screen* for prompt patterns —
+// "needs your input" (attention) vs "finished" (idle). Blocking menus can't
+// wait for quiet, though: codex keeps animating its status line under an
+// approval modal, so busy panes are also probed on a timer for on-screen
+// menu prompts (probeAttention).
 // ---------------------------------------------------------------------------
 const IDLE_MS = 1000; // quiet period before a terminal is no longer "busy"
 
@@ -360,10 +429,40 @@ const STATE_LABEL = {
   dead: 'exited',
 };
 
-// Patterns that mean Claude (or a CLI) is waiting for the user to answer.
-const ATTENTION_PATTERNS = [
-  /❯\s*1\.\s*Yes/i,
-  /\b1\.\s*Yes\b[\s\S]{0,160}\b2\.\s*No\b/i,
+// Interactive menu prompts a CLI is blocked on — Claude Code's permission
+// menus ("❯ 1. Yes") and the Codex CLI's approval modals. These are TUI
+// chrome, not prose, so they're safe to match even while output is still
+// flowing. That matters: codex keeps animating its status line while an
+// approval modal waits, so "output gone quiet" never happens there — these
+// are probed on a timer against the visible screen instead (probeAttention).
+// Claude Code select-menu footer (AskUserQuestion, permission menus). The
+// options carry arbitrary labels, so this chrome line is the only
+// label-independent signature the screen offers. Also drives the screen-parsed
+// question card (parseScreenQuestion).
+const SELECT_FOOTER_RE =
+  /\bEnter to (select|submit|confirm)\b[^\n]{0,120}\bEsc to (cancel|go back|exit|skip)/i;
+
+// The Submit tab of a multi-select AskUserQuestion ("Review your answers" over
+// "1. Submit answers / 2. Cancel") draws NO footer chrome at all (verified
+// v2.1.201) — this prompt line is its only stable signature.
+const REVIEW_PROMPT_RE = /Ready to submit your answers\?/i;
+
+const MENU_PATTERNS = [
+  /[❯›]\s*1\.\s*Yes/i,                        // selection caret on a Yes option
+  /\b1\.\s*Yes\b[\s\S]{0,160}\b2\.\s*No\b/i,  // numbered Yes/No menu
+  /Yes, and don'?t ask again/i,               // codex approval options
+  /No, and (tell Codex what to do differently|continue without running)/i,
+  /Allow Codex to [^\n]{0,200}\?/,            // codex approval headers
+  /Codex wants to (edit|run|use)/i,
+  /Would you like to (run the following command|grant these permissions|make this edit)/i,
+  SELECT_FOOTER_RE,
+  REVIEW_PROMPT_RE,
+];
+
+// Prose questions that mean a *finished* turn is waiting on an answer. Only
+// checked once output has gone quiet — mid-turn they'd be ordinary sentences
+// streaming past in the agent's reply.
+const QUESTION_PATTERNS = [
   /Do you want to (proceed|create|make|run|allow|continue|trust)/i,
   /Would you like to/i,
   /\(y\/n\)/i,
@@ -395,16 +494,254 @@ const stripAnsi = (s) => String(s).replace(ANSI_RE, '');
 
 let notifyMuted = localStorage.getItem('hm.muteNotifications') === '1';
 
+// The visible terminal screen (the live bottom page of xterm's buffer).
+// Prompt detection reads this rather than the raw output stream: a menu that
+// is on screen is genuinely waiting, and an answered one vanishes from the
+// screen immediately — no stale matches lingering in an append buffer.
+function screenText(pane) {
+  try {
+    const b = pane.term.buffer.active;
+    const lines = [];
+    for (let y = b.baseY; y < b.baseY + pane.term.rows; y++) {
+      const line = b.getLine(y);
+      if (line) lines.push(line.translateToString(true));
+    }
+    return lines.join('\n');
+  } catch (_) {
+    return pane.buf || ''; // terminal not ready — fall back to the stream tail
+  }
+}
+
+const PROBE_MS = 700; // how often a busy pane's screen is checked for a menu
+
+// The transcript knows about one kind of prompt the screen scan can't be
+// trusted on: an AskUserQuestion tool call whose result hasn't landed yet —
+// the agent is blocked on the user picking an option. The chat view tracks
+// those deterministically (addQuestionRow / attachToolResult); while browsing
+// history the live question isn't on screen, so it doesn't count.
+function chatHasPendingQuestion(pane) {
+  const c = pane.chat;
+  return !!(c && !c.viewingHistory && c.pendingQuestions.size);
+}
+
+// A *pending* AskUserQuestion never reaches the transcript: Claude Code only
+// flushes the assistant message (its text and the tool_use) once the tool
+// resolves — i.e. after the user has already answered in the TUI (verified
+// against v2.1.201). So while the question waits — the only window the card
+// matters — the visible screen is the sole signal, exactly like codex
+// approvals. These helpers parse the select menu off the screen and render it
+// as a synthetic question card (addQuestionRow) so the chat view can show and
+// answer the prompt live. Once answered, the menu leaves the screen (the
+// probe removes the stand-in) and the real transcript entries land, rendering
+// the permanent answered card.
+// Multi-select menus draw a checkbox on each option — before or after the
+// number depending on the menu, and Windows terminals render the check mark
+// as √ (the figures-package fallback for ✓). Its presence is the reliable
+// multi-select signal; footer wording varies between Claude Code versions.
+// Since v2.1.20x the multi-select flow is two screens: on the question tab
+// digits toggle and Enter only toggles the highlighted option — Tab moves to
+// the Submit tab, a review screen ("Ready to submit your answers?" over
+// "1. Submit answers / 2. Cancel") with no footer chrome, where digits act
+// immediately (1 submits, 2 declines). Single-select menus still answer
+// straight off a digit press. All verified against v2.1.201.
+const SCREEN_OPT_RE = /^\s*(?:[❯›>]\s+)?(\[[ x✓✔√]\]\s*|[◻◼☐☑]\s*)?(\d{1,2})[.)]\s+(\S.*)$/;
+const SCREEN_CHECK_RE = /^(\[[ x✓✔√]\]|[◻◼☐☑])\s*/;
+const SCREEN_CHECKED_RE = /[x✓✔√◼☑]/;
+const SCREEN_SEP_RE = /^[\s─—–-]*$/;
+const SCREEN_CHIP_RE = /^\[[^\]]{0,3}\]\s*(\S.{0,40})$/;
+
+function parseScreenQuestion(screen) {
+  const lines = screen.split('\n');
+  let foot = -1;
+  for (let i = lines.length - 1; i >= 0; i--) {
+    if (SELECT_FOOTER_RE.test(lines[i])) { foot = i; break; }
+  }
+  if (foot < 0) return parseScreenReview(lines);
+  // The options block: the "1." line closest above the footer, then numbered
+  // lines counting up. Unnumbered lines under an option are its description
+  // (or a wrapped label — indistinguishable, and cosmetically equivalent).
+  let start = -1;
+  for (let i = foot - 1; i >= 0; i--) {
+    const m = SCREEN_OPT_RE.exec(lines[i]);
+    if (m && m[2] === '1') { start = i; break; }
+  }
+  if (start < 0) return null;
+  const options = [];
+  let hasCheckbox = false;
+  for (let i = start; i < foot; i++) {
+    if (SCREEN_SEP_RE.test(lines[i])) continue;
+    const m = SCREEN_OPT_RE.exec(lines[i]);
+    if (m && Number(m[2]) === options.length + 1) {
+      let label = m[3].trim();
+      let box = m[1] || '';
+      const cm = SCREEN_CHECK_RE.exec(label);
+      if (cm) {
+        box = cm[1];
+        label = label.slice(cm[0].length).trim();
+      }
+      if (box) hasCheckbox = true;
+      options.push({ label, description: '', checked: SCREEN_CHECKED_RE.test(box) });
+    } else if (options.length) {
+      const t = lines[i].trim();
+      // The focusable "Submit" row under the last option is menu chrome, not
+      // an option description.
+      if (/^Submit$/.test(t)) continue;
+      const o = options[options.length - 1];
+      o.description = (o.description ? o.description + ' ' : '') + t;
+    }
+  }
+  if (options.length < 2) return null;
+  // The question: the contiguous text block directly above the options. A
+  // leading "[ ] Header" chip line is the header tab, not question prose.
+  let end = start - 1;
+  while (end >= 0 && SCREEN_SEP_RE.test(lines[end])) end--;
+  let qStart = end;
+  while (qStart >= 0 && !SCREEN_SEP_RE.test(lines[qStart]) && !SCREEN_OPT_RE.test(lines[qStart])) qStart--;
+  qStart++;
+  if (qStart > end) return null;
+  let header = '';
+  const chip = SCREEN_CHIP_RE.exec(lines[qStart].trim());
+  if (chip && qStart < end) {
+    header = chip[1].trim();
+    qStart++;
+  }
+  const question = lines.slice(qStart, end + 1).map((s) => s.trim()).join(' ').trim();
+  if (!question) return null;
+  return {
+    header,
+    question,
+    options,
+    multiSelect: hasCheckbox || /space to (toggle|select)/i.test(lines[foot]),
+  };
+}
+
+// The footerless review screen (see REVIEW_PROMPT_RE): options sit *below*
+// the anchor prompt, and the chosen answers sit above it under a "Review your
+// answers" heading — carried into the card so the user sees what they're
+// confirming. Digits act immediately here, so the ordinary click-sends-digit
+// card works unchanged.
+function parseScreenReview(lines) {
+  let a = -1;
+  for (let i = lines.length - 1; i >= 0; i--) {
+    if (REVIEW_PROMPT_RE.test(lines[i])) { a = i; break; }
+  }
+  if (a < 0) return null;
+  const options = [];
+  for (let i = a + 1; i < lines.length; i++) {
+    if (SCREEN_SEP_RE.test(lines[i])) {
+      if (options.length) break;
+      continue;
+    }
+    const m = SCREEN_OPT_RE.exec(lines[i]);
+    if (m && Number(m[2]) === options.length + 1) {
+      options.push({ label: m[3].trim(), description: '', checked: false });
+    } else break;
+  }
+  if (options.length < 2) return null;
+  let head = -1;
+  for (let i = a - 1; i >= 0; i--) {
+    if (/^\s*Review your answers\s*$/i.test(lines[i])) { head = i; break; }
+  }
+  const summary = head < 0 ? '' : lines.slice(head + 1, a)
+    .map((s) => s.replace(/^[\s●•·]+/, '').trim())
+    .filter(Boolean)
+    .join(' ');
+  return {
+    header: 'Review',
+    question: (summary ? summary + ' — ' : '') + lines[a].trim(),
+    options,
+    multiSelect: false,
+  };
+}
+
+const screenQuestionKey = (pane) => 'screenq:' + pane.id;
+
+function syncScreenQuestion(pane, screen) {
+  const c = pane.chat;
+  if (!c) return;
+  const parsed = !c.viewingHistory && pane.state !== 'dead'
+    ? parseScreenQuestion(screen !== undefined ? screen : screenText(pane))
+    : null;
+  if (!parsed) {
+    removeScreenQuestion(pane);
+    return;
+  }
+  // Re-parsed every probe tick; only touch the DOM when the content changed
+  // (a re-render would drop the clicked-option echo mid-interaction).
+  const key = screenQuestionKey(pane);
+  const sig = safeJson(parsed);
+  if (c.screenQSig === sig && c.byKey.has(key)) return;
+  c.screenQSig = sig;
+  const fresh = !c.byKey.has(key);
+  addQuestionRow(pane, key, {
+    id: key,
+    name: 'AskUserQuestion',
+    input: { questions: [parsed] },
+  });
+  if (fresh && c.pinned) c.list.scrollTop = c.list.scrollHeight;
+}
+
+function removeScreenQuestion(pane) {
+  const c = pane.chat;
+  if (!c) return;
+  c.screenQSig = null;
+  const key = screenQuestionKey(pane);
+  const row = c.byKey.get(key);
+  if (row) {
+    row.remove();
+    c.byKey.delete(key);
+  }
+  c.toolByUseId.delete(key);
+  if (c.pendingQuestions.delete(key)) updateChatBanner(pane);
+}
+
+// While output is flowing, periodically check the screen for a blocking menu.
+// Codex animates its status line while an approval modal waits, so a codex
+// pane never "goes quiet" — without this probe the modal would sit behind
+// "working…" forever (Claude pauses output at its prompts, so the quiet path
+// catches those too; the probe just gets there sooner).
+function probeAttention(pane) {
+  if (pane.disposed || pane.state === 'dead') return stopAttentionProbe(pane);
+  if (pane.state !== 'busy' && pane.state !== 'attention') return;
+  const screen = screenText(pane);
+  syncScreenQuestion(pane, screen);
+  if (MENU_PATTERNS.some((re) => re.test(screen)) || chatHasPendingQuestion(pane)) {
+    pane.menuMiss = 0;
+    setPaneState(pane, 'attention');
+  } else if (pane.state === 'attention' && ++pane.menuMiss >= 2) {
+    // Two consecutive misses before dropping back to busy: a snapshot taken
+    // mid-repaint can briefly show the modal region cleared, and flapping
+    // would re-fire the "needs your input" notification.
+    setPaneState(pane, 'busy');
+  }
+}
+
+function startAttentionProbe(pane) {
+  if (pane.probeTimer) return;
+  pane.menuMiss = 0;
+  pane.probeTimer = setInterval(() => probeAttention(pane), PROBE_MS);
+}
+
+function stopAttentionProbe(pane) {
+  clearInterval(pane.probeTimer);
+  pane.probeTimer = null;
+}
+
 function markActivity(pane, data) {
   if (pane.disposed || pane.state === 'dead') return;
   if (data) pane.buf = ((pane.buf || '') + stripAnsi(data)).slice(-4000);
-  setPaneState(pane, 'busy');
+  // A pane showing a menu keeps emitting output (codex repaints its status
+  // line under the modal) — don't let those repaints flip 'attention' back to
+  // 'busy'; the probe clears it once the menu leaves the screen.
+  if (pane.state !== 'attention') setPaneState(pane, 'busy');
+  startAttentionProbe(pane);
   clearTimeout(pane.idleTimer);
   pane.idleTimer = setTimeout(() => evaluateIdle(pane), IDLE_MS);
 }
 
 function evaluateIdle(pane) {
   if (pane.disposed || pane.state === 'dead') return;
+  stopAttentionProbe(pane); // output is quiet — the screen won't change now
   const buf = pane.buf || '';
 
   // A failed startup command: hint once, right in the terminal.
@@ -428,7 +765,14 @@ function evaluateIdle(pane) {
     return;
   }
   pane.errored = false;
-  const needsYou = ATTENTION_PATTERNS.some((re) => re.test(buf));
+  // Quiet means the turn ended or the CLI is waiting. Judge the visible
+  // screen: a blocking menu, or a turn that finished on a question for the
+  // user, both read "needs you"; anything else is a finished turn.
+  const screen = screenText(pane);
+  syncScreenQuestion(pane, screen);
+  const needsYou = MENU_PATTERNS.some((re) => re.test(screen)) ||
+    QUESTION_PATTERNS.some((re) => re.test(screen)) ||
+    chatHasPendingQuestion(pane);
   setPaneState(pane, needsYou ? 'attention' : 'idle');
 }
 
@@ -624,15 +968,35 @@ function sendToPane(pane, data) {
   markActivity(pane, ''); // typing means this pane is active again
 }
 
-// Send a full prompt to a live pane, exactly like the chat composer would:
-// multi-line text goes through bracketed paste, and Enter follows as its own
-// keystroke once the TUI has ingested the text.
-function deliverPrompt(pane, text) {
-  window.api.transcript.noteSent(pane.id, text);
-  if (pane.chat) addEchoRow(pane, text);
+// Type a prompt into a pane's TUI: multi-line text goes through bracketed
+// paste, and Enter follows as its own keystroke once the TUI has ingested the
+// text. The Codex CLI ("ChatGPT") treats rapid input as a paste burst and an
+// Enter arriving inside that burst becomes a plain newline instead of a
+// submit, so codex threads get a longer gap before the Enter keystroke.
+// `images` are file paths the TUI should attach as actual image input: the
+// Codex composer converts a paste event into an image attachment only when
+// that paste is exactly one image path and nothing else, so each path goes
+// through as its own bracketed paste (its model can't view images from a path
+// in text — codex's view_image tool is unreliable in the Windows sandbox).
+function typePrompt(pane, text, images = []) {
+  for (const p of images) sendToPane(pane, '\x1b[200~' + p + '\x1b[201~');
   if (text.includes('\n')) sendToPane(pane, '\x1b[200~' + text + '\x1b[201~');
-  else sendToPane(pane, text);
-  setTimeout(() => { if (!pane.disposed) sendToPane(pane, '\r'); }, 40);
+  else if (text) sendToPane(pane, text);
+  const delay = pane.agent === 'codex' ? 250 : 40;
+  setTimeout(() => { if (!pane.disposed) sendToPane(pane, '\r'); }, delay);
+}
+
+// Send a full prompt to a live pane, exactly like the chat composer would.
+function deliverPrompt(pane, text, images = []) {
+  if (transcriptSupported(pane)) window.api.transcript.noteSent(pane.id, text);
+  // Echo bubbles only make sense in the transcript-backed chat: the terminal-
+  // backed layer keeps its list hidden (the TUI itself echoes the message), so
+  // a row there would never be seen — or confirmed away.
+  if (pane.chat && transcriptSupported(pane)) {
+    const names = images.map((p) => '🖼 ' + (String(p).split(/[\\/]/).pop() || p));
+    addEchoRow(pane, [text, ...names].filter(Boolean).join('\n'));
+  }
+  typePrompt(pane, text, images);
 }
 
 // ---------------------------------------------------------------------------
@@ -859,20 +1223,45 @@ async function persistImage(file) {
 // Paths with spaces need quoting before they land on an input line.
 const quotePath = (p) => (/\s/.test(p) ? `"${p}"` : p);
 
-// Type an image's path into the pane's prompt so Claude Code can read it.
-// A trailing space lets the user keep typing.
+// The Codex CLI ("ChatGPT") runs sandboxed and can only read files inside its
+// workspace, so an attachment living elsewhere (temp screenshots, files picked
+// or dropped from anywhere on disk) is copied into the project's
+// `.hivemind/attachments/` before its path is sent. Claude reads any path, so
+// its attachments pass through untouched.
+function pathInsideDir(p, dir) {
+  const norm = (s) => {
+    const v = String(s).replace(/\\/g, '/').replace(/\/+$/, '');
+    return window.api.platform === 'win32' ? v.toLowerCase() : v;
+  };
+  return norm(p).startsWith(norm(dir) + '/');
+}
+
+async function stagePathForPane(pane, p) {
+  if (!p || pane.agent !== 'codex') return p;
+  const dir = pane.board && pane.board.dir;
+  if (!dir || pathInsideDir(p, dir)) return p;
+  return (await window.api.stageAttachment(dir, p)) || p;
+}
+
+// Type an image's path into the pane's prompt so the agent can read it.
+// A trailing space lets the user keep typing. Codex only attaches an image as
+// real image input when a paste event is exactly one path (see typePrompt),
+// so there the path goes through as its own bracketed paste instead.
 async function typePathIntoPane(pane, p) {
-  sendToPane(pane, quotePath(p) + ' ');
+  p = await stagePathForPane(pane, p);
+  if (pane.agent === 'codex') sendToPane(pane, '\x1b[200~' + p + '\x1b[201~');
+  else sendToPane(pane, quotePath(p) + ' ');
 }
 
 // ---------------------------------------------------------------------------
 // Chat wrapper
 //
-// A structured chat view layered over each Claude thread. The TUI keeps
-// running in the pane's (covered, never unmounted) xterm; the chat renders
-// the session's transcript JSONL, streamed from main via api.transcript.
-// Input goes through the same sendToPane() path as keystrokes; voice
-// dictation lands in the composer textarea while chat view is showing.
+// A structured chat view layered over a thread. Claude renders from its JSONL
+// transcript; ChatGPT/Codex renders from the Codex CLI's rollout log, which
+// transcript.js normalizes into the same entry shape — so both agents get the
+// same clean bubbles-and-tool-folds view over their hidden terminal.
+// Input goes through the same sendToPane() path as keystrokes; voice dictation
+// lands in the composer textarea while chat view is showing.
 // ---------------------------------------------------------------------------
 const CHAT_KINDS = ['tool', 'thinking', 'meta', 'subagent'];
 const CHAT_KIND_LABELS = { tool: 'Tools', thinking: 'Thinking', meta: 'Meta', subagent: 'Subagents' };
@@ -887,10 +1276,27 @@ function globalChatFilters() {
   }
 }
 
-// The chat view reads Claude Code transcripts — other agents are terminal-only.
-function chatSupported(pane) {
+// Transcript-backed chat: Claude tails its ~/.claude/projects session JSONL;
+// ChatGPT/Codex tails the Codex CLI rollout under ~/.codex/sessions (both
+// normalized to the same entry shape in transcript.js).
+function transcriptSupported(pane) {
+  return pane.agent === 'claude' || pane.agent === 'codex';
+}
+
+// Browsing/resuming past conversations is Claude-only: the history picker and
+// composer-resume both ride on `claude --resume <session-id>`.
+function historySupported(pane) {
   return pane.agent === 'claude';
 }
+
+function chatSupported(pane) {
+  return transcriptSupported(pane);
+}
+
+// Composer placeholder for the live view; history mode swaps in its own
+// "continue this conversation" hint (updateHistoryChrome).
+const CHAT_PLACEHOLDER =
+  'Message this thread…  (Enter sends, Shift+Enter for a new line, paste/drop files to attach)';
 
 function initChatUI(pane, body) {
   const wrap = document.createElement('div');
@@ -1005,7 +1411,7 @@ function initChatUI(pane, body) {
   const input = document.createElement('textarea');
   input.className = 'chat-input';
   input.rows = 1;
-  input.placeholder = 'Message this thread…  (Enter sends, Shift+Enter for a new line, paste/drop files to attach)';
+  input.placeholder = CHAT_PLACEHOLDER;
   input.spellcheck = true;
   const attachBtn = document.createElement('button');
   attachBtn.className = 'chat-attach';
@@ -1047,11 +1453,13 @@ function initChatUI(pane, body) {
   pane.chat = {
     wrap, list, input, sendBtn, banner, bannerText, notice, chips, attachRow, topic, working,
     historyBtn, historyMenu, historyBar, historyBarText,
-    viewingHistory: false,   // true while showing a past session read-only
+    viewingHistory: false,   // true while showing a past session over the live view
+    historySession: null,    // the session being viewed (so the composer can resume it)
     attachments: [],         // { path, name, isImage, thumbUrl } chips awaiting send
     byKey: new Map(),        // row key -> row element
     toolByUseId: new Map(),  // tool_use id -> row key
     pendingResults: new Map(), // tool_use id -> result payload that arrived early
+    pendingQuestions: new Map(), // AskUserQuestion tool_use id -> question text, until answered
     pendingEcho: [],         // optimistic user bubbles awaiting their transcript line
     echoSeq: 0,
     pinned: true,
@@ -1059,6 +1467,18 @@ function initChatUI(pane, body) {
     histIdx: null,           // index into history while browsing; null = live draft
     histDraft: '',           // the in-progress draft stashed when browsing began
   };
+
+  updateChatChrome(pane);
+
+  // Terminal-backed mode insets the terminal by the composer's height so the
+  // TUI's input line stays visible (.pane.term-chat CSS). Track that height as
+  // the textarea autosizes and attachment chips wrap — the observer fires once
+  // on observe, seeding the variable before first paint.
+  new ResizeObserver(() => {
+    if (pane.disposed) return;
+    pane.el.style.setProperty('--chat-composer-h', composer.offsetHeight + 'px');
+    if (pane.el.classList.contains('term-chat')) fitBoard(pane.board.id);
+  }).observe(composer);
 
   // Composer wiring. Keystrokes stay local to the textarea; Enter sends.
   // The autocomplete menu gets first look at keys so ↑/↓/Tab/Enter/Esc can
@@ -1090,7 +1510,7 @@ function initChatUI(pane, body) {
   attachBtn.onclick = async (e) => {
     e.stopPropagation();
     const paths = (await window.api.pickFiles()) || [];
-    for (const p of paths) addChatAttachment(pane, p);
+    for (const p of paths) await addChatAttachment(pane, p);
     input.focus();
   };
 
@@ -1105,14 +1525,14 @@ function initChatUI(pane, body) {
       e.preventDefault();
       const file = imgItem.getAsFile();
       const p = file && (await persistImage(file));
-      if (p) addChatAttachment(pane, p, file);
+      if (p) await addChatAttachment(pane, p, file);
       return;
     }
     if (types.includes('text/plain')) return; // native text paste
     // Raw bitmap on the native clipboard (e.g. Win+Shift+S).
     e.preventDefault();
     const p = await window.api.clipboardImage();
-    if (p) addChatAttachment(pane, p);
+    if (p) await addChatAttachment(pane, p);
   });
 
   // Drag-and-drop files anywhere on the chat view — each becomes a chip.
@@ -1132,7 +1552,7 @@ function initChatUI(pane, body) {
     for (const f of files) {
       // Files already on disk keep their path; in-memory images get persisted.
       const p = f.path || (isImageFile(f) ? await persistImage(f) : null);
-      if (p) addChatAttachment(pane, p, f);
+      if (p) await addChatAttachment(pane, p, f);
     }
     input.focus();
   });
@@ -1189,17 +1609,22 @@ function fileUrlFor(p) {
   return 'file://' + u.split('/').map(encodeURIComponent).join('/').replace(/%3A/gi, ':');
 }
 
-function addChatAttachment(pane, p, file) {
+async function addChatAttachment(pane, p, file) {
   const c = pane.chat;
   if (!c || !p) return;
-  if (c.attachments.some((a) => a.path === p)) return;
+  // Dedupe on the pre-staging path too — staging a source twice would mint a
+  // second copy with a fresh timestamped name and slip past the path check.
+  if (c.attachments.some((a) => a.path === p || a.src === p)) return;
+  const src = p;
+  p = await stagePathForPane(pane, p);
+  if (!p || c.attachments.some((a) => a.path === p)) return;
   const name = String(p).split(/[\\/]/).pop() || String(p);
   const isImage = isImageFile(file) || IMAGE_EXT_RE.test(name);
   // Prefer an object URL when we still hold the bytes (pasted images) — it
   // works even before slow disks flush; fall back to the on-disk path.
   const thumbUrl = !isImage ? null
     : (file && file.size ? URL.createObjectURL(file) : fileUrlFor(p));
-  c.attachments.push({ path: p, name, isImage, thumbUrl });
+  c.attachments.push({ path: p, src, name, isImage, thumbUrl });
   renderChatAttachments(pane);
 }
 
@@ -1475,8 +1900,15 @@ function setPaneView(pane, view, { persist = true } = {}) {
   if (!chatSupported(pane)) view = 'term';
   pane.view = view;
   pane.el.classList.toggle('term-view', view === 'term');
+  // Terminal-backed chat (agents with a composer but no readable session log):
+  // the terminal stays the conversation view, shrunk by the composer's height
+  // (.pane.term-chat CSS) so the TUI's own input line isn't covered. Re-fit
+  // whenever that inset appears/disappears.
+  const termChat = view === 'chat' && !transcriptSupported(pane);
+  const insetChanged = pane.el.classList.contains('term-chat') !== termChat;
+  pane.el.classList.toggle('term-chat', termChat);
   updateViewBtn(pane);
-  if (view === 'term') fitBoard(pane.board.id); // defensive re-fit on reveal
+  if (view === 'term' || insetChanged) fitBoard(pane.board.id); // defensive re-fit on reveal
   if (pane === focusedPane) {
     try {
       if (view === 'chat' && pane.chat) pane.chat.input.focus();
@@ -1486,10 +1918,30 @@ function setPaneView(pane, view, { persist = true } = {}) {
   if (persist) persistLayout(pane.board.id);
 }
 
-// Called when a pane's agent changes: chat for Claude, terminal for the rest.
+function updateChatChrome(pane) {
+  const c = pane.chat;
+  if (!c) return;
+  const transcript = transcriptSupported(pane);
+  c.wrap.classList.toggle('terminal-backed', !transcript);
+  c.historyBtn.style.display = historySupported(pane) ? '' : 'none';
+  c.historyMenu.classList.add('hidden');
+  for (const kind of CHAT_KINDS) {
+    if (c.chips[kind]) c.chips[kind].style.display = transcript ? '' : 'none';
+  }
+  if (!transcript) c.notice.classList.add('hidden');
+  // Claude's topic comes from the transcript's rolling summary; other agents
+  // don't write one, so show the agent name instead.
+  if (pane.agent !== 'claude') {
+    c.topic.textContent = agentFor(pane.agent).label;
+    c.topic.title = agentFor(pane.agent).label + ' thread';
+  }
+}
+
+// Called when a pane's agent changes: chat for supported agents, terminal for the rest.
 function updateChatAvailability(pane) {
   if (!pane.viewBtn) return;
   const ok = chatSupported(pane);
+  updateChatChrome(pane);
   pane.viewBtn.style.display = ok ? '' : 'none';
   setPaneView(pane, ok ? 'chat' : 'term', { persist: false });
 }
@@ -1514,15 +1966,19 @@ function resetChat(pane) {
   c.byKey.clear();
   c.toolByUseId.clear();
   c.pendingResults.clear();
+  c.pendingQuestions.clear();
+  c.screenQSig = null;
   c.pendingEcho = [];
   c.pinned = true;
   c.topic.textContent = '';
   c.topic.title = '';
+  updateChatChrome(pane);
 }
 
 function chatBindStatus(pane, status) {
   const c = pane.chat;
   if (!c) return;
+  if (!transcriptSupported(pane)) return;
   // Don't let a live (re)bind wipe the past conversation being viewed; the
   // live view is rebuilt from scratch when the user clicks "Back to live".
   if (c.viewingHistory) return;
@@ -1613,6 +2069,7 @@ async function openHistorySession(pane, sess) {
   if (pane.disposed || !c) return;
   if (!res || !res.ok) { c.notice.classList.remove('hidden'); return; }
   c.viewingHistory = true;
+  c.historySession = sess; // remembered so the composer can continue this conversation
   resetChat(pane);
   renderChatEntries(pane, res.entries, true);
   if (sess.title) setChatTopic(pane, sess.title);
@@ -1627,10 +2084,12 @@ function exitHistory(pane) {
   hideHistoryMenu(pane);
   if (!c.viewingHistory) return;
   c.viewingHistory = false;
+  c.historySession = null;
   resetChat(pane);
   updateHistoryChrome(pane, null);
   updateChatBanner(pane);              // restore live swirl/banner state
   window.api.transcript.refresh(pane.id); // re-emit the live file to catch up
+  syncScreenQuestion(pane);            // restore a live on-screen question card
 }
 
 function updateHistoryChrome(pane, sess) {
@@ -1642,8 +2101,13 @@ function updateHistoryChrome(pane, sess) {
   c.historyBtn.classList.toggle('active', on);
   if (on) {
     c.historyBarText.textContent =
-      'Viewing a past conversation (read-only)' + (sess.title ? ' · ' + sess.title : '');
+      'Viewing a past conversation' + (sess.title ? ' · ' + sess.title : '');
   }
+  // The composer stays usable in history mode — sending continues the viewed
+  // conversation (the thread restarts on it), so say so where the user types.
+  c.input.placeholder = on
+    ? 'Continue this conversation…  (sending restarts the thread on it)'
+    : CHAT_PLACEHOLDER;
 }
 
 // -- Rendering ---------------------------------------------------------------
@@ -1654,6 +2118,10 @@ function chatIngest(pane, entries, backfill) {
   // exitHistory() re-reads the live file to catch up.
   if (!c || c.viewingHistory) return;
   renderChatEntries(pane, entries, backfill);
+  // A question can land after the pane already went quiet and read 'idle'
+  // (the transcript line trails the screen) — pull the state to 'attention'
+  // now instead of waiting for the next output burst.
+  if (chatHasPendingQuestion(pane) && pane.state === 'idle') setPaneState(pane, 'attention');
 }
 
 function renderChatEntries(pane, entries, backfill) {
@@ -1709,7 +2177,11 @@ function renderChatEntry(pane, e) {
           row.querySelector('.chat-pre').textContent = part.thinking;
         });
       } else if (part.type === 'tool_use') {
-        addToolRow(pane, key, part);
+        if (part.name === 'AskUserQuestion' && part.input && Array.isArray(part.input.questions)) {
+          addQuestionRow(pane, key, part);
+        } else {
+          addToolRow(pane, key, part);
+        }
       }
     });
     return;
@@ -1846,6 +2318,150 @@ function addToolRow(pane, key, part) {
   }
 }
 
+// AskUserQuestion is a prompt *for the human*, not plumbing — render it as a
+// full card (question, options) instead of a collapsed tool fold. Clicking an
+// option presses its number in the hidden TUI, the same quick-key path the
+// attention banner uses; the card greys out once the answer's tool_result
+// lands. While the answer is outstanding the tool_use id sits in
+// pendingQuestions, which drives the pane's "needs you" state.
+function addQuestionRow(pane, key, part) {
+  const c = pane.chat;
+  // A real tool_use from the transcript supersedes the screen-parsed stand-in
+  // (it only lands once the question was answered and the menu left the screen).
+  if (part.id && part.id.indexOf('screenq:') !== 0) removeScreenQuestion(pane);
+  const questions = part.input.questions.filter((q) => q && typeof q === 'object');
+  const isScreenCard = !!(part.id && part.id.indexOf('screenq:') === 0);
+  upsertChatRow(pane, key, 'prompt', (row) => {
+    // The checked look is local echo of the digits this card sent — carry it
+    // across a re-render (transcript re-emits) so clicks don't visually vanish.
+    // Not for screen-parsed cards: there the TUI's own checkbox state is
+    // authoritative, and the same row morphs into the review screen's card —
+    // carrying the old highlights would pre-select "Submit answers".
+    const prevSel = new Set(isScreenCard ? [] :
+      [...row.querySelectorAll('.chat-question-opt.selected')].map((b) => b.dataset.opt));
+    row.innerHTML = '';
+    const card = document.createElement('div');
+    card.className = 'chat-question';
+    let anyMulti = false;
+    questions.forEach((q, qi) => {
+      anyMulti = anyMulti || !!q.multiSelect;
+      const head = document.createElement('div');
+      head.className = 'chat-question-head';
+      if (q.header) {
+        const chip = document.createElement('span');
+        chip.className = 'chat-question-chip';
+        chip.textContent = String(q.header);
+        head.appendChild(chip);
+      }
+      const text = document.createElement('span');
+      text.className = 'chat-question-text';
+      text.textContent = String(q.question || '');
+      head.appendChild(text);
+      card.appendChild(head);
+      const opts = document.createElement('div');
+      opts.className = 'chat-question-options';
+      (Array.isArray(q.options) ? q.options : []).forEach((o, i) => {
+        const label = typeof o === 'string' ? o : String((o && o.label) || '');
+        const btn = document.createElement('button');
+        btn.className = 'chat-question-opt';
+        btn.dataset.opt = qi + ':' + i;
+        // Screen-parsed options carry the TUI's own checkbox state — that's
+        // authoritative (this card re-renders whenever it changes). Transcript
+        // options don't, so the local click echo is all there is.
+        const hasChecked = typeof o === 'object' && o && typeof o.checked === 'boolean';
+        if (hasChecked ? o.checked : prevSel.has(btn.dataset.opt)) {
+          btn.classList.add('selected');
+        }
+        if (q.multiSelect) {
+          const box = document.createElement('span');
+          box.className = 'chat-question-check';
+          btn.appendChild(box);
+        }
+        const num = document.createElement('span');
+        num.className = 'chat-question-num';
+        num.textContent = (i + 1) + '.';
+        const body = document.createElement('span');
+        body.className = 'chat-question-optbody';
+        const lbl = document.createElement('span');
+        lbl.className = 'chat-question-label';
+        lbl.textContent = label;
+        body.appendChild(lbl);
+        const desc = typeof o === 'object' && o && o.description ? String(o.description) : '';
+        if (desc) {
+          const d = document.createElement('span');
+          d.className = 'chat-question-desc';
+          d.textContent = desc;
+          body.appendChild(d);
+        }
+        btn.append(num, body);
+        btn.title = q.multiSelect
+          ? `Toggle "${label}" — presses ${i + 1} in the hidden terminal`
+          : `Answer "${label}" — presses ${i + 1} in the hidden terminal`;
+        btn.onclick = (e) => {
+          e.stopPropagation();
+          if (c.viewingHistory || card.classList.contains('answered') || pane.state === 'dead') return;
+          // Mirror the toggle locally — the TUI checks/unchecks out of sight.
+          if (q.multiSelect) btn.classList.toggle('selected');
+          else {
+            [...opts.children].forEach((x) => x.classList.remove('selected'));
+            btn.classList.add('selected');
+          }
+          sendToPane(pane, String(i + 1));
+        };
+        opts.appendChild(btn);
+      });
+      card.appendChild(opts);
+    });
+    const foot = document.createElement('div');
+    foot.className = 'chat-question-foot';
+    const hint = document.createElement('span');
+    hint.className = 'chat-question-hint';
+    hint.textContent = anyMulti
+      ? 'Multi-select — click options to toggle, then Review to submit. Custom answers need the terminal.'
+      : 'Click an option to answer. For a custom answer, open the terminal.';
+    foot.appendChild(hint);
+    if (anyMulti) {
+      // Enter no longer submits a multi-select (it toggles the highlighted
+      // option) — Tab moves to the Submit tab, whose review screen then
+      // appears as its own card with a "Submit answers" option.
+      const review = document.createElement('button');
+      review.className = 'chat-question-key';
+      review.textContent = 'Review ⇥';
+      review.title = 'Press Tab in the hidden terminal (open the review step, then click Submit answers)';
+      review.onclick = (e) => {
+        e.stopPropagation();
+        if (c.viewingHistory || card.classList.contains('answered') || pane.state === 'dead') return;
+        sendToPane(pane, '\t');
+      };
+      foot.appendChild(review);
+    }
+    const openTerm = document.createElement('button');
+    openTerm.className = 'chat-question-key';
+    openTerm.textContent = 'Open terminal';
+    openTerm.onclick = (e) => { e.stopPropagation(); setPaneView(pane, 'term'); };
+    foot.appendChild(openTerm);
+    card.appendChild(foot);
+    const answer = document.createElement('pre');
+    answer.className = 'chat-question-answer hidden';
+    card.appendChild(answer);
+    row.appendChild(card);
+  });
+  if (part.id) {
+    c.toolByUseId.set(part.id, key);
+    if (!c.viewingHistory) {
+      const brief = String((questions[0] && questions[0].question) || 'Claude is asking a question')
+        .replace(/\s+/g, ' ').trim().slice(0, 200);
+      c.pendingQuestions.set(part.id, brief);
+      updateChatBanner(pane);
+    }
+    const early = c.pendingResults.get(part.id);
+    if (early) {
+      c.pendingResults.delete(part.id);
+      attachToolResult(pane, early.part, early.toolUseResult);
+    }
+  }
+}
+
 function attachToolResult(pane, part, toolUseResult) {
   const c = pane.chat;
   const key = c.toolByUseId.get(part.tool_use_id);
@@ -1864,6 +2480,18 @@ function attachToolResult(pane, part, toolUseResult) {
   }
   if (!text && toolUseResult) {
     text = typeof toolUseResult === 'string' ? toolUseResult : safeJson(toolUseResult);
+  }
+  const card = row.querySelector('.chat-question');
+  if (card) {
+    if (c.pendingQuestions.delete(part.tool_use_id)) updateChatBanner(pane);
+    card.classList.add('answered');
+    const ans = card.querySelector('.chat-question-answer');
+    if (ans) {
+      ans.textContent = clipResult(text || '(answered)');
+      ans.classList.remove('hidden');
+    }
+    row.classList.toggle('tool-error', !!part.is_error);
+    return;
   }
   const out = row.querySelector('.chat-tool-result');
   if (!out) return;
@@ -1941,10 +2569,17 @@ function sendChatMessage(pane) {
     return;
   }
   const typed = text; // the user's typed text, recallable later with ↑
-  // Attachments ride along as quoted paths appended to the message.
+  // Attachments ride along as quoted paths appended to the message — except
+  // images on codex threads, which are handed to typePrompt to paste as real
+  // image attachments (the Codex model can't view an image from a path in
+  // message text; only files ride along as paths there).
+  let images = [];
   if (c.attachments.length) {
-    const paths = c.attachments.map((a) => quotePath(a.path)).join(' ');
-    text = text ? text + '\n' + paths : paths;
+    const attached = pane.agent === 'codex' ? c.attachments.filter((a) => a.isImage) : [];
+    images = attached.map((a) => a.path);
+    const paths = c.attachments.filter((a) => !attached.includes(a))
+      .map((a) => quotePath(a.path)).join(' ');
+    if (paths) text = text ? text + '\n' + paths : paths;
     for (const a of c.attachments) {
       if (a.thumbUrl && a.thumbUrl.startsWith('blob:')) URL.revokeObjectURL(a.thumbUrl);
     }
@@ -1961,7 +2596,29 @@ function sendChatMessage(pane) {
   }
   c.histIdx = null;
   c.histDraft = '';
-  deliverPrompt(pane, text);
+  // Sending while viewing a past conversation continues *that* conversation:
+  // the thread restarts on it (claude --resume <session>) with this message.
+  if (c.viewingHistory && c.historySession) {
+    continueHistorySession(pane, c.historySession, text);
+    return;
+  }
+  deliverPrompt(pane, text, images);
+}
+
+// Continue a past conversation from the history view: restart the thread's
+// claude resuming that session, delivering the typed message as the CLI
+// prompt (the only safe delivery at spawn time — see spawnPty). Claude Code
+// keeps writing under the resumed session id, so the rebuilt chat view binds
+// to that exact file and backfills — past messages plus the new turn.
+function continueHistorySession(pane, sess, text) {
+  const id = String(sess.name || '').replace(/\.jsonl$/i, '');
+  if (pane.agent !== 'claude' || !/^[a-zA-Z0-9-]+$/.test(id)) {
+    // Not resumable (custom agent / odd filename) — fall back to the live chat.
+    exitHistory(pane);
+    if (text) deliverPrompt(pane, text);
+    return;
+  }
+  respawnPane(pane, { resume: id, initialPrompt: text });
 }
 
 // Optimistic echo: show the message immediately; the transcript's real user
@@ -2022,9 +2679,22 @@ function updateChatBanner(pane) {
   c.banner.classList.toggle('error', state === 'error' || state === 'dead');
   if (state === 'dead') {
     c.bannerText.textContent = 'The process behind this thread exited.';
-  } else {
+  } else if (state === 'error') {
     const lines = (pane.buf || '').split('\n').map((s) => s.trim()).filter(Boolean).slice(-3);
-    c.bannerText.textContent = lines.join('\n') || (state === 'error' ? 'The thread hit an error.' : 'The thread needs your input.');
+    c.bannerText.textContent = lines.join('\n') || 'The thread hit an error.';
+  } else if (chatHasPendingQuestion(pane)) {
+    // A question card is sitting in the chat below — point at it rather than
+    // scraping the screen (the TUI's select menu is a worse copy of the card).
+    c.bannerText.textContent = [...c.pendingQuestions.values()].join('\n');
+  } else {
+    // Show the prompt itself, from the visible screen: start at the line the
+    // attention scan matched (the question header) so the codex approval's
+    // command preview and options follow it, not the spinner line under them.
+    const lines = screenText(pane).split('\n').map((s) => s.trim()).filter(Boolean);
+    const i = lines.findIndex((l) =>
+      MENU_PATTERNS.some((re) => re.test(l)) || QUESTION_PATTERNS.some((re) => re.test(l)));
+    const block = i >= 0 ? lines.slice(i, i + 6) : lines.slice(-3);
+    c.bannerText.textContent = block.join('\n') || 'The thread needs your input.';
   }
 }
 
@@ -2109,9 +2779,10 @@ function serializeLayout(boardId) {
   const cols = g.columns.map((col) => ({
     flex: col.flex,
     panes: col.panes.filter((p) => !p.disposed).map((p) => ({
-      name: p.name, agent: p.agent, model: p.model, perm: p.permMode, fontSize: p.fontSize,
+      name: p.name, agent: p.agent, model: p.model, codexModel: p.codexModel, perm: p.permMode, fontSize: p.fontSize,
       flex: p.flex, caption: p.captionText || '', autoName: !!p.autoName,
       planId: p.planId || undefined, // stable per-thread key for the Plan pane
+      sessionId: p.sessionId || undefined, // this thread's Claude session (resume-on-start)
       view: p.view, chatFilters: p.chatFilters,
     })),
   })).filter((c) => c.panes.length);
@@ -2142,9 +2813,9 @@ function rebuildFromLayout(board) {
       const looksAuto = new RegExp('^' + cmd.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + ' \\d+$').test(pd.name || '');
       const autoName = pd.autoName !== undefined ? pd.autoName : looksAuto;
       const pane = createPane(board, colObj, {
-        name: pd.name, agent, model: pd.model, perm: pd.perm, fontSize: pd.fontSize,
+        name: pd.name, agent, model: pd.model, codexModel: pd.codexModel, perm: pd.perm, fontSize: pd.fontSize,
         flex: pd.flex, caption: pd.caption, autoName, planId: pd.planId,
-        view: pd.view, chatFilters: pd.chatFilters,
+        sessionId: pd.sessionId, view: pd.view, chatFilters: pd.chatFilters,
       });
       colObj.panes.push(pane);
       const m = /(\d+)\s*$/.exec(pd.name || '');
@@ -2153,9 +2824,16 @@ function rebuildFromLayout(board) {
   }
   board._seq = maxNum;
   layout(board.id);
-  // Panes are attached now — spawn each PTY at its real size.
+  // Panes are attached now — spawn each PTY at its real size. Resume-on-start
+  // reopens each thread's own saved session (`--resume <id>`); `--continue`
+  // (most recent session in the directory — wrong thread when several share
+  // it) remains only for layouts saved before session ids were tracked.
   for (const col of g.columns) {
-    for (const pane of col.panes) spawnPanePty(pane, { resume: board.resumeOnStart });
+    for (const pane of col.panes) {
+      spawnPanePty(pane, {
+        resume: board.resumeOnStart ? (pane.sessionId || true) : false,
+      });
+    }
   }
   const first = g.columns[0] && g.columns[0].panes[0];
   if (first) focusPane(first);
@@ -2526,21 +3204,43 @@ function addTerminal(board, opts = {}) {
 // backspaced across.
 function spawnPanePty(pane, { resume, initialPrompt } = {}) {
   try { pane.fitAddon.fit(); } catch (_) { /* keep xterm defaults */ }
+  // Pin down which Claude Code session this pane owns, so the transcript
+  // binder can claim `<sessionId>.jsonl` outright instead of pairing files to
+  // panes by timing (which mixed threads up when several shared a directory):
+  //   fresh spawn        → generate a UUID, start claude with --session-id
+  //   resume <id string> → --resume <id>; claude reuses that same session id
+  //   resume true        → --continue (id unknown until the binder finds the
+  //                        file — legacy fallback, e.g. layouts saved before
+  //                        session ids were tracked)
+  if (pane.agent === 'claude') {
+    if (isSessionId(resume)) pane.sessionId = resume;
+    else pane.sessionId = resume ? null : newSessionId();
+  }
   window.api.spawnPty({
     id: pane.id,
     cwd: pane.board.dir,
     cols: pane.term.cols,
     rows: pane.term.rows,
     startupCommand: paneCommand(pane),
-    model: pane.agent === 'claude' ? pane.model : 'default',
+    model: pane.agent === 'claude' ? pane.model
+         : pane.agent === 'codex' ? pane.codexModel
+         : 'default',
     permissionMode: pane.agent === 'claude' ? pane.permMode : 'default',
-    resume: !!resume,
-    initialPrompt: (pane.agent === 'claude' && initialPrompt) || undefined,
+    resume: resume || false, // true → --continue, session-id string → --resume <id>
+    initialPrompt: ((pane.agent === 'claude' || pane.agent === 'codex') && initialPrompt) || undefined,
+    sessionId: (pane.agent === 'claude' && !resume && pane.sessionId) || undefined,
   });
-  // Chat view: bind this pane to the session transcript Claude Code is about
-  // to create (or, on resume, continue) in the board's project directory.
-  if (pane.agent === 'claude') {
-    window.api.transcript.bind({ paneId: pane.id, cwd: pane.board.dir, resume: !!resume });
+  // Transcript-backed chat (Claude, ChatGPT): bind this pane to the session
+  // log its CLI is about to create (or, on resume, continue) for the board's
+  // project directory. sessionId/resume are Claude concepts — codex binds by
+  // rollout cwd + timing/first-message matching instead.
+  if (transcriptSupported(pane)) {
+    window.api.transcript.bind({
+      paneId: pane.id, cwd: pane.board.dir,
+      agent: pane.agent,
+      resume: pane.agent === 'claude' && !!resume,
+      sessionId: (pane.agent === 'claude' && pane.sessionId) || undefined,
+    });
     // An initial prompt reaches claude as a CLI argument, not via the composer,
     // so report it to the binder ourselves — otherwise the new session file
     // can't be text-matched to this pane and can bind to another thread that's
@@ -2560,6 +3260,7 @@ function createPane(board, col, opts = {}) {
   const startName = opts.name ||
     (startAgent === 'claude' ? (board.startupCommand || 'claude') : agentFor(startAgent).command);
   const startModel = isValidModel(opts.model) ? opts.model : defaultModel;
+  const startCodexModel = isValidCodexModel(opts.codexModel) ? opts.codexModel : defaultCodexModel;
   const startPerm = isValidPerm(opts.perm) ? opts.perm : defaultPerm;
   const startFont = opts.fontSize ? clampFont(opts.fontSize) : defaultFontSize;
   const el = document.createElement('div');
@@ -2620,6 +3321,18 @@ function createPane(board, col, opts = {}) {
   }
   modelSelect.value = startModel;
   if (startAgent !== 'claude') modelSelect.style.display = 'none';
+  // ChatGPT model this thread runs Codex with (see setPaneCodexModel).
+  const codexModelSelect = document.createElement('select');
+  codexModelSelect.className = 'model-select';
+  codexModelSelect.title = 'ChatGPT model for this thread — changing it restarts the thread';
+  for (const m of CODEX_MODELS) {
+    const opt = document.createElement('option');
+    opt.value = m.value;
+    opt.textContent = m.label;
+    codexModelSelect.appendChild(opt);
+  }
+  codexModelSelect.value = startCodexModel;
+  if (startAgent !== 'codex') codexModelSelect.style.display = 'none';
   // Permission mode this thread starts Claude Code in (see setPanePerm).
   const permSelect = document.createElement('select');
   permSelect.className = 'model-select perm-select';
@@ -2640,7 +3353,7 @@ function createPane(board, col, opts = {}) {
   // Chat/terminal view toggle (Claude threads only — see initChatUI).
   const viewBtn = document.createElement('button');
   viewBtn.className = 'font-btn view-btn';
-  header.append(dot, titleWrap, statusEl, agentSelect, modelSelect, permSelect, viewBtn, fontDownBtn, fontUpBtn, zoomBtn, closeBtn);
+  header.append(dot, titleWrap, statusEl, agentSelect, modelSelect, codexModelSelect, permSelect, viewBtn, fontDownBtn, fontUpBtn, zoomBtn, closeBtn);
 
   const termWrap = document.createElement('div');
   termWrap.className = 'pane-term';
@@ -2697,18 +3410,23 @@ function createPane(board, col, opts = {}) {
   term.open(termWrap);
 
   const pane = {
-    id, el, term, fitAddon, searchAddon, dot, statusEl, agentSelect, modelSelect, permSelect, title, caption,
+    id, el, term, fitAddon, searchAddon, dot, statusEl, agentSelect, modelSelect, codexModelSelect, permSelect, title, caption,
     findBar, findInput, viewBtn, flex: opts.flex || 1, col, board, disposed: false,
-    name: startName, state: null, buf: '', idleTimer: null,
-    fontSize: startFont, agent: startAgent, model: startModel, permMode: startPerm, captionText: '', capBuf: '',
+    name: startName, state: null, buf: '', idleTimer: null, probeTimer: null, menuMiss: 0,
+    fontSize: startFont, agent: startAgent, model: startModel, codexModel: startCodexModel, permMode: startPerm, captionText: '', capBuf: '',
     errored: false, hintShown: false,
     planId: opts.planId || null, // assigned lazily the first time the Plan pane needs it
+    // Claude Code session id this pane owns. Set before spawn (fresh threads
+    // get a generated UUID passed as --session-id; resumes reuse the old id)
+    // and updated whenever the transcript binder reports the bound file — so
+    // it survives /clear rollovers and app restarts (it's saved in the layout).
+    sessionId: isSessionId(opts.sessionId) ? opts.sessionId : null,
 
     // Chat wrapper: which layer is on top ('chat' | 'term'), what the chat view
     // shows, and its live render state (built in initChatUI).
     view: opts.view === 'chat' || opts.view === 'term'
       ? opts.view
-      : (startAgent === 'claude' ? 'chat' : 'term'),
+      : (chatSupported({ agent: startAgent }) ? 'chat' : 'term'),
     chatFilters: Object.assign(globalChatFilters(), opts.chatFilters || {}),
     chat: null,
 
@@ -2724,7 +3442,7 @@ function createPane(board, col, opts = {}) {
 
   // Wire IO
   term.onData((data) => sendToPane(pane, data));
-  el.addEventListener('mousedown', () => focusPane(pane));
+  el.addEventListener('mousedown', (e) => focusPane(pane, e));
 
   // Double-click the title to rename the thread (single click still focuses).
   // The caption is wired too, since it replaces the name once the thread is titled.
@@ -2758,6 +3476,10 @@ function createPane(board, col, opts = {}) {
   // Model dropdown: switch the model this thread runs (live, if it's started).
   modelSelect.addEventListener('mousedown', (e) => e.stopPropagation());
   modelSelect.onchange = (e) => { e.stopPropagation(); setPaneModel(pane, modelSelect.value); persistLayout(board.id); };
+
+  // ChatGPT model dropdown: switch the Codex model (restarts a running thread).
+  codexModelSelect.addEventListener('mousedown', (e) => e.stopPropagation());
+  codexModelSelect.onchange = (e) => { e.stopPropagation(); setPaneCodexModel(pane, codexModelSelect.value); persistLayout(board.id); };
 
   // Permission dropdown: change the mode Claude starts in (restarts the thread).
   permSelect.addEventListener('mousedown', (e) => e.stopPropagation());
@@ -2915,6 +3637,7 @@ function closePane(pane) {
   if (pane.disposed) return;
   pane.disposed = true;
   clearTimeout(pane.idleTimer);
+  stopAttentionProbe(pane);
   window.api.killPty(pane.id);
   window.api.transcript.unbind(pane.id);
   try { pane.term.dispose(); } catch (_) { /* ignore */ }
@@ -2939,14 +3662,20 @@ function closePane(pane) {
 }
 
 let focusedPane = null;
-function focusPane(pane) {
+function focusPane(pane, ev) {
   const changed = focusedPane !== pane;
   if (focusedPane && focusedPane !== pane) focusedPane.el.classList.remove('focused');
   focusedPane = pane;
   pane.el.classList.add('focused');
   setDoneGlow(pane, false); // visiting the thread acknowledges its finished turn
   try {
-    if (pane.view === 'chat' && pane.chat) pane.chat.input.focus();
+    // Terminal-backed chat: a click landing on the visible terminal is direct
+    // TUI interaction (approval menus want raw arrow keys, which the composer
+    // would swallow as history recall) — give the terminal the focus. Any
+    // other route into the pane focuses the composer as usual.
+    const termClick = ev && pane.el.classList.contains('term-chat') &&
+      pane.term.element && pane.term.element.contains(ev.target);
+    if (pane.view === 'chat' && pane.chat && !termClick) pane.chat.input.focus();
     else pane.term.focus();
   } catch (_) { /* ignore */ }
   // The Plan pane always mirrors the focused thread's plan.
@@ -2991,6 +3720,7 @@ window.api.onPtyExit(({ id }) => {
   const pane = findPane(id);
   if (pane && !pane.disposed) {
     clearTimeout(pane.idleTimer);
+    stopAttentionProbe(pane);
     setPaneState(pane, 'dead');
     pane.term.write('\r\n\x1b[90m[process exited]\x1b[0m\r\n');
   }
@@ -3002,9 +3732,23 @@ window.api.transcript.onEntries(({ paneId, entries, backfill }) => {
   if (pane && !pane.disposed) chatIngest(pane, entries || [], !!backfill);
 });
 
-window.api.transcript.onStatus(({ paneId, status }) => {
+window.api.transcript.onStatus(({ paneId, status, file }) => {
   const pane = findPane(paneId);
-  if (pane && !pane.disposed) chatBindStatus(pane, status);
+  if (!pane || pane.disposed) return;
+  // Remember which session this pane is bound to (the file is
+  // `<session-id>.jsonl`). Heuristic binds and /clear rollovers are how a
+  // pane learns its id; it's persisted in the layout so a restart can
+  // `--resume` this exact conversation instead of `--continue`-ing whatever
+  // session in the directory happens to be the most recent. Claude only:
+  // codex rollout filenames also end in a uuid, but it isn't resumable here.
+  if (pane.agent === 'claude' && status === 'bound' && typeof file === 'string') {
+    const sid = (/([0-9a-f-]{36})\.jsonl$/i.exec(file) || [])[1];
+    if (isSessionId(sid) && sid !== pane.sessionId) {
+      pane.sessionId = sid;
+      persistLayout(pane.board.id);
+    }
+  }
+  chatBindStatus(pane, status);
 });
 
 // Click anywhere outside an open history menu closes it.
@@ -4503,7 +5247,7 @@ async function requestPlanFromThread() {
   let since = 0;
   if (dir) { const cur = await window.api.plan.read(dir, planId); if (cur && cur.ok) since = cur.mtime || 0; }
   const rel = '.hivemind/plans/' + planId + '.md';
-  sendToPane(pane, `Write your current plan to ${rel} as GitHub-flavoured markdown, overwriting any existing file. Create the folder if needed.\r`);
+  typePrompt(pane, `Write your current plan to ${rel} as GitHub-flavoured markdown, overwriting any existing file. Create the folder if needed.`);
   setPlanMsg('Asked the thread to write its plan — it will appear here once written.', 'ok');
   const token = { planId, since };
   planAwait = token;
@@ -5924,6 +6668,15 @@ function syncGeneralFields() {
     }
   }
   if (sm) sm.value = defaultModel;
+  const scm = $('set-default-codex-model');
+  if (scm && !scm.options.length) {
+    for (const m of CODEX_MODELS) {
+      const opt = document.createElement('option');
+      opt.value = m.value; opt.textContent = m.label;
+      scm.appendChild(opt);
+    }
+  }
+  if (scm) scm.value = defaultCodexModel;
   const sf = $('set-default-font');
   if (sf) sf.value = String(defaultFontSize);
   const sn = $('set-notify');
@@ -6134,6 +6887,13 @@ if (setModelSel) setModelSel.addEventListener('change', () => {
   if (isValidModel(setModelSel.value)) {
     defaultModel = setModelSel.value;
     localStorage.setItem('hm.model', defaultModel);
+  }
+});
+const setCodexModelSel = $('set-default-codex-model');
+if (setCodexModelSel) setCodexModelSel.addEventListener('change', () => {
+  if (isValidCodexModel(setCodexModelSel.value)) {
+    defaultCodexModel = setCodexModelSel.value;
+    localStorage.setItem('hm.codexModel', defaultCodexModel);
   }
 });
 const setFontInput = $('set-default-font');

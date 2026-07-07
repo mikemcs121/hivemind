@@ -374,7 +374,26 @@ button.usage-pill.crit { color: var(--danger); }
   background: var(--bg);
 }
 .pane.term-view .chat-wrap { display: none; }
-
+.pane:not(.term-view) .chat-wrap.terminal-backed {
+  background: transparent;
+  pointer-events: none;
+}
+.pane:not(.term-view) .chat-wrap.terminal-backed .chat-filters,
+.pane:not(.term-view) .chat-wrap.terminal-backed .chat-list,
+.pane:not(.term-view) .chat-wrap.terminal-backed .chat-notice,
+.pane:not(.term-view) .chat-wrap.terminal-backed .chat-banner,
+.pane:not(.term-view) .chat-wrap.terminal-backed .chat-history-bar {
+  display: none;
+}
+.pane:not(.term-view) .chat-wrap.terminal-backed .chat-composer {
+  margin-top: auto;
+  pointer-events: auto;
+  background: var(--bg-alt);
+}
+/* The terminal underneath stays the conversation view, so it gets shorter by
+   the composer's measured height (--chat-composer-h, kept current from JS)
+   instead of having its bottom rows — the TUI's own input line — covered. */
+.pane.term-chat .pane-term { margin-bottom: var(--chat-composer-h, 54px); }
 /* Header bar: conversation topic on the left, filter chips on the right. */
 .chat-filters {
   display: flex;
@@ -547,8 +566,11 @@ button.usage-pill.crit { color: var(--danger); }
 }
 .chat-history-bar button:hover { border-color: var(--accent); }
 
-/* The composer is hidden while viewing a past (read-only) conversation. */
-.chat-wrap.viewing-history .chat-composer { display: none; }
+/* While viewing a past conversation the composer stays usable — sending
+   continues that conversation (the thread restarts on it via --resume).
+   The interrupt button is hidden: it targets the live process, which isn't
+   what's on screen. */
+.chat-wrap.viewing-history .chat-interrupt { display: none; }
 
 /* Working indicator: a spinning swirl while the thread is busy on a turn.
    Lives inside .chat-list as its last child, under the newest message. */
@@ -633,6 +655,102 @@ button.usage-pill.crit { color: var(--danger); }
 .chat-tool-name { color: var(--accent); font-weight: 600; }
 .chat-tool-sum { font-family: 'Cascadia Code', Consolas, monospace; font-size: calc(var(--pane-font, 13px) - 2px); }
 .chat-row.tool-error .chat-tool-name { color: var(--danger); }
+
+/* AskUserQuestion card: a prompt for the human, so it renders in full —
+   question, clickable options — instead of a collapsed tool fold. */
+.chat-question {
+  max-width: 92%;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px 12px;
+  border: 1px solid var(--peach);
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--peach) 8%, transparent);
+  font-size: var(--pane-font, 13px);
+}
+.chat-question.answered {
+  border-color: var(--border);
+  background: transparent;
+  opacity: .75;
+}
+.chat-question-head { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; }
+.chat-question-chip {
+  flex: none;
+  padding: 1px 8px;
+  border: 1px solid var(--peach);
+  border-radius: 999px;
+  font-size: calc(var(--pane-font, 13px) - 3px);
+  color: var(--peach);
+  white-space: nowrap;
+}
+.chat-question.answered .chat-question-chip { border-color: var(--border); color: var(--muted); }
+.chat-question-text { color: var(--text); word-break: break-word; }
+.chat-question-options { display: flex; flex-direction: column; gap: 4px; }
+.chat-question-opt {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 5px 9px;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: var(--surface);
+  color: var(--text);
+  text-align: left;
+  cursor: pointer;
+  font-size: calc(var(--pane-font, 13px) - 1px);
+}
+.chat-question-opt:hover { border-color: var(--accent); }
+.chat-question.answered .chat-question-opt { cursor: default; }
+.chat-question.answered .chat-question-opt:hover { border-color: var(--border); }
+/* Local echo of what this card sent — the TUI checks options out of sight. */
+.chat-question-opt.selected {
+  border-color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 10%, var(--surface));
+}
+.chat-question.answered .chat-question-opt.selected,
+.chat-question.answered .chat-question-opt.selected:hover { border-color: var(--accent); }
+.chat-question-check { flex: none; color: var(--muted); }
+.chat-question-check::before { content: '☐'; }
+.chat-question-opt.selected .chat-question-check { color: var(--accent); }
+.chat-question-opt.selected .chat-question-check::before { content: '☑'; }
+.chat-question-num { flex: none; color: var(--muted); }
+.chat-question-optbody { display: flex; flex-direction: column; gap: 1px; min-width: 0; }
+.chat-question-label { font-weight: 600; word-break: break-word; }
+.chat-question-desc {
+  font-size: calc(var(--pane-font, 13px) - 2px);
+  color: var(--muted);
+  word-break: break-word;
+}
+.chat-question-foot { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.chat-question.answered .chat-question-foot { display: none; }
+.chat-question-hint { flex: 1; min-width: 0; font-size: calc(var(--pane-font, 13px) - 3px); color: var(--muted); }
+.chat-question-key {
+  flex: none;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  color: var(--text);
+  border-radius: 5px;
+  font-size: 11px;
+  padding: 3px 8px;
+  cursor: pointer;
+}
+.chat-question-key:hover { border-color: var(--accent); }
+.chat-question-answer {
+  margin: 0;
+  padding: 6px 8px;
+  background: var(--bg-alt);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  font-family: 'Cascadia Code', Consolas, monospace;
+  font-size: calc(var(--pane-font, 13px) - 2px);
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 160px;
+  overflow-y: auto;
+}
+.chat-question-answer.hidden { display: none; }
+.chat-row.tool-error .chat-question { border-color: var(--danger); }
 .chat-pre {
   margin: 4px 0 0 14px;
   padding: 6px 8px;
@@ -980,17 +1098,28 @@ button.usage-pill.crit { color: var(--danger); }
   position: relative;
   display: flex; align-items: center; justify-content: center;
   flex: 0 0 auto; width: 30px; height: 30px;
+  box-sizing: border-box;
   background: var(--surface); border: 1px solid var(--border); border-radius: 7px;
   color: var(--muted); cursor: pointer;
+  overflow: visible;
   transition: color .12s ease, background .12s ease, border-color .12s ease, transform .06s ease;
 }
-.git-openweb .gh-mark { display: block; }
+.git-openweb .gh-mark {
+  display: block;
+  flex: none;
+  width: 16px;
+  height: 16px;
+  overflow: visible;
+}
 /* External-open arrow: tucked top-right, hidden until hover/focus. */
 .git-openweb .gh-out {
   position: absolute; top: 3px; right: 3px;
+  width: 9px;
+  height: 9px;
   opacity: 0; transform: translate(-1px, 1px);
   transition: opacity .12s ease, transform .12s ease;
   pointer-events: none;
+  overflow: visible;
 }
 .git-openweb:hover {
   color: var(--text); background: var(--panel);

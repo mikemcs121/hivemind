@@ -31,6 +31,35 @@ function isNewer(latest, current) {
   return false;
 }
 
+// Delete older portable exes (and orphaned .part downloads) sitting next to
+// the running one. If a post-update cleanup batch ever fails, the previous
+// version's exe stays behind and launching it re-triggers the update prompt.
+// Best-effort: anything still locked is retried on the next launch. Matches
+// both the release-asset name ("Hivemind.0.1.7.portable.exe") and the name
+// the updater downloads to ("Hivemind 0.1.7 portable.exe"). Newer-versioned
+// siblings are left alone.
+function cleanupStaleExes() {
+  const currentExe = process.env.PORTABLE_EXECUTABLE_FILE;
+  const dir = path.dirname(currentExe);
+  let entries;
+  try { entries = fs.readdirSync(dir); } catch (_) { return; }
+  for (const name of entries) {
+    const full = path.join(dir, name);
+    if (full.toLowerCase() === currentExe.toLowerCase()) continue;
+    const exeMatch = /^hivemind[ .](\d+\.\d+\.\d+)[ .]portable\.exe$/i.exec(name);
+    if (exeMatch) {
+      if (isNewer(app.getVersion(), exeMatch[1])) {
+        try { fs.unlinkSync(full); } catch (_) { /* still locked — next launch */ }
+      }
+      continue;
+    }
+    // A finished download gets renamed, so any surviving .part is a dead one.
+    if (/^hivemind[ .].*portable\.exe\.part$/i.test(name)) {
+      try { fs.unlinkSync(full); } catch (_) { /* still locked — next launch */ }
+    }
+  }
+}
+
 function httpsGet(url, redirectsLeft = 5) {
   return new Promise((resolve, reject) => {
     const req = https.get(url, {
@@ -72,6 +101,8 @@ function downloadToFile(url, destPath) {
 
 async function checkForUpdates(win) {
   if (!process.env.PORTABLE_EXECUTABLE_FILE) return;
+
+  cleanupStaleExes();
 
   try {
     const { statusCode, body } = await httpsGet(`https://api.github.com/repos/${REPO}/releases/latest`);

@@ -1,18 +1,26 @@
 'use strict';
 
 // Transcript tailing for the chat wrapper. Claude Code writes a JSONL
-// transcript per session under ~/.claude/projects/<encoded-project-dir>/.
-// Each chat-view pane binds to "its" session file and receives every appended
-// line as a parsed entry, which the renderer classifies into chat rows. The
+// transcript per session under ~/.claude/projects/<encoded-project-dir>/;
+// OpenAI's Codex CLI ("ChatGPT") writes a rollout JSONL per session under
+// ~/.codex/sessions/YYYY/MM/DD/. Each chat-view pane binds to "its" session
+// file and receives every appended line as a parsed entry, which the renderer
+// classifies into chat rows. Codex lines are normalized here into the same
+// entry shape Claude produces, so one chat renderer serves both agents. The
 // interactive TUI in the pane's PTY is untouched — this module only reads.
 //
 // The hard part is deciding which file belongs to which pane when several
 // panes run in the same project directory. Rules (in order):
+//   0. A pane bound with an explicit `sessionId` claims `<sessionId>.jsonl`
+//      outright — Hivemind starts claude with `--session-id <uuid>` (fresh
+//      threads) or `--resume <uuid>` (which reuses the same session id), so
+//      the file is known up front and none of the guessing below applies.
 //   1. A file binds to at most one pane (synchronous claims, no races).
 //   2. Fresh panes take an unclaimed file created after the pane spawned
 //      (with slack for the shell-startup delay before `claude` is typed).
-//   3. Resume panes (--continue) prefer a fresh file too — current Claude
-//      Code re-emits the resumed history into a new session file — but fall
+//   3. Resume panes (--continue) prefer a fresh file (older Claude Code
+//      re-emitted resumed history into a new session file; current versions
+//      reuse the original id and keep appending to the old file) and fall
 //      back to the most recently modified unclaimed pre-existing file if no
 //      new one appears within RESUME_FALLBACK_MS.
 //   4. A candidate whose first user message matches text exactly one waiting
@@ -46,6 +54,16 @@ const LAST_SENT_MAX = 5;
 const encodeProjectDir = (cwd) => String(cwd).replace(/[^a-zA-Z0-9]/g, '-');
 const transcriptDirFor = (cwd) =>
   path.join(os.homedir(), '.claude', 'projects', encodeProjectDir(cwd));
+const codexSessionsRoot = () => path.join(os.homedir(), '.codex', 'sessions');
+
+// Codex rollouts for every project share one date-partitioned tree, so panes
+// can't be scoped by directory — each rollout's session_meta line carries the
+// session's cwd instead, and binding filters candidates on it.
+const normPath = (p) => {
+  let r;
+  try { r = path.resolve(String(p)); } catch (_) { r = String(p); }
+  return process.platform === 'win32' ? r.toLowerCase() : r;
+};
 
 let send = () => {};
 
@@ -53,24 +71,32 @@ const watchers = new Map(); // dir -> { fsWatcher, pollTimer, scanTimer, refCoun
 const panes = new Map();    // paneId -> pane record
 const claims = new Map();   // filePath -> paneId
 const retired = new Set();  // once-claimed files — never rollover targets again
-const tails = new Map();    // filePath -> { offset, partial (Buffer) }
+const tails = new Map();    // filePath -> { offset, partial (Buffer), lineNo }
 const firstUser = new Map(); // filePath -> { sizeChecked, text } (bind heuristics)
+const codexMeta = new Map(); // filePath -> { sizeChecked, cwd } (session_meta peek)
 
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
 
-function bind({ paneId, cwd, resume }, sendFn) {
+const SESSION_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+function bind({ paneId, cwd, resume, sessionId, agent }, sendFn) {
   if (sendFn) send = sendFn;
   unbind(paneId); // re-bind safely (respawn under the same id, defensive)
-  const dir = transcriptDirFor(cwd);
+  const kind = agent === 'codex' ? 'codex' : 'claude';
+  const dir = kind === 'codex' ? codexSessionsRoot() : transcriptDirFor(cwd);
   const pane = {
     paneId,
+    agent: kind,
+    cwd: String(cwd || ''),
     dir,
-    resume: !!resume,
+    resume: kind === 'claude' && !!resume,
+    deterministic: false,
+    timedOut: false,
     registeredAt: Date.now(),
     allowPreExisting: false,
-    preExisting: snapshotDir(dir),
+    preExisting: kind === 'claude' ? snapshotDir(dir) : new Set(),
     boundFile: null,
     boundAt: 0,
     lastSent: [],
@@ -80,7 +106,40 @@ function bind({ paneId, cwd, resume }, sendFn) {
     fallbackTimer: null,
   };
   panes.set(paneId, pane);
-  ensureWatcher(dir);
+  ensureWatcher(dir, kind === 'codex'); // the codex tree is date-partitioned
+
+  // Codex creates its rollout lazily (often only once the first message is
+  // sent), so a fresh pane can sit unbound for minutes — that's normal, not
+  // worth the "can't find the transcript" notice. Stay quietly 'searching'.
+  if (kind === 'codex') {
+    emitStatus(pane, 'searching');
+    scanDir(dir);
+    return { ok: true };
+  }
+
+  // Rule 0: the renderer knows this pane's session id (it started claude with
+  // --session-id or --resume <id>), so the transcript file is known up front.
+  // Claim it immediately — even before claude has created it; tailing starts
+  // the moment it appears. If it never appears, tell the renderer we're stuck.
+  if (typeof sessionId === 'string' && SESSION_ID_RE.test(sessionId)) {
+    const file = path.join(dir, sessionId + '.jsonl');
+    const ownerId = claims.get(file);
+    if (!ownerId || !panes.has(ownerId)) {
+      pane.deterministic = true;
+      retired.delete(file); // resuming a file a closed/respawned pane released
+      claimFile(pane, file);
+      pane.timeoutTimer = setTimeout(() => {
+        pane.timeoutTimer = null;
+        if (pane.boundFile && !fs.existsSync(pane.boundFile)) {
+          pane.timedOut = true;
+          emitStatus(pane, 'timeout');
+        }
+      }, BIND_TIMEOUT_MS);
+      return { ok: true };
+    }
+    // Same session claimed by another live pane (shouldn't happen — ids are
+    // per-pane UUIDs). Fall through to the heuristics rather than fight.
+  }
 
   if (pane.resume) {
     pane.fallbackTimer = setTimeout(() => {
@@ -241,6 +300,7 @@ function refresh(paneId) {
   if (tail) {
     tail.offset = 0;
     tail.partial = Buffer.alloc(0);
+    tail.lineNo = 0;
   }
   readAppended(pane, pane.boundFile, true);
   return { ok: true };
@@ -250,13 +310,13 @@ function refresh(paneId) {
 // Directory watching
 // ---------------------------------------------------------------------------
 
-function ensureWatcher(dir) {
+function ensureWatcher(dir, recursive) {
   let w = watchers.get(dir);
   if (w) {
     w.refCount += 1;
     return;
   }
-  w = { fsWatcher: null, pollTimer: null, scanTimer: null, refCount: 1 };
+  w = { fsWatcher: null, pollTimer: null, scanTimer: null, refCount: 1, recursive: !!recursive };
   watchers.set(dir, w);
   tryWatch(dir, w);
   // Poll fallback: catches missed append events, the directory not existing
@@ -269,7 +329,7 @@ function ensureWatcher(dir) {
 
 function tryWatch(dir, w) {
   try {
-    w.fsWatcher = fs.watch(dir, () => {
+    w.fsWatcher = fs.watch(dir, { recursive: w.recursive }, () => {
       // Coalesce event storms (one write can fire several events).
       if (w.scanTimer) return;
       w.scanTimer = setTimeout(() => {
@@ -307,6 +367,49 @@ function snapshotDir(dir) {
   return known;
 }
 
+// Enumerate candidate session files. Claude: the project dir's *.jsonl.
+// Codex: rollout-*.jsonl in the date dirs a fresh spawn could land in —
+// today and yesterday (clock slack around midnight); older files can't be
+// new-bind candidates anyway, and bound files are re-added by the caller.
+function listSessionFiles(dir, agent) {
+  const stats = new Map();
+  if (agent === 'codex') {
+    for (const day of codexRecentDateDirs(dir)) {
+      let names;
+      try { names = fs.readdirSync(day); } catch (_) { continue; }
+      for (const name of names) {
+        if (!/^rollout-.*\.jsonl$/i.test(name)) continue;
+        const file = path.join(day, name);
+        try { stats.set(file, fs.statSync(file)); } catch (_) { /* vanished */ }
+      }
+    }
+    return stats;
+  }
+  let names;
+  try { names = fs.readdirSync(dir); } catch (_) { return null; }
+  for (const name of names) {
+    if (!name.endsWith('.jsonl')) continue;
+    const file = path.join(dir, name);
+    try { stats.set(file, fs.statSync(file)); } catch (_) { /* vanished */ }
+  }
+  return stats;
+}
+
+// Codex partitions rollouts by local date: <root>/YYYY/MM/DD.
+function codexRecentDateDirs(root) {
+  const out = [];
+  for (const back of [0, 1]) {
+    const t = new Date(Date.now() - back * 24 * 60 * 60 * 1000);
+    out.push(path.join(
+      root,
+      String(t.getFullYear()),
+      String(t.getMonth() + 1).padStart(2, '0'),
+      String(t.getDate()).padStart(2, '0')
+    ));
+  }
+  return out;
+}
+
 // ---------------------------------------------------------------------------
 // Scanning: tail bound files, bind waiting panes, handle session rollover
 // ---------------------------------------------------------------------------
@@ -314,21 +417,31 @@ function snapshotDir(dir) {
 function scanDir(dir) {
   const dirPanes = [...panes.values()].filter((p) => p.dir === dir);
   if (!dirPanes.length) return;
+  // A watched dir is either one Claude project dir or the shared codex root,
+  // so every pane in it runs the same agent.
+  const agent = dirPanes[0].agent;
 
-  const stats = new Map(); // filePath -> fs.Stats
-  try {
-    for (const name of fs.readdirSync(dir)) {
-      if (!name.endsWith('.jsonl')) continue;
-      const file = path.join(dir, name);
-      try { stats.set(file, fs.statSync(file)); } catch (_) { /* vanished */ }
+  const stats = listSessionFiles(dir, agent); // filePath -> fs.Stats
+  if (!stats) return; // dir doesn't exist yet
+
+  // A long-running session can outlive the recent-date windows the codex
+  // enumeration scans — keep tailing bound files wherever they live.
+  for (const pane of dirPanes) {
+    if (pane.boundFile && !stats.has(pane.boundFile)) {
+      try { stats.set(pane.boundFile, fs.statSync(pane.boundFile)); } catch (_) { /* gone */ }
     }
-  } catch (_) {
-    return; // dir doesn't exist yet
   }
 
   // 1. Tail every bound file.
   for (const pane of dirPanes) {
     if (pane.boundFile && stats.has(pane.boundFile)) {
+      // A deterministic bind whose file was slow to appear may have reported
+      // 'timeout' — the file is here now, so re-announce the bind (nothing was
+      // ingested while it didn't exist, so the renderer's reset is harmless).
+      if (pane.timedOut) {
+        pane.timedOut = false;
+        emitStatus(pane, 'bound', pane.boundFile);
+      }
       checkTail(pane, stats.get(pane.boundFile));
     }
   }
@@ -347,7 +460,7 @@ function scanDir(dir) {
     // no matter how file/pane ages would pair up below.
     for (const file of unclaimed) {
       const st = stats.get(file);
-      const text = firstUserText(file, st.size);
+      const text = firstUserText(file, st.size, agent);
       if (!text) continue;
       const matches = waiting.filter(
         (p) => !p.boundFile && p.lastSent.includes(text) && paneAccepts(p, file, st)
@@ -371,7 +484,7 @@ function scanDir(dir) {
         const st = stats.get(f);
         // A newborn file whose first user line hasn't hit disk yet may
         // text-match another pane once it lands — don't age-pair it away.
-        if (Date.now() - birthMs(st) < TEXT_GRACE_MS && !firstUserText(f, st.size)) return false;
+        if (Date.now() - birthMs(st) < TEXT_GRACE_MS && !firstUserText(f, st.size, agent)) return false;
         // A pane that has waited far longer than a Claude boot yields a
         // just-born file to a just-spawned pane: new session files follow new
         // spawns, not threads whose session never materialized ages ago.
@@ -397,8 +510,10 @@ function scanDir(dir) {
         const ownerId = claims.get(file);
         if (!ownerId || ownerId === pane.paneId) continue;
         const owner = panes.get(ownerId);
-        if (!owner || !paneAccepts(pane, file, st)) continue;
-        const text = firstUserText(file, st.size);
+        // A deterministic claim is ground truth (claude was told that session
+        // id) — never steal it, even on a text match.
+        if (!owner || owner.deterministic || !paneAccepts(pane, file, st)) continue;
+        const text = firstUserText(file, st.size, agent);
         if (!text || !pane.lastSent.includes(text) || owner.lastSent.includes(text)) continue;
         releaseFile(owner);
         emitStatus(owner, 'searching');
@@ -422,9 +537,15 @@ function scanDir(dir) {
     for (const file of leftovers) {
       if (claims.has(file)) continue;
       const st = stats.get(file);
-      const fresh = bound.filter((p) => birthMs(st) > p.boundAt);
+      // Only panes whose bound file actually exists can roll over — a
+      // deterministic pane still waiting for claude to create its file must
+      // not be hijacked by an unrelated transcript (e.g. a `claude -p` run).
+      // cwdOk keeps a lone codex pane from rolling over onto some other
+      // project's rollout (codex started outside Hivemind, another board…).
+      const fresh = bound.filter((p) =>
+        stats.has(p.boundFile) && birthMs(st) > p.boundAt && cwdOk(p, file, st.size));
       if (!fresh.length) continue;
-      const text = firstUserText(file, st.size);
+      const text = firstUserText(file, st.size, agent);
       const byText = fresh.filter((p) => text && p.lastSent.includes(text));
       const target =
         byText.length === 1 ? byText[0] : fresh.length === 1 ? fresh[0] : null;
@@ -441,8 +562,49 @@ function birthMs(st) {
 }
 
 function paneAccepts(pane, file, st) {
+  if (!cwdOk(pane, file, st.size)) return false;
   if (birthMs(st) >= pane.registeredAt - FRESH_SLACK_MS) return true;
   return pane.allowPreExisting && pane.preExisting.has(file);
+}
+
+// Codex rollouts from every project share one tree — a candidate only fits a
+// pane when its session_meta cwd matches the pane's project directory. (A file
+// whose meta line hasn't hit disk yet matches nothing; later scans retry.)
+function cwdOk(pane, file, size) {
+  if (pane.agent !== 'codex') return true;
+  const cwd = codexCwd(file, size);
+  return !!cwd && normPath(cwd) === normPath(pane.cwd);
+}
+
+// Peek a rollout's first line (session_meta) for its cwd. Cached per file;
+// re-read only while no meta has been parsed yet and the file has grown.
+function codexCwd(file, size) {
+  const cached = codexMeta.get(file);
+  if (cached && (cached.cwd !== null || cached.sizeChecked === size)) return cached.cwd;
+  let cwd = null;
+  try {
+    const fd = fs.openSync(file, 'r');
+    try {
+      // session_meta is one (large — it embeds the base instructions) line.
+      const buf = Buffer.alloc(Math.min(size, 256 * 1024));
+      const n = fs.readSync(fd, buf, 0, buf.length, 0);
+      for (const line of buf.subarray(0, n).toString('utf8').split('\n')) {
+        const t = line.trim();
+        if (!t) continue;
+        try {
+          const o = JSON.parse(t);
+          if (o && o.type === 'session_meta' && o.payload && typeof o.payload.cwd === 'string') {
+            cwd = o.payload.cwd;
+          }
+        } catch (_) { /* torn first line — retry when the file grows */ }
+        break; // only the first line matters
+      }
+    } finally {
+      fs.closeSync(fd);
+    }
+  } catch (_) { /* unreadable — treat as unknown */ }
+  codexMeta.set(file, { sizeChecked: size, cwd });
+  return cwd;
 }
 
 function claimFile(pane, file) {
@@ -452,7 +614,7 @@ function claimFile(pane, file) {
   clearTimeout(pane.timeoutTimer);
   clearTimeout(pane.fallbackTimer);
   pane.timeoutTimer = pane.fallbackTimer = null;
-  tails.set(file, { offset: 0, partial: Buffer.alloc(0) });
+  tails.set(file, { offset: 0, partial: Buffer.alloc(0), lineNo: 0 });
   emitStatus(pane, 'bound', file);
   readAppended(pane, file, true);
 }
@@ -478,6 +640,7 @@ function checkTail(pane, st) {
     // Truncated/rewritten — start over and let the renderer re-render.
     tail.offset = 0;
     tail.partial = Buffer.alloc(0);
+    tail.lineNo = 0;
     readAppended(pane, pane.boundFile, true);
   } else if (st.size > tail.offset) {
     readAppended(pane, pane.boundFile, false);
@@ -514,10 +677,15 @@ function readAppended(pane, file, backfill) {
     tail.partial = Buffer.from(data.subarray(lastNl + 1));
     const entries = [];
     for (const line of data.subarray(0, lastNl).toString('utf8').split('\n')) {
+      // Count every raw line so codex row keys ('cx:<line>') are stable across
+      // re-reads regardless of blank or malformed lines in between.
+      const lineNo = tail.lineNo++;
       const t = line.trim();
       if (!t) continue;
       try {
-        entries.push(slimEntry(JSON.parse(t)));
+        const o = JSON.parse(t);
+        const entry = pane.agent === 'codex' ? normalizeCodexEntry(o, lineNo) : slimEntry(o);
+        if (entry) entries.push(entry);
       } catch (_) { /* torn or malformed line — skip */ }
     }
     if (entries.length) queueEmit(pane, entries, backfill);
@@ -570,6 +738,127 @@ function capStrings(value) {
   return value;
 }
 
+// ---------------------------------------------------------------------------
+// Codex rollout normalization
+// ---------------------------------------------------------------------------
+// Rollout lines are { timestamp, type, payload }. Normalize each into the
+// Claude-transcript entry shape the renderer already renders (user/assistant
+// bubbles, tool_use/tool_result, thinking, meta) and return null for lines the
+// chat view shouldn't show: event_msg streams that duplicate response_item
+// lines, token counts, and per-turn context blobs.
+
+// Context blocks codex injects into the conversation as "user" messages.
+const CODEX_PLUMBING_RE =
+  /^<(environment_context|user_instructions|permissions|turn_state|turn_aborted|ide_[a-z_]*|AGENTS)/i;
+
+const codexText = (parts, types) =>
+  (Array.isArray(parts) ? parts : [])
+    .filter((c) => c && types.includes(c.type) && typeof c.text === 'string')
+    .map((c) => c.text)
+    .join('\n')
+    .trim();
+
+const codexToolUse = (name, id, input) => ({
+  type: 'assistant',
+  message: { role: 'assistant', content: [{ type: 'tool_use', id, name, input }] },
+});
+
+function normalizeCodexEntry(o, lineNo) {
+  const e = codexPayloadEntry(o && o.type, (o && o.payload) || {});
+  if (!e) return null;
+  e.uuid = 'cx:' + lineNo;
+  e.timestamp = o.timestamp;
+  return capStrings(e);
+}
+
+function codexPayloadEntry(type, p) {
+  if (type === 'compacted') return { type: 'system', content: 'conversation compacted' };
+  if (type === 'event_msg') {
+    // agent_message/user_message/reasoning events all have response_item
+    // twins; only surface what exists nowhere else.
+    if (p.type === 'error') return { type: 'system', content: 'error: ' + (p.message || '') };
+    if (p.type === 'turn_aborted') return { type: 'system', content: 'turn interrupted' };
+    return null;
+  }
+  if (type !== 'response_item') return null; // session_meta, turn_context, …
+  switch (p.type) {
+    case 'message': {
+      if (p.role === 'assistant') {
+        const text = codexText(p.content, ['output_text', 'text']);
+        if (!text) return null;
+        return { type: 'assistant', message: { role: 'assistant', content: [{ type: 'text', text }] } };
+      }
+      if (p.role !== 'user') return null; // developer/system instruction blobs
+      const text = codexText(p.content, ['input_text', 'text']);
+      if (!text) return null;
+      const tag = CODEX_PLUMBING_RE.exec(text);
+      if (tag) return { type: 'system', content: tag[1].replace(/_/g, ' ').toLowerCase() };
+      return { type: 'user', message: { role: 'user', content: text } };
+    }
+    case 'reasoning': {
+      // Only the summary is readable — the chain itself ships encrypted.
+      const text = codexText(p.summary, ['summary_text']);
+      if (!text) return null;
+      return { type: 'assistant', message: { role: 'assistant', content: [{ type: 'thinking', thinking: text }] } };
+    }
+    case 'function_call': {
+      let input = null;
+      try {
+        const parsed = JSON.parse(p.arguments);
+        if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) input = parsed;
+      } catch (_) { /* not JSON — keep raw below */ }
+      if (!input) input = typeof p.arguments === 'string' && p.arguments ? { arguments: p.arguments } : {};
+      return codexToolUse(p.name || 'tool', p.call_id, input);
+    }
+    case 'local_shell_call': {
+      const cmd = p.action && Array.isArray(p.action.command) ? p.action.command.join(' ') : '';
+      return codexToolUse('shell', p.call_id || p.id, { command: cmd });
+    }
+    case 'custom_tool_call': {
+      const input = {};
+      if (typeof p.input === 'string') {
+        // apply_patch input is a patch blob — surface the first touched file
+        // as the tool row's one-line summary.
+        const m = /^\*\*\* (?:Add|Update|Delete) File: (.+)$/m.exec(p.input);
+        if (m) input.file_path = m[1].trim();
+        input.input = p.input;
+      }
+      return codexToolUse(p.name || 'tool', p.call_id, input);
+    }
+    case 'web_search_call':
+      return codexToolUse('web_search', p.call_id || p.id, {
+        query: (p.action && p.action.query) || '',
+      });
+    case 'function_call_output':
+    case 'custom_tool_call_output': {
+      let out = p.output;
+      if (out && typeof out === 'object') {
+        out = typeof out.output === 'string' ? out.output : safeJsonStr(out);
+      }
+      out = typeof out === 'string' ? out : String(out == null ? '' : out);
+      return {
+        type: 'user',
+        message: {
+          role: 'user',
+          content: [{
+            type: 'tool_result',
+            tool_use_id: p.call_id,
+            content: out,
+            // Shell outputs lead with "Exit code: N" — flag failures.
+            is_error: /^Exit code: (?!0\b)\d+/.test(out),
+          }],
+        },
+      };
+    }
+    default:
+      return null;
+  }
+}
+
+const safeJsonStr = (v) => {
+  try { return JSON.stringify(v); } catch (_) { return String(v); }
+};
+
 function queueEmit(pane, entries, backfill) {
   if (backfill) {
     // Flush anything pending first so ordering stays sane on re-reads.
@@ -603,7 +892,7 @@ function emitStatus(pane, status, file) {
 // Returns the trimmed text of the file's first real user message, or null.
 // Cached per file; re-read only while no user line has appeared yet and the
 // file has grown since the last look.
-function firstUserText(file, size) {
+function firstUserText(file, size, agent) {
   const cached = firstUser.get(file);
   if (cached && (cached.text !== null || cached.sizeChecked === size)) {
     return cached.text;
@@ -617,14 +906,7 @@ function firstUserText(file, size) {
       for (const line of buf.subarray(0, n).toString('utf8').split('\n')) {
         let o;
         try { o = JSON.parse(line); } catch (_) { continue; }
-        if (o.type !== 'user' || o.isMeta || o.isSidechain || !o.message) continue;
-        const c = o.message.content;
-        if (typeof c === 'string') text = c.trim();
-        else if (Array.isArray(c)) {
-          const t = c.find((p) => p && p.type === 'text' && typeof p.text === 'string');
-          if (!t) continue; // tool_result-only "user" line — not a real turn
-          text = t.text.trim();
-        }
+        text = agent === 'codex' ? codexUserLineText(o) : claudeUserLineText(o);
         if (text) break;
       }
     } finally {
@@ -633,6 +915,33 @@ function firstUserText(file, size) {
   } catch (_) { /* unreadable — treat as no user text */ }
   firstUser.set(file, { sizeChecked: size, text });
   return text;
+}
+
+function claudeUserLineText(o) {
+  if (o.type !== 'user' || o.isMeta || o.isSidechain || !o.message) return null;
+  const c = o.message.content;
+  if (typeof c === 'string') return c.trim() || null;
+  if (Array.isArray(c)) {
+    const t = c.find((p) => p && p.type === 'text' && typeof p.text === 'string');
+    if (!t) return null; // tool_result-only "user" line — not a real turn
+    return t.text.trim() || null;
+  }
+  return null;
+}
+
+// The user's text appears both as an event_msg and a response_item user
+// message; the latter also carries injected context blocks (all of which start
+// with an XML-ish tag) — skip those, take whichever real text comes first.
+function codexUserLineText(o) {
+  const p = o.payload || {};
+  if (o.type === 'event_msg' && p.type === 'user_message' && typeof p.message === 'string') {
+    return p.message.trim() || null;
+  }
+  if (o.type === 'response_item' && p.type === 'message' && p.role === 'user') {
+    const text = codexText(p.content, ['input_text', 'text']);
+    if (text && !CODEX_PLUMBING_RE.test(text) && !text.startsWith('<')) return text;
+  }
+  return null;
 }
 
 module.exports = { bind, unbind, noteSent, disposeAll, listSessions, readSession, refresh };

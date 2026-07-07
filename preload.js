@@ -35,6 +35,9 @@ contextBridge.exposeInMainWorld('api', {
   // A screenshot held on the native clipboard (e.g. Win+Shift+S): persist as
   // PNG and get back a path, or null if the clipboard holds no image.
   clipboardImage: () => ipcRenderer.invoke('image:fromClipboard'),
+  // Copy a file into `<cwd>/.hivemind/attachments/` so sandboxed agents
+  // (Codex/"ChatGPT") can read it; returns the staged path or null.
+  stageAttachment: (cwd, srcPath) => ipcRenderer.invoke('attach:stage', { cwd, srcPath }),
 
   // PTY lifecycle
   spawnPty: (opts) => ipcRenderer.invoke('pty:spawn', opts),
