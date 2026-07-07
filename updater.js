@@ -7,8 +7,8 @@
 // sets PORTABLE_EXECUTABLE_FILE in that case, and only that case), check
 // GitHub for a newer release on startup. If one exists, ask the user once;
 // on "Update Now" download the new portable exe next to the current one,
-// launch it, delete the old exe, and quit. Installed (NSIS) and dev runs
-// return immediately.
+// launch it, delete the old exe and every other older-versioned sibling,
+// and quit. Installed (NSIS) and dev runs return immediately.
 // ---------------------------------------------------------------------------
 
 const { app, dialog } = require('electron');
@@ -21,6 +21,10 @@ const REPO = 'mikemcs121/hivemind';
 const RELEASES_URL = `https://github.com/${REPO}/releases`;
 const USER_AGENT = 'Hivemind-Updater';
 
+// Matches both the release-asset name ("Hivemind.0.1.7.portable.exe") and the
+// name the updater downloads to ("Hivemind 0.1.7 portable.exe").
+const PORTABLE_EXE_RE = /^hivemind[ .](\d+\.\d+\.\d+)[ .]portable\.exe$/i;
+
 function isNewer(latest, current) {
   const a = latest.replace(/^v/, '').split('.').map(Number);
   const b = current.split('.').map(Number);
@@ -31,13 +35,26 @@ function isNewer(latest, current) {
   return false;
 }
 
+// Absolute paths of sibling portable exes strictly older than `version`
+// (which may carry a leading "v"). The freshly downloaded exe is never listed
+// because its version equals `version`; a running old exe IS listed as long
+// as its filename matches the standard pattern.
+function findOlderExes(dir, version) {
+  let entries;
+  try { entries = fs.readdirSync(dir); } catch (_) { return []; }
+  const out = [];
+  for (const name of entries) {
+    const m = PORTABLE_EXE_RE.exec(name);
+    if (m && isNewer(version, m[1])) out.push(path.join(dir, name));
+  }
+  return out;
+}
+
 // Delete older portable exes (and orphaned .part downloads) sitting next to
 // the running one. If a post-update cleanup batch ever fails, the previous
 // version's exe stays behind and launching it re-triggers the update prompt.
-// Best-effort: anything still locked is retried on the next launch. Matches
-// both the release-asset name ("Hivemind.0.1.7.portable.exe") and the name
-// the updater downloads to ("Hivemind 0.1.7 portable.exe"). Newer-versioned
-// siblings are left alone.
+// Best-effort: anything still locked is retried on the next launch.
+// Newer-versioned siblings are left alone.
 function cleanupStaleExes() {
   const currentExe = process.env.PORTABLE_EXECUTABLE_FILE;
   const dir = path.dirname(currentExe);
@@ -46,7 +63,7 @@ function cleanupStaleExes() {
   for (const name of entries) {
     const full = path.join(dir, name);
     if (full.toLowerCase() === currentExe.toLowerCase()) continue;
-    const exeMatch = /^hivemind[ .](\d+\.\d+\.\d+)[ .]portable\.exe$/i.exec(name);
+    const exeMatch = PORTABLE_EXE_RE.exec(name);
     if (exeMatch) {
       if (isNewer(app.getVersion(), exeMatch[1])) {
         try { fs.unlinkSync(full); } catch (_) { /* still locked — next launch */ }
@@ -153,19 +170,25 @@ async function checkForUpdates(win) {
       // Launch the new version, schedule deletion of the old exe, then quit.
       spawn(newExePath, [], { detached: true, stdio: 'ignore' }).unref();
 
-      // The old exe stays locked until this process (and the portable
-      // launcher wrapping it) fully exits, so retry the delete for up to
-      // ~30s and then give up rather than loop forever. `ping` is the delay
-      // because `timeout` refuses to run without console input, which a
-      // hidden window doesn't have.
+      // Delete the running exe AND every other older-versioned sibling, so a
+      // folder that accumulated old copies is swept in one update. The old exe
+      // stays locked until this process (and the portable launcher wrapping
+      // it) fully exits, so retry the deletes for up to ~30s and then give up
+      // rather than loop forever. `ping` is the delay because `timeout`
+      // refuses to run without console input, which a hidden window doesn't
+      // have.
+      const staleExes = findOlderExes(currentDir, latestTag);
+      if (!staleExes.some(p => p.toLowerCase() === oldExePath.toLowerCase())) {
+        staleExes.push(oldExePath); // renamed exe won't match the pattern
+      }
       const batPath = path.join(app.getPath('temp'), 'hivemind-update-cleanup.bat');
       fs.writeFileSync(batPath, [
         '@echo off',
         'set tries=0',
         ':loop',
         'set /a tries+=1',
-        `del /f /q "${oldExePath}" >nul 2>nul`,
-        `if not exist "${oldExePath}" goto done`,
+        ...staleExes.map(p => `del /f /q "${p}" >nul 2>nul`),
+        'if not exist ' + staleExes.map(p => `"${p}"`).join(' if not exist ') + ' goto done',
         'if %tries% geq 30 goto done',
         'ping -n 2 127.0.0.1 >nul',
         'goto loop',
@@ -193,4 +216,4 @@ async function checkForUpdates(win) {
   }
 }
 
-module.exports = { checkForUpdates };
+module.exports = { checkForUpdates, findOlderExes };
