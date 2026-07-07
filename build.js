@@ -199,6 +199,21 @@ async function restoreVersion(cwd, prevRaw) {
   } catch (_) { /* best effort — worst case the bump sticks */ }
 }
 
+// Preflight for publishing: confirm the gh CLI is installed and signed in
+// BEFORE anything irreversible happens (version bump, commit, push). A publish
+// failure discovered only after the bump was pushed leaves the repo ahead of
+// the newest release, so clients never see the new build.
+async function checkGhReady(cwd) {
+  const probe = await run('gh', ['auth', 'status'], cwd, null);
+  if (probe.code === -1) {
+    return { ok: false, message: 'GitHub CLI (gh) is not installed — install it (winget install GitHub.cli), then restart Hivemind.' };
+  }
+  if (probe.code !== 0) {
+    return { ok: false, message: 'GitHub CLI is not signed in — run "gh auth login" in a terminal, then try again.' };
+  }
+  return { ok: true };
+}
+
 // Publish the built portable exe as a GitHub release (tag vX.Y.Z) via the gh
 // CLI, committing and pushing the version bump first so the repo matches the
 // release. The commit/push is best-effort; the release upload is the point.
@@ -238,4 +253,4 @@ async function publishRelease(cwd, version, onProgress) {
   return { ok: true, url };
 }
 
-module.exports = { isHivemindProject, buildPortable, bumpPatchVersion, restoreVersion, publishRelease };
+module.exports = { isHivemindProject, buildPortable, bumpPatchVersion, restoreVersion, checkGhReady, publishRelease };

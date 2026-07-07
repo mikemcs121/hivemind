@@ -654,13 +654,32 @@ function parseScreenReview(lines) {
   };
 }
 
+// The "Ready to code?" plan-approval menu gets the same card treatment as a
+// question: it draws none of the footer chrome parseScreenQuestion anchors on,
+// so it's recognised by its option labels instead (parsePlanMenu, defined with
+// the plan-review code below). Digits act immediately in that menu — the same
+// keys the plan review's Approve buttons send — so the ordinary
+// click-sends-digit card works unchanged.
+function parsePlanScreenQuestion(pane, screen) {
+  if (pane.agent !== 'claude') return null;
+  const options = parsePlanMenu(screen);
+  if (!options) return null;
+  return {
+    header: 'Plan',
+    question: /Ready to code\?/i.test(screen) ? 'Ready to code?' : 'Approve this plan?',
+    options: options.map((o) => ({ label: o.label, description: '', checked: false })),
+    multiSelect: false,
+  };
+}
+
 const screenQuestionKey = (pane) => 'screenq:' + pane.id;
 
 function syncScreenQuestion(pane, screen) {
   const c = pane.chat;
   if (!c) return;
+  const s = screen !== undefined ? screen : screenText(pane);
   const parsed = !c.viewingHistory && pane.state !== 'dead'
-    ? parseScreenQuestion(screen !== undefined ? screen : screenText(pane))
+    ? parseScreenQuestion(s) || parsePlanScreenQuestion(pane, s)
     : null;
   if (!parsed) {
     removeScreenQuestion(pane);
@@ -3897,20 +3916,24 @@ function createPane(board, col, opts = {}) {
   findClose.onclick = () => closeFind(pane);
 
   // Agent dropdown: switch which CLI this thread runs (restarts the thread).
+  // Each dropdown hands focus back to the pane after a pick — the mousedown
+  // stopPropagation (needed so opening the dropdown doesn't steal focus)
+  // otherwise leaves keyboard focus stranded on the <select>, where typing is
+  // swallowed and arrow keys silently change the value again.
   agentSelect.addEventListener('mousedown', (e) => e.stopPropagation());
-  agentSelect.onchange = (e) => { e.stopPropagation(); setPaneAgent(pane, agentSelect.value); persistLayout(board.id); };
+  agentSelect.onchange = (e) => { e.stopPropagation(); setPaneAgent(pane, agentSelect.value); persistLayout(board.id); focusPane(pane); };
 
   // Model dropdown: switch the model this thread runs (live, if it's started).
   modelSelect.addEventListener('mousedown', (e) => e.stopPropagation());
-  modelSelect.onchange = (e) => { e.stopPropagation(); setPaneModel(pane, modelSelect.value); persistLayout(board.id); };
+  modelSelect.onchange = (e) => { e.stopPropagation(); setPaneModel(pane, modelSelect.value); persistLayout(board.id); focusPane(pane); };
 
   // ChatGPT model dropdown: switch the Codex model (restarts a running thread).
   codexModelSelect.addEventListener('mousedown', (e) => e.stopPropagation());
-  codexModelSelect.onchange = (e) => { e.stopPropagation(); setPaneCodexModel(pane, codexModelSelect.value); persistLayout(board.id); };
+  codexModelSelect.onchange = (e) => { e.stopPropagation(); setPaneCodexModel(pane, codexModelSelect.value); persistLayout(board.id); focusPane(pane); };
 
   // Permission dropdown: change the mode Claude starts in (restarts the thread).
   permSelect.addEventListener('mousedown', (e) => e.stopPropagation());
-  permSelect.onchange = (e) => { e.stopPropagation(); setPanePerm(pane, permSelect.value); persistLayout(board.id); };
+  permSelect.onchange = (e) => { e.stopPropagation(); setPanePerm(pane, permSelect.value); persistLayout(board.id); focusPane(pane); };
 
   // Drag-and-drop / paste an image into the pane. We can't feed raw image bytes
   // through the PTY, so instead we drop the image to a file and type its path
@@ -3973,8 +3996,8 @@ function createPane(board, col, opts = {}) {
   closeBtn.onclick = (e) => { e.stopPropagation(); closePane(pane); };
 
   // Font sizing: header buttons, Ctrl +/-/0, and Ctrl+scroll.
-  fontDownBtn.onclick = (e) => { e.stopPropagation(); setPaneFontSize(pane, pane.fontSize - 1); };
-  fontUpBtn.onclick = (e) => { e.stopPropagation(); setPaneFontSize(pane, pane.fontSize + 1); };
+  fontDownBtn.onclick = (e) => { e.stopPropagation(); setPaneFontSize(pane, pane.fontSize - 1); focusPane(pane); };
+  fontUpBtn.onclick = (e) => { e.stopPropagation(); setPaneFontSize(pane, pane.fontSize + 1); focusPane(pane); };
   // One custom key handler covers every shortcut. xterm stores a SINGLE handler
   // (calling attachCustomKeyEventHandler twice overwrites), so paste-passthrough,
   // font sizing, find, and pane nav all live here.
@@ -4511,10 +4534,14 @@ if (buildBtn) {
       window.api.notify({ title: 'Hivemind', body: `v${res.version} built and published to GitHub — opening the dist folder.` });
       window.api.files.reveal(dir, 'dist');
     } else if (res && res.ok) {
-      window.api.notify({ title: 'Hivemind', body: `v${res.version} built, but publishing to GitHub failed: ${res.publishMessage || 'unknown error'}` });
+      const why = res.publishMessage || 'unknown error';
+      window.api.notify({ title: 'Hivemind', body: `v${res.version} built, but publishing to GitHub failed: ${why}` });
+      hmToast(`v${res.version} built but NOT published — clients will not receive this update. ${why}`, 'err');
       window.api.files.reveal(dir, 'dist');
     } else {
-      window.api.notify({ title: 'Hivemind', body: 'Portable build failed: ' + ((res && res.message) || 'see terminal output') });
+      const why = (res && res.message) || 'see terminal output';
+      window.api.notify({ title: 'Hivemind', body: 'Portable build failed: ' + why });
+      hmToast('Portable build failed: ' + why, 'err');
     }
   };
   buildBtn.onclick = startPortableBuild;

@@ -865,6 +865,11 @@ app.whenReady().then(() => {
       }
     };
     try {
+      // Publishing is the point of the build, so make sure gh is usable
+      // before bumping/committing anything — otherwise the pushed version
+      // bump ends up ahead of the newest release and clients never update.
+      const gh = await build.checkGhReady(cwd);
+      if (!gh.ok) return { ok: false, message: gh.message };
       // Bump first so the exe is stamped with the new version; restore on
       // build failure so failed builds don't burn version numbers.
       let bump;
