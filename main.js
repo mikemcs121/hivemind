@@ -762,6 +762,9 @@ app.whenReady().then(() => {
   // The thread writes its plan to `.hivemind/plans/<planId>.md`; Hivemind reads
   // it and stores highlight-comments in a sidecar JSON alongside it.
   ipcMain.handle('plan:read', (_e, { cwd, planId }) => plan.readPlan(cwd, planId));
+  // Native plan-mode files live outside the project (~/.claude/plans/…); read
+  // by absolute path, guarded to that dir plus the project's .hivemind/plans.
+  ipcMain.handle('plan:readFile', (_e, { cwd, file }) => plan.readPlanFile(cwd, file));
   ipcMain.handle('plan:write', (_e, { cwd, planId, content }) => plan.writePlan(cwd, planId, content));
   ipcMain.handle('plan:comments:read', (_e, { cwd, planId }) => plan.readComments(cwd, planId));
   ipcMain.handle('plan:comments:write', (_e, { cwd, planId, comments }) => plan.writeComments(cwd, planId, comments));

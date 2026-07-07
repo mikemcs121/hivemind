@@ -440,7 +440,7 @@ const STATE_LABEL = {
 // label-independent signature the screen offers. Also drives the screen-parsed
 // question card (parseScreenQuestion).
 const SELECT_FOOTER_RE =
-  /\bEnter to (select|submit|confirm)\b[^\n]{0,120}\bEsc to (cancel|go back|exit|skip)/i;
+  /\bEnter to (select|submit|confirm)\b[^\n]{0,120}\bEsc to (cancel|close|go back|exit|skip)/i;
 
 // The Submit tab of a multi-select AskUserQuestion ("Review your answers" over
 // "1. Submit answers / 2. Cancel") draws NO footer chrome at all (verified
@@ -705,6 +705,7 @@ function probeAttention(pane) {
   if (pane.state !== 'busy' && pane.state !== 'attention') return;
   const screen = screenText(pane);
   syncScreenQuestion(pane, screen);
+  planScreenCheck(pane, screen);
   if (MENU_PATTERNS.some((re) => re.test(screen)) || chatHasPendingQuestion(pane)) {
     pane.menuMiss = 0;
     setPaneState(pane, 'attention');
@@ -770,9 +771,14 @@ function evaluateIdle(pane) {
   // user, both read "needs you"; anything else is a finished turn.
   const screen = screenText(pane);
   syncScreenQuestion(pane, screen);
+  planScreenCheck(pane, screen);
   const needsYou = MENU_PATTERNS.some((re) => re.test(screen)) ||
     QUESTION_PATTERNS.some((re) => re.test(screen)) ||
     chatHasPendingQuestion(pane);
+  // A turn that ended without reaching the plan-approval menu (⟳-requested
+  // plans, or planning interrupted): the file is final for now, not mid-draft
+  // — drop "drafting" so the 📋 chip doesn't stick.
+  if (!needsYou && panePlan(pane).state === 'drafting') planSetState(pane, 'none');
   setPaneState(pane, needsYou ? 'attention' : 'idle');
 }
 
@@ -1060,10 +1066,530 @@ function hmExtractTask(rest) {
   return task.trim();
 }
 
-// Execute a command addressed to Hivemind. Returns true when the text was a
-// recognized command (even one that failed, e.g. an unknown thread name) and
-// false when it wasn't — the caller then sends the message to the thread as
-// normal, so talking *about* Hivemind never gets swallowed.
+// "everywhere" / "in all threads" suffix on font commands → every pane on the
+// hive instead of just the context pane.
+const HM_ALL_RE = /\b(?:everywhere|all\s+(?:threads|panes|terminals))\b/i;
+function hmFontPanes(board, pane, rest) {
+  if (HM_ALL_RE.test(rest || '')) {
+    const all = boardPanes(board);
+    if (all.length) return all;
+  }
+  return pane ? [pane] : [];
+}
+
+// Resolve a spoken/typed model name against a MODELS/CODEX_MODELS list: exact
+// value, exact label, then substring — all case-insensitive.
+function hmResolveModel(list, q) {
+  q = String(q || '').trim().toLowerCase().replace(/\s+model$/, '');
+  if (!q) return null;
+  return list.find((x) => x.value.toLowerCase() === q)
+      || list.find((x) => x.label.toLowerCase() === q)
+      || list.find((x) => x.label.toLowerCase().includes(q) || x.value.toLowerCase().includes(q))
+      || null;
+}
+
+// The command registry. Ordered — the first entry with a matching pattern
+// wins, so specific commands sit above generic ones (e.g. voice's "stop
+// listening" above the catch-all "stop <thread>"). `help` is the entry's line
+// in the Help modal's "Hivemind commands" list (null on aliases / commands
+// documented by a sibling entry); the list is generated from this registry so
+// it can't drift out of date. Every `run` gets (match, { board, pane }) where
+// pane is the context thread ("this thread").
+const HM_COMMANDS = [
+  {
+    name: 'help',
+    patterns: [/^(?:help|commands?|what can (?:you|i) (?:do|say))$/i],
+    help: '<strong>help</strong> — opens this window.',
+    run() {
+      openHelp();
+      hmToast('Commands are listed under "Hivemind commands" in Help.');
+    },
+  },
+  {
+    name: 'close-help',
+    patterns: [/^close\s+(?:the\s+)?help$/i],
+    help: null,
+    run() { closeHelp(); },
+  },
+  {
+    // "add a todo (item) [to] <text>" — append to this hive's Todo panel. The
+    // bare "todo <text>" composer prefix is the shortcut for the same thing.
+    name: 'add-todo',
+    patterns: [/^(?:add|create|make|new)\s+(?:a\s+)?(?:new\s+)?to-?do(?:\s+item)?\b\s*(.*)$/i],
+    help: '<strong>add a todo &lt;text&gt;</strong> — adds an item to this hive\'s Todo panel.',
+    run(m) { captureTodo(hmExtractTask(m[1])); },
+  },
+  {
+    // "open (up) a new thread [and/to <task>]" — the task rides along as the
+    // new Claude's initial prompt, so it starts working the moment it boots.
+    name: 'new-thread',
+    patterns: [
+      /^(?:open(?:\s+up)?|start|create|add|make|spawn)\s+(?:a\s+|another\s+)?(?:new\s+)?(?:thread|terminal|pane|tab|claude)\b\s*(.*)$/i,
+      /^new\s+(?:thread|terminal|pane|tab)\b\s*(.*)$/i,
+    ],
+    help: '<strong>open a new thread</strong> <em>[and/to &lt;task&gt;]</em> — opens a thread on this hive; with a task, the new Claude starts working on it the moment it boots.',
+    run(m, { board }) {
+      if (!board) { hmToast('No hive is open — create one first.', 'err'); return; }
+      const task = hmExtractTask(m[1]);
+      const p = addTerminal(board, task ? { initialPrompt: task } : {});
+      if (p && task) setPaneCaption(p, task);
+      hmToast(task ? 'Opened a new thread — starting on: ' + task : 'Opened a new thread.');
+    },
+  },
+  {
+    name: 'new-hive',
+    patterns: [/^(?:new|create|add|open|make|start)\s+(?:a\s+)?(?:new\s+)?(?:hive|board)$/i],
+    help: '<strong>new hive</strong> — opens the create-hive dialog.',
+    run() { openModal(null); },
+  },
+  {
+    // "tell <thread> to <task>" — route a task to another thread by name/caption.
+    name: 'tell',
+    patterns: [/^(?:tell|ask)\s+(?:thread\s+)?(.+?)\s+to\s+(.+)$/i],
+    help: '<strong>tell &lt;thread&gt; to &lt;task&gt;</strong> — sends the task to the named thread (names and captions both match, so “tell claude 2 to…” or “tell the login thread to…” work).',
+    run(m, { board, pane }) {
+      const who = m[1].trim();
+      const target = /^(?:it|this|this thread|the current thread)$/i.test(who)
+        ? pane : findPaneByName(board, who);
+      if (!target) { hmToast('No thread called "' + who + '" on this hive.', 'err'); return; }
+      if (target.state === 'dead') { hmToast('That thread has exited — open a new one.', 'err'); return; }
+      const task = m[2].trim();
+      deliverPrompt(target, task);
+      hmToast('Sent to ' + paneLabel(target) + ': ' + task);
+    },
+  },
+  {
+    // "close this thread" / "close thread <name>"
+    name: 'close-thread',
+    patterns: [/^(?:close|kill)\s+(?:(?:this|the\s+current)\s+)?(?:thread|terminal|pane)\b\s*(.*)$/i],
+    help: '<strong>close this thread</strong> / <strong>close thread &lt;name&gt;</strong>',
+    run(m, { board, pane }) {
+      const nm = m[1].replace(/^(?:called|named)\s+/i, '').trim();
+      const target = nm ? findPaneByName(board, nm) : pane;
+      if (!target) { hmToast(nm ? 'No thread called "' + nm + '" on this hive.' : 'No thread to close.', 'err'); return; }
+      const label = paneLabel(target);
+      closePane(target);
+      hmToast('Closed ' + label + '.');
+    },
+  },
+  {
+    name: 'rename-thread',
+    patterns: [/^rename\s+(?:(?:this|the\s+current)\s+)?(?:thread|terminal|pane)?\s*(?:to|as)\s+(.+)$/i],
+    help: '<strong>rename this thread to &lt;name&gt;</strong>',
+    run(m, { pane }) {
+      if (!pane) { hmToast('No thread to rename.', 'err'); return; }
+      pane.name = m[1].trim();
+      pane.autoName = false;
+      pane.title.textContent = pane.name;
+      updateTitleVisibility(pane);
+      refreshZoomTabs(pane.board.id);
+      persistLayout(pane.board.id);
+      hmToast('Renamed this thread to "' + pane.name + '".');
+    },
+  },
+  {
+    name: 'maximize',
+    patterns: [/^(?:maximi[sz]e|zoom(?:\s+in)?)\b/i],
+    help: '<strong>maximize</strong> / <strong>restore</strong> — zoom the current thread or go back to the tiled layout.',
+    run(m, { pane }) {
+      if (!pane) { hmToast('No thread to maximize.', 'err'); return; }
+      const g = grids.get(pane.board.id);
+      if (g && g.zoomed !== pane) toggleZoom(pane);
+      hmToast('Maximized ' + paneLabel(pane) + '.');
+    },
+  },
+  {
+    name: 'restore',
+    patterns: [/^(?:restore|un\s*zoom|zoom\s+out|minimi[sz]e|tile)\b/i],
+    help: null, // documented on the maximize entry
+    run(m, { board }) {
+      const g = board && grids.get(board.id);
+      if (g && g.zoomed) toggleZoom(g.zoomed);
+      hmToast('Restored the tiled layout.');
+    },
+  },
+  {
+    // Must sit above the stop/interrupt catch-all so "stop voice typing" and
+    // "stop listening" reach the mic instead of a thread.
+    name: 'voice-start',
+    patterns: [/^(?:start|enable|turn\s+on|begin)\s+(?:voice(?:\s+typing)?|dictation|dictating|listening)$/i],
+    help: '<strong>start / stop voice typing</strong> — same as the 🎤 button or the <kbd>~</kbd> key.',
+    run() { startVoice(); },
+  },
+  {
+    name: 'voice-stop',
+    patterns: [
+      /^(?:stop|disable|turn\s+off|end)\s+(?:voice(?:\s+typing)?|dictation|dictating|listening)$/i,
+      /^stop\s+listening$/i,
+    ],
+    help: null,
+    run() { stopVoice(); hmToast('Voice typing stopped.'); },
+  },
+  {
+    name: 'voice-toggle',
+    patterns: [/^toggle\s+(?:voice(?:\s+typing)?|dictation)$/i],
+    help: null,
+    run() { toggleVoice(); },
+  },
+  {
+    // "stop / interrupt [thread <name>]" — same Ctrl+C the ⏹ button sends.
+    name: 'interrupt',
+    patterns: [/^(?:stop|interrupt|cancel)(?:\s+(?:(?:this|the\s+current)\s+)?(?:thread|terminal|pane))?\s*(.*)$/i],
+    help: '<strong>stop</strong> / <strong>interrupt</strong> <em>[thread &lt;name&gt;]</em> — sends the same Ctrl+C as the ⏹ button.',
+    run(m, { board, pane }) {
+      const nm = m[1].trim();
+      const target = nm ? findPaneByName(board, nm) : pane;
+      if (!target) { hmToast(nm ? 'No thread called "' + nm + '" on this hive.' : 'No thread to interrupt.', 'err'); return; }
+      sendToPane(target, '\x03');
+      hmToast('Interrupted ' + paneLabel(target) + '.');
+    },
+  },
+  {
+    name: 'focus-thread',
+    patterns: [/^(?:focus|go\s+to|switch\s+to|show)\s+(?:the\s+)?thread\s+(.+)$/i],
+    help: '<strong>focus thread &lt;name&gt;</strong> — jump to a thread by name.',
+    run(m, { board }) {
+      const target = findPaneByName(board, m[1]);
+      if (!target) { hmToast('No thread called "' + m[1].trim() + '" on this hive.', 'err'); return; }
+      focusPane(target);
+      hmToast('Focused ' + paneLabel(target) + '.');
+    },
+  },
+  {
+    name: 'cycle-thread',
+    patterns: [/^(?:focus\s+|go\s+to\s+|switch\s+to\s+)?(?:the\s+)?(next|previous|prev)\s+(?:thread|terminal|pane)$/i],
+    help: '<strong>next / previous thread</strong> — cycle focus, like <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>]</kbd> / <kbd>[</kbd>.',
+    run(m) {
+      cycleFocus(/^n/i.test(m[1]) ? 1 : -1);
+      if (focusedPane) hmToast('Focused ' + paneLabel(focusedPane) + '.');
+    },
+  },
+  {
+    name: 'switch-hive',
+    patterns: [
+      /^(?:switch|go|jump|move)\s+to\s+(?:the\s+)?(?:hive|board|project)\s+(.+)$/i,
+      /^open\s+(?:the\s+)?(?:hive|board|project)\s+(.+)$/i,
+    ],
+    help: '<strong>switch to hive &lt;name&gt;</strong>',
+    run(m) {
+      const q = m[1].trim().toLowerCase();
+      const b = boards.find((x) => (x.name || '').toLowerCase() === q)
+             || boards.find((x) => (x.name || '').toLowerCase().includes(q));
+      if (!b) { hmToast('No hive called "' + m[1].trim() + '".', 'err'); return; }
+      selectBoard(b.id);
+      hmToast('Switched to ' + b.name + '.');
+    },
+  },
+  {
+    name: 'font-bigger',
+    patterns: [
+      /^(?:make\s+)?(?:the\s+)?(?:font|text)(?:\s+size)?\s+(?:bigger|larger|up)\b(.*)$/i,
+      /^(?:increase|enlarge|grow|raise|bump(?:\s+up)?)\s+(?:the\s+)?(?:font|text)(?:\s+size)?\b(.*)$/i,
+      /^bigger\s+(?:font|text)\b(.*)$/i,
+    ],
+    help: '<strong>font bigger / smaller</strong>, <strong>font size &lt;n&gt;</strong>, <strong>reset font</strong> — this thread\'s font; add <em>everywhere</em> to change all threads.',
+    run(m, { board, pane }) {
+      const targets = hmFontPanes(board, pane, m[1]);
+      if (!targets.length) { hmToast('No thread to resize.', 'err'); return; }
+      for (const p of targets) setPaneFontSize(p, p.fontSize + 1);
+      const f = targets[targets.length - 1].fontSize;
+      hmToast('Font size ' + f + (f >= FONT_MAX ? ' — that\'s the max.' : '.'));
+    },
+  },
+  {
+    name: 'font-smaller',
+    patterns: [
+      /^(?:make\s+)?(?:the\s+)?(?:font|text)(?:\s+size)?\s+(?:smaller|down)\b(.*)$/i,
+      /^(?:decrease|reduce|shrink|lower)\s+(?:the\s+)?(?:font|text)(?:\s+size)?\b(.*)$/i,
+      /^smaller\s+(?:font|text)\b(.*)$/i,
+    ],
+    help: null, // documented on the font-bigger entry
+    run(m, { board, pane }) {
+      const targets = hmFontPanes(board, pane, m[1]);
+      if (!targets.length) { hmToast('No thread to resize.', 'err'); return; }
+      for (const p of targets) setPaneFontSize(p, p.fontSize - 1);
+      const f = targets[targets.length - 1].fontSize;
+      hmToast('Font size ' + f + (f <= FONT_MIN ? ' — that\'s the minimum.' : '.'));
+    },
+  },
+  {
+    name: 'font-set',
+    patterns: [
+      /^(?:set\s+)?(?:the\s+)?(?:font|text)(?:\s+size)?\s+(?:to\s+)?(\d{1,3})\b(.*)$/i,
+      /^(reset)\s+(?:the\s+)?(?:font|text)(?:\s+size)?\b(.*)$/i,
+    ],
+    help: null, // documented on the font-bigger entry
+    run(m, { board, pane }) {
+      const targets = hmFontPanes(board, pane, m[2]);
+      if (!targets.length) { hmToast('No thread to resize.', 'err'); return; }
+      const size = /^\d+$/.test(m[1]) ? parseInt(m[1], 10) : FONT_DEFAULT;
+      for (const p of targets) setPaneFontSize(p, size);
+      const f = clampFont(size);
+      hmToast('Font size ' + f + (f !== size ? ' (' + size + ' is outside ' + FONT_MIN + '–' + FONT_MAX + ')' : '') + '.');
+    },
+  },
+  {
+    name: 'theme',
+    patterns: [
+      /^(?:switch|change|set)\s+(?:the\s+)?theme\s+(?:to\s+)?(.+)$/i,
+      /^theme\s+(.+)$/i,
+      /^(?:switch|change)\s+to\s+(?:the\s+)?(.+?)\s+theme$/i,
+    ],
+    help: '<strong>theme &lt;name&gt;</strong> — midnight, forest, ember, grape, paper, or rose.',
+    run(m) {
+      const q = m[1].trim().toLowerCase().replace(/\s+theme$/, '');
+      const id = Object.keys(THEMES).find((k) => k === q)
+        || Object.keys(THEMES).find((k) => THEMES[k].label.toLowerCase().startsWith(q));
+      if (!id) { hmToast('No theme called "' + m[1].trim() + '" — themes: ' + Object.keys(THEMES).join(', ') + '.', 'err'); return; }
+      applyTheme(id);
+      const st = $('set-theme');
+      if (st && st.options.length) st.value = id;
+      hmToast('Theme: ' + THEMES[id].label.replace(/\s*\(.*$/, '') + '.');
+    },
+  },
+  {
+    name: 'model',
+    patterns: [
+      /^(?:switch|change|set)\s+(?:the\s+)?model\s+(?:to\s+)?(.+)$/i,
+      /^use\s+(?:the\s+)?(.+?)\s+model$/i,
+    ],
+    help: '<strong>switch model to &lt;model&gt;</strong> — live on a Claude thread; restarts a ChatGPT thread with a fresh conversation.',
+    run(m, { pane }) {
+      if (!pane) { hmToast('No thread to switch models on.', 'err'); return; }
+      if (pane.agent === 'gemini') { hmToast('Gemini threads have no model picker.', 'err'); return; }
+      const codex = pane.agent === 'codex';
+      const list = codex ? CODEX_MODELS : MODELS;
+      const hit = hmResolveModel(list, m[1]);
+      if (!hit) {
+        hmToast('No ' + (codex ? 'ChatGPT' : 'Claude') + ' model matches "' + m[1].trim() + '" — options: ' + list.map((x) => x.label).join(', ') + '.', 'err');
+        return;
+      }
+      if (codex) {
+        const restarting = pane.codexModel !== hit.value && pane.state !== 'dead';
+        setPaneCodexModel(pane, hit.value);
+        hmToast('Model: ' + hit.label + (restarting ? ' — restarting this thread; the conversation starts fresh.' : '.'));
+      } else {
+        setPaneModel(pane, hit.value);
+        hmToast('Model: ' + hit.label + ' — switched live.');
+      }
+      persistLayout(pane.board.id);
+    },
+  },
+  {
+    name: 'agent',
+    patterns: [
+      /^(?:switch|change)\s+(?:(?:this|the\s+current)\s+thread\s+)?to\s+(claude|chat\s*gpt|codex|gemini)$/i,
+      /^use\s+(claude|chat\s*gpt|codex|gemini)$/i,
+    ],
+    help: '<strong>switch to claude / chatgpt / gemini</strong> — restarts this thread on that agent (the conversation doesn\'t carry over).',
+    run(m, { pane }) {
+      if (!pane) { hmToast('No thread to switch.', 'err'); return; }
+      const raw = m[1].toLowerCase().replace(/\s+/g, '');
+      const v = raw === 'claude' ? 'claude' : raw === 'gemini' ? 'gemini' : 'codex';
+      if (pane.agent === v) { hmToast('This thread is already running ' + agentFor(v).label + '.'); return; }
+      setPaneAgent(pane, v);
+      persistLayout(pane.board.id);
+      hmToast('Restarting this thread as ' + agentFor(v).label + ' — the conversation doesn\'t carry over.');
+    },
+  },
+  {
+    name: 'permission-mode',
+    patterns: [
+      /^(?:set\s+)?(?:the\s+)?permissions?(?:\s+mode)?\s+(?:to\s+)?(.+)$/i,
+      /^(?:enter\s+|go\s+to\s+|switch\s+to\s+)?(plan|bypass|accept\s*edits|default)\s+mode$/i,
+    ],
+    help: '<strong>plan / bypass / accept edits / default mode</strong> — this Claude thread\'s permission mode (restarts it, resuming the conversation).',
+    run(m, { pane }) {
+      if (!pane) { hmToast('No thread to change.', 'err'); return; }
+      if (pane.agent !== 'claude') { hmToast('Permission modes only apply to Claude threads.', 'err'); return; }
+      const q = m[1].trim().toLowerCase().replace(/\s+mode$/, '').replace(/[\s-]+/g, '');
+      const v = q === 'default' ? 'default'
+        : q === 'plan' ? 'plan'
+        : /^bypass/.test(q) ? 'bypass'
+        : /^accept/.test(q) ? 'acceptEdits' : null;
+      if (!v) { hmToast('Permission modes: Default, Accept Edits, Plan, Bypass.', 'err'); return; }
+      const label = (PERMS.find((p) => p.value === v) || {}).label || v;
+      if (pane.permMode === v) { hmToast('Already in ' + label + ' mode.'); return; }
+      const restarting = pane.state !== 'dead';
+      setPanePerm(pane, v);
+      persistLayout(pane.board.id);
+      hmToast('Permission mode: ' + label + (restarting ? ' — restarting and resuming this conversation.' : '.'));
+    },
+  },
+  {
+    name: 'panel',
+    patterns: [/^(open|show|close|hide|toggle)\s+(?:the\s+)?(files?|file\s+explorer|explorer|git|source\s+control|to-?dos?)\s*(?:panel|sidebar|list)?$/i],
+    help: '<strong>open / close the explorer / git / todo panel</strong>',
+    run(m) {
+      const verb = m[1].toLowerCase();
+      const what = m[2].toLowerCase();
+      const kind = /git|source/.test(what) ? 'git' : /to-?do/.test(what) ? 'todo' : 'files';
+      const panel = kind === 'git' ? gitPanel : kind === 'todo' ? todoPanel : filesPanel;
+      const isOpen = panel && !panel.classList.contains('hidden');
+      const open = verb === 'toggle' ? !isOpen : (verb === 'open' || verb === 'show');
+      if (kind === 'git') { setGitOpen(open); if (open) refreshGit(); }
+      else if (kind === 'todo') { setTodoOpen(open); if (open) refreshTodo(); }
+      else { setFilesOpen(open); if (open) refreshFiles(); }
+      hmToast((kind === 'git' ? 'Source Control' : kind === 'todo' ? 'Todo' : 'Explorer') + (open ? ' panel opened.' : ' panel closed.'));
+    },
+  },
+  {
+    name: 'show-plan',
+    patterns: [/^(?:open|show|view)\s+(?:the\s+)?plan(?:\s+review)?$/i],
+    help: '<strong>show the plan</strong> / <strong>close the plan</strong> — this thread\'s plan review.',
+    run(m, { pane }) {
+      if (!pane) { hmToast('No thread to show a plan for.', 'err'); return; }
+      openPlanReview(pane);
+    },
+  },
+  {
+    name: 'close-plan',
+    patterns: [/^close\s+(?:the\s+)?plan(?:\s+review)?$/i],
+    help: null,
+    run() { closePlanReview(); },
+  },
+  {
+    name: 'show-diff',
+    patterns: [/^(?:show|open|view)\s+(?:the\s+)?diff(?:s)?(?:\s+(?:for|of|on)\s+(.+))?$/i],
+    help: '<strong>show diff</strong> <em>[for &lt;file&gt;]</em> — opens Source Control, or jumps straight to a changed file\'s diff.',
+    async run(m) {
+      const dir = activeDir();
+      if (!dir) { hmToast('This hive has no project directory set.', 'err'); return; }
+      const q = (m[1] || '').trim();
+      if (!q) {
+        setGitOpen(true);
+        refreshGit();
+        hmToast('Source Control opened — click a file to see its diff.');
+        return;
+      }
+      const st = await window.api.git.status(dir);
+      const files = (st && st.files) || [];
+      const hits = files.filter((f) => f.path.toLowerCase().includes(q.toLowerCase()));
+      if (hits.length === 1) { showDiff(hits[0], !!(hits[0].staged && !hits[0].unstaged)); return; }
+      setGitOpen(true);
+      refreshGit();
+      if (hits.length) hmToast(hits.length + ' changed files match "' + q + '" — pick one in Source Control.');
+      else hmToast('No changed file matches "' + q + '".', 'err');
+    },
+  },
+  {
+    name: 'show-terminal',
+    patterns: [/^(?:show|open|switch\s+to|go\s+to)\s+(?:the\s+)?terminal(?:\s+view)?$/i],
+    help: '<strong>show the terminal</strong> / <strong>show the chat</strong> — flip this thread\'s view, like the <strong>&gt;_</strong> / <strong>💬</strong> button.',
+    run(m, { pane }) {
+      if (!pane) { hmToast('No thread to switch views on.', 'err'); return; }
+      setPaneView(pane, 'term');
+      hmToast('Terminal view.');
+    },
+  },
+  {
+    name: 'show-chat',
+    patterns: [/^(?:show|open|switch\s+to|go\s+to)\s+(?:the\s+)?chat(?:\s+view)?$/i],
+    help: null, // documented on the show-terminal entry
+    run(m, { pane }) {
+      if (!pane) { hmToast('No thread to switch views on.', 'err'); return; }
+      if (!chatSupported(pane)) { hmToast('This thread is terminal-only.', 'err'); return; }
+      setPaneView(pane, 'chat');
+      hmToast('Chat view.');
+    },
+  },
+  {
+    name: 'attach',
+    patterns: [/^attach(?:\s+(?:a\s+|some\s+)?files?)?$/i],
+    help: '<strong>attach a file</strong> — opens the composer\'s 📎 file picker.',
+    run(m, { pane }) {
+      if (!pane || !pane.chat || !pane.chat.pickAttachments) { hmToast('This thread has no composer to attach files to.', 'err'); return; }
+      if (pane.view !== 'chat') setPaneView(pane, 'chat');
+      pane.chat.pickAttachments();
+    },
+  },
+  {
+    name: 'history',
+    patterns: [/^(?:open|show|browse)\s+(?:the\s+)?(?:conversation\s+)?history$/i],
+    help: '<strong>show history</strong> — browse this Claude thread\'s past conversations.',
+    run(m, { pane }) {
+      if (!pane || !pane.chat || !historySupported(pane)) { hmToast('Past conversations are only available on Claude threads.', 'err'); return; }
+      if (pane.view !== 'chat') setPaneView(pane, 'chat');
+      toggleHistoryMenu(pane);
+    },
+  },
+  {
+    name: 'settings',
+    patterns: [/^(?:open|show)\s+(?:the\s+)?settings(?:\s+(general|voice))?$/i],
+    help: '<strong>open settings</strong> <em>[general/voice]</em> / <strong>close settings</strong>',
+    run(m) { openSettings(m[1] ? m[1].toLowerCase() : 'general'); },
+  },
+  {
+    name: 'close-settings',
+    patterns: [/^close\s+(?:the\s+)?settings$/i],
+    help: null,
+    run() { closeSettings(); },
+  },
+  {
+    name: 'usage',
+    patterns: [/^(?:open|show|check)\s+(?:the\s+)?(?:claude\s+)?usage$/i],
+    help: '<strong>show usage</strong> / <strong>close usage</strong> — your Claude plan limits and today\'s tokens.',
+    run() { openUsage(); },
+  },
+  {
+    name: 'close-usage',
+    patterns: [/^close\s+(?:the\s+)?usage$/i],
+    help: null,
+    run() { closeUsage(); },
+  },
+  {
+    name: 'build',
+    patterns: [/^(?:build|package|compile)(?:\s+(?:the|a))?(?:\s+portable)?(?:\s+(?:app|application|build|exe|copy|version))?$/i],
+    help: '<strong>build the portable app</strong> — bump the version, build, and publish a release (only when this hive is the Hivemind checkout).',
+    async run() {
+      const dir = activeDir();
+      let ok = false;
+      try { ok = !!dir && await window.api.build.isHivemind(dir); } catch (_) { /* not buildable */ }
+      if (!ok || !startPortableBuild) {
+        hmToast('Building is only available when this hive points at the Hivemind source checkout.', 'err');
+        return;
+      }
+      if (buildBtn.dataset.busy) {
+        hmToast('A build is already running — progress shows on the Build button in Settings.', 'err');
+        return;
+      }
+      startPortableBuild();
+      hmToast('Building the portable app — progress shows in Settings → General → Building Hivemind.');
+    },
+  },
+  {
+    // Greediest pattern — keep it last so "find <anything>" can't shadow
+    // other commands.
+    name: 'find',
+    patterns: [/^(?:find|search(?:\s+for)?)\s+(.+)$/i, /^find$/i],
+    help: '<strong>find &lt;text&gt;</strong> — search this thread\'s terminal, like <kbd>Ctrl</kbd>+<kbd>F</kbd>.',
+    run(m, { pane }) {
+      if (!pane) { hmToast('No thread to search.', 'err'); return; }
+      if (!pane.searchAddon) { hmToast('Search isn\'t available in this build.', 'err'); return; }
+      if (pane.view !== 'term') setPaneView(pane, 'term');
+      openFind(pane);
+      const q = (m[1] || '').trim();
+      if (q) {
+        pane.findInput.value = q;
+        try { pane.searchAddon.findNext(q); } catch (_) { /* no match */ }
+      }
+    },
+  },
+];
+
+// The Help modal's "Hivemind commands" list is generated from the registry,
+// so the docs can never drift from what the dispatcher actually accepts.
+(function renderHmCommandHelp() {
+  const ul = document.getElementById('hm-cmd-list');
+  if (!ul) return;
+  ul.innerHTML = HM_COMMANDS.filter((c) => c.help).map((c) => '<li>' + c.help + '</li>').join('');
+})();
+
+// Execute a command addressed to Hivemind. Anything that starts with the wake
+// word is consumed as a command — recognized ones run (even when they fail,
+// e.g. an unknown thread name), unrecognized ones get an error toast — and is
+// never sent to the thread. Mentioning Hivemind mid-sentence doesn't match the
+// wake regex at all, so ordinary messages still pass through untouched.
 function runHivemindCommand(cmd, ctxPane) {
   const board = activeBoard();
   const pane = (ctxPane && !ctxPane.disposed) ? ctxPane : focusedPane;
@@ -1072,129 +1598,14 @@ function runHivemindCommand(cmd, ctxPane) {
     hmToast('Say a command after "Hivemind" — e.g. "Hivemind, open a new thread and fix the failing test". Say "Hivemind help" for the list.', 'err');
     return true;
   }
-  let m;
-
-  // "help" — open the Help modal, which documents the command list.
-  if (/^(?:help|commands?|what can (?:you|i) (?:do|say))$/i.test(c)) {
-    const hb = document.getElementById('help-backdrop');
-    if (hb) hb.classList.remove('hidden');
-    hmToast('Commands are listed under "Hivemind commands" in Help.');
-    return true;
+  for (const entry of HM_COMMANDS) {
+    for (const re of entry.patterns) {
+      const m = re.exec(c);
+      if (m) { entry.run(m, { board, pane }); return true; }
+    }
   }
-
-  // "add a todo (item) [to] <text>" — append to this hive's Todo panel. The
-  // bare "todo <text>" composer prefix is the shortcut for the same thing.
-  m = /^(?:add|create|make|new)\s+(?:a\s+)?(?:new\s+)?to-?do(?:\s+item)?\b\s*(.*)$/i.exec(c);
-  if (m) {
-    captureTodo(hmExtractTask(m[1]));
-    return true;
-  }
-
-  // "open (up) a new thread [and/to <task>]" — the task rides along as the new
-  // Claude's initial prompt, so it starts working the moment it boots.
-  m = /^(?:open(?:\s+up)?|start|create|add|make|spawn)\s+(?:a\s+|another\s+)?(?:new\s+)?(?:thread|terminal|pane|tab|claude)\b\s*(.*)$/i.exec(c)
-   || /^new\s+(?:thread|terminal|pane|tab)\b\s*(.*)$/i.exec(c);
-  if (m) {
-    if (!board) { hmToast('No hive is open — create one first.', 'err'); return true; }
-    const task = hmExtractTask(m[1]);
-    const p = addTerminal(board, task ? { initialPrompt: task } : {});
-    if (p && task) setPaneCaption(p, task);
-    hmToast(task ? 'Opened a new thread — starting on: ' + task : 'Opened a new thread.');
-    return true;
-  }
-
-  // "tell <thread> to <task>" — route a task to another thread by name/caption.
-  m = /^(?:tell|ask)\s+(?:thread\s+)?(.+?)\s+to\s+(.+)$/i.exec(c);
-  if (m) {
-    const who = m[1].trim();
-    const target = /^(?:it|this|this thread|the current thread)$/i.test(who)
-      ? pane : findPaneByName(board, who);
-    if (!target) { hmToast('No thread called "' + who + '" on this hive.', 'err'); return true; }
-    if (target.state === 'dead') { hmToast('That thread has exited — open a new one.', 'err'); return true; }
-    const task = m[2].trim();
-    deliverPrompt(target, task);
-    hmToast('Sent to ' + paneLabel(target) + ': ' + task);
-    return true;
-  }
-
-  // "close this thread" / "close thread <name>"
-  m = /^(?:close|kill)\s+(?:(?:this|the\s+current)\s+)?(?:thread|terminal|pane)\b\s*(.*)$/i.exec(c);
-  if (m) {
-    const nm = m[1].replace(/^(?:called|named)\s+/i, '').trim();
-    const target = nm ? findPaneByName(board, nm) : pane;
-    if (!target) { hmToast(nm ? 'No thread called "' + nm + '" on this hive.' : 'No thread to close.', 'err'); return true; }
-    const label = paneLabel(target);
-    closePane(target);
-    hmToast('Closed ' + label + '.');
-    return true;
-  }
-
-  // "rename this thread to <name>"
-  m = /^rename\s+(?:(?:this|the\s+current)\s+)?(?:thread|terminal|pane)?\s*(?:to|as)\s+(.+)$/i.exec(c);
-  if (m) {
-    if (!pane) { hmToast('No thread to rename.', 'err'); return true; }
-    pane.name = m[1].trim();
-    pane.autoName = false;
-    pane.title.textContent = pane.name;
-    updateTitleVisibility(pane);
-    refreshZoomTabs(pane.board.id);
-    persistLayout(pane.board.id);
-    hmToast('Renamed this thread to "' + pane.name + '".');
-    return true;
-  }
-
-  // "maximize [this thread]" / "restore"
-  if (/^(?:maximi[sz]e|zoom(?:\s+in)?)\b/i.test(c)) {
-    if (!pane) { hmToast('No thread to maximize.', 'err'); return true; }
-    const g = grids.get(pane.board.id);
-    if (g && g.zoomed !== pane) toggleZoom(pane);
-    hmToast('Maximized ' + paneLabel(pane) + '.');
-    return true;
-  }
-  if (/^(?:restore|un\s*zoom|zoom\s+out|minimi[sz]e|tile)\b/i.test(c)) {
-    const g = board && grids.get(board.id);
-    if (g && g.zoomed) toggleZoom(g.zoomed);
-    hmToast('Restored the tiled layout.');
-    return true;
-  }
-
-  // "stop / interrupt [thread <name>]" — same Ctrl+C the ⏹ button sends.
-  m = /^(?:stop|interrupt|cancel)(?:\s+(?:(?:this|the\s+current)\s+)?(?:thread|terminal|pane))?\s*(.*)$/i.exec(c);
-  if (m) {
-    const nm = m[1].trim();
-    const target = nm ? findPaneByName(board, nm) : pane;
-    if (!target) { hmToast(nm ? 'No thread called "' + nm + '" on this hive.' : 'No thread to interrupt.', 'err'); return true; }
-    sendToPane(target, '\x03');
-    hmToast('Interrupted ' + paneLabel(target) + '.');
-    return true;
-  }
-
-  // "focus / go to thread <name>"
-  m = /^(?:focus|go\s+to|switch\s+to|show)\s+(?:the\s+)?thread\s+(.+)$/i.exec(c);
-  if (m) {
-    const target = findPaneByName(board, m[1]);
-    if (!target) { hmToast('No thread called "' + m[1].trim() + '" on this hive.', 'err'); return true; }
-    focusPane(target);
-    hmToast('Focused ' + paneLabel(target) + '.');
-    return true;
-  }
-
-  // "switch to hive <name>"
-  m = /^(?:switch|go|jump|move)\s+to\s+(?:the\s+)?(?:hive|board|project)\s+(.+)$/i.exec(c)
-   || /^open\s+(?:the\s+)?(?:hive|board|project)\s+(.+)$/i.exec(c);
-  if (m) {
-    const q = m[1].trim().toLowerCase();
-    const b = boards.find((x) => (x.name || '').toLowerCase() === q)
-           || boards.find((x) => (x.name || '').toLowerCase().includes(q));
-    if (!b) { hmToast('No hive called "' + m[1].trim() + '".', 'err'); return true; }
-    selectBoard(b.id);
-    hmToast('Switched to ' + b.name + '.');
-    return true;
-  }
-
-  // Not a command we recognize — let the caller send it to the thread as a
-  // normal message (the user may just be talking about Hivemind).
-  return false;
+  hmToast('Didn\'t recognize "' + c + '" — say "Hivemind help" for the command list.', 'err');
+  return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -1507,12 +1918,14 @@ function initChatUI(pane, body) {
   sendBtn.onclick = (e) => { e.stopPropagation(); sendChatMessage(pane); };
 
   // 📎 opens a native picker; each chosen file becomes an attachment chip.
-  attachBtn.onclick = async (e) => {
-    e.stopPropagation();
+  // Exposed on the chat object so the "hivemind attach a file" command can
+  // drive the same picker the button does.
+  pane.chat.pickAttachments = async () => {
     const paths = (await window.api.pickFiles()) || [];
     for (const p of paths) await addChatAttachment(pane, p);
     input.focus();
   };
+  attachBtn.onclick = (e) => { e.stopPropagation(); pane.chat.pickAttachments(); };
 
   // Images pasted into the composer become temp files shown as attachment
   // chips, so they submit together with the message text.
@@ -2548,15 +2961,16 @@ function sendChatMessage(pane) {
   let text = raw.trim();
   if (!text && !c.attachments.length) return;
   // A message addressed to Hivemind itself ("Hivemind, open a new thread…")
-  // is an app command — run it instead of sending it to the thread. Text that
-  // starts with the wake word but isn't a recognized command falls through and
-  // is sent as a normal message.
+  // is an app command — run it instead of sending it to the thread. Anything
+  // starting with the wake word is consumed (unrecognized commands toast an
+  // error); mentioning Hivemind mid-sentence sends as a normal message.
   const hmCmd = matchHivemindCommand(text);
   // A message starting with "todo" is a checklist entry for the Todo panel,
   // handled by Hivemind itself — same swallow-and-clear path as app commands.
   const todoText = hmCmd === null ? matchTodoPrefix(text) : null;
-  if ((hmCmd !== null && runHivemindCommand(hmCmd, pane)) || todoText !== null) {
+  if (hmCmd !== null || todoText !== null) {
     if (todoText !== null) captureTodo(todoText);
+    else runHivemindCommand(hmCmd, pane);
     if (text && c.history[c.history.length - 1] !== text) {
       c.history.push(text);
       if (c.history.length > 200) c.history.shift();
@@ -2781,7 +3195,9 @@ function serializeLayout(boardId) {
     panes: col.panes.filter((p) => !p.disposed).map((p) => ({
       name: p.name, agent: p.agent, model: p.model, codexModel: p.codexModel, perm: p.permMode, fontSize: p.fontSize,
       flex: p.flex, caption: p.captionText || '', autoName: !!p.autoName,
-      planId: p.planId || undefined, // stable per-thread key for the Plan pane
+      planId: p.planId || undefined, // stable per-thread key for ⟳-requested plans
+      planFile: (p.plan && p.plan.file) || undefined,     // last known plan file (plan review)
+      planSource: (p.plan && p.plan.source) || undefined, // 'native' | 'hivemind'
       sessionId: p.sessionId || undefined, // this thread's Claude session (resume-on-start)
       view: p.view, chatFilters: p.chatFilters,
     })),
@@ -2815,6 +3231,7 @@ function rebuildFromLayout(board) {
       const pane = createPane(board, colObj, {
         name: pd.name, agent, model: pd.model, codexModel: pd.codexModel, perm: pd.perm, fontSize: pd.fontSize,
         flex: pd.flex, caption: pd.caption, autoName, planId: pd.planId,
+        planFile: pd.planFile, planSource: pd.planSource,
         sessionId: pd.sessionId, view: pd.view, chatFilters: pd.chatFilters,
       });
       colObj.panes.push(pane);
@@ -2946,9 +3363,6 @@ function selectBoard(id) {
   // Watch this board's directory so the Git/Files panels can auto-refresh.
   window.api.setWatch(board.dir || null);
 
-  // Show the "Build Portable" button only when this hive is the Hivemind source.
-  updateBuildButton(board);
-
   // Show the active grid, hide the rest — BEFORE building a new grid, so pane
   // measurements during the build see the full workspace width (a still-visible
   // previous grid would flex-share the row and halve it).
@@ -2975,7 +3389,6 @@ function selectBoard(id) {
   if (typeof filesToggle !== 'undefined' && filesToggle) filesToggle.disabled = false;
   if (typeof filesOnBoardChange === 'function') filesOnBoardChange();
   if (typeof planToggle !== 'undefined' && planToggle) planToggle.disabled = false;
-  if (typeof planOnBoardChange === 'function') planOnBoardChange();
   if (typeof todoToggle !== 'undefined' && todoToggle) todoToggle.disabled = false;
   if (typeof todoOnBoardChange === 'function') todoOnBoardChange();
   fitBoard(id);
@@ -3347,13 +3760,17 @@ function createPane(board, col, opts = {}) {
   if (startAgent !== 'claude') permSelect.style.display = 'none';
   const statusEl = document.createElement('span');
   statusEl.className = 'status';
+  // "📋 plan ready" chip — shown while this thread drafts a plan / waits on
+  // plan approval; clicking it opens the plan review (see "Plan review").
+  const planChip = document.createElement('button');
+  planChip.className = 'pane-plan-chip hidden';
   const closeBtn = document.createElement('button');
   closeBtn.textContent = '✕';
   closeBtn.title = 'Close thread';
   // Chat/terminal view toggle (Claude threads only — see initChatUI).
   const viewBtn = document.createElement('button');
   viewBtn.className = 'font-btn view-btn';
-  header.append(dot, titleWrap, statusEl, agentSelect, modelSelect, codexModelSelect, permSelect, viewBtn, fontDownBtn, fontUpBtn, zoomBtn, closeBtn);
+  header.append(dot, titleWrap, planChip, statusEl, agentSelect, modelSelect, codexModelSelect, permSelect, viewBtn, fontDownBtn, fontUpBtn, zoomBtn, closeBtn);
 
   const termWrap = document.createElement('div');
   termWrap.className = 'pane-term';
@@ -3410,12 +3827,19 @@ function createPane(board, col, opts = {}) {
   term.open(termWrap);
 
   const pane = {
-    id, el, term, fitAddon, searchAddon, dot, statusEl, agentSelect, modelSelect, codexModelSelect, permSelect, title, caption,
+    id, el, term, fitAddon, searchAddon, dot, statusEl, planChip, agentSelect, modelSelect, codexModelSelect, permSelect, title, caption,
     findBar, findInput, viewBtn, flex: opts.flex || 1, col, board, disposed: false,
     name: startName, state: null, buf: '', idleTimer: null, probeTimer: null, menuMiss: 0,
     fontSize: startFont, agent: startAgent, model: startModel, codexModel: startCodexModel, permMode: startPerm, captionText: '', capBuf: '',
     errored: false, hintShown: false,
-    planId: opts.planId || null, // assigned lazily the first time the Plan pane needs it
+    planId: opts.planId || null, // assigned lazily the first time a ⟳ plan request needs it
+    // Plan-review lifecycle (see the "Plan review" section). The file/source
+    // survive restarts via the layout; the rest is rebuilt from transcript
+    // backfill and the screen probe.
+    plan: {
+      state: 'none', file: opts.planFile || null, source: opts.planSource || null,
+      menu: null, menuMiss: 0, exitIds: new Set(), exitPlanText: null,
+    },
     // Claude Code session id this pane owns. Set before spawn (fresh threads
     // get a generated UUID passed as --session-id; resumes reuse the old id)
     // and updated whenever the transcript binder reports the bound file — so
@@ -3452,6 +3876,9 @@ function createPane(board, col, opts = {}) {
   // Zoom / maximize.
   zoomBtn.addEventListener('mousedown', (e) => e.stopPropagation());
   zoomBtn.onclick = (e) => { e.stopPropagation(); toggleZoom(pane); };
+
+  // 📋 chip → open this thread's plan review (clicking still focuses the pane).
+  planChip.onclick = (e) => { e.stopPropagation(); focusPane(pane); openPlanReview(pane); };
 
   // Find bar wiring.
   const runFind = (back) => {
@@ -3636,6 +4063,7 @@ function closeFind(pane) {
 function closePane(pane) {
   if (pane.disposed) return;
   pane.disposed = true;
+  if (typeof planModalPane !== 'undefined' && planModalPane === pane) closePlanReview();
   clearTimeout(pane.idleTimer);
   stopAttentionProbe(pane);
   window.api.killPty(pane.id);
@@ -3663,7 +4091,6 @@ function closePane(pane) {
 
 let focusedPane = null;
 function focusPane(pane, ev) {
-  const changed = focusedPane !== pane;
   if (focusedPane && focusedPane !== pane) focusedPane.el.classList.remove('focused');
   focusedPane = pane;
   pane.el.classList.add('focused');
@@ -3678,8 +4105,6 @@ function focusPane(pane, ev) {
     if (pane.view === 'chat' && pane.chat && !termClick) pane.chat.input.focus();
     else pane.term.focus();
   } catch (_) { /* ignore */ }
-  // The Plan pane always mirrors the focused thread's plan.
-  if (changed && typeof planOnFocusChange === 'function') planOnFocusChange();
 }
 
 // ---------------------------------------------------------------------------
@@ -3727,9 +4152,13 @@ window.api.onPtyExit(({ id }) => {
 });
 
 // Transcript entries/status for the chat view (see "Chat wrapper" section).
+// Plan detection scans first: chatIngest bails while the user browses history,
+// but the plan lifecycle must never miss an entry (see "Plan review" section).
 window.api.transcript.onEntries(({ paneId, entries, backfill }) => {
   const pane = findPane(paneId);
-  if (pane && !pane.disposed) chatIngest(pane, entries || [], !!backfill);
+  if (!pane || pane.disposed) return;
+  try { planScanEntries(pane, entries || [], !!backfill); } catch (_) { /* never block the chat */ }
+  chatIngest(pane, entries || [], !!backfill);
 });
 
 window.api.transcript.onStatus(({ paneId, status, file }) => {
@@ -3865,7 +4294,7 @@ function showEmpty() {
   if (typeof voiceToggleBtn !== 'undefined' && voiceToggleBtn) voiceToggleBtn.disabled = true;
   if (typeof stopVoice === 'function') stopVoice();
   window.api.setWatch(null); // nothing active to watch
-  if (buildBtn) buildBtn.classList.add('hidden');
+  { const g = $('build-group'); if (g) g.classList.add('hidden'); }
   boardTitle.textContent = 'No hive selected';
   boardMeta.textContent = '';
   if (typeof gitToggle !== 'undefined' && gitToggle) {
@@ -3882,13 +4311,13 @@ function showEmpty() {
     planToggle.disabled = true;
     planToggle.classList.remove('active');
   }
-  if (typeof planPanel !== 'undefined' && planPanel) planPanel.classList.add('hidden');
+  if (typeof planOpen === 'function' && planOpen()) closePlanReview();
   if (typeof todoToggle !== 'undefined' && todoToggle) {
     todoToggle.disabled = true;
     todoToggle.classList.remove('active');
   }
   if (typeof todoPanel !== 'undefined' && todoPanel) todoPanel.classList.add('hidden');
-  const sb = $('sidebar'); if (sb) sb.classList.remove('git-open', 'files-open', 'plan-open', 'todo-open');
+  const sb = $('sidebar'); if (sb) sb.classList.remove('git-open', 'files-open', 'todo-open');
 }
 
 // ---------------------------------------------------------------------------
@@ -3974,8 +4403,11 @@ window.api.onFsChanged(({ cwd }) => {
   if (typeof gitPanelOpen === 'function' && gitPanelOpen() && !gitBusy && !gitMenuOpen) {
     refreshGit({ keepMsg: true });
   }
-  // The thread may have just (re)written its plan file — re-render it live.
-  if (typeof planPanelOpen === 'function' && planPanelOpen()) refreshPlan();
+  // A thread may have just (re)written a `.hivemind/plans/` file — the open
+  // review polls anyway, but a project-tree change gets it there sooner.
+  // (Native plan files live outside the watched tree; the poll covers those.)
+  if (typeof planOpen === 'function' && planOpen() && planModalPane && !planDrafting &&
+      panePlan(planModalPane).source !== 'native') refreshPlanReview();
   // Todos may have changed on disk (a thread edited todos.json). Re-render, but
   // not while the user is mid-edit in the panel — that would clobber their input.
   if (typeof todoPanelOpen === 'function' && todoPanelOpen() &&
@@ -4014,15 +4446,16 @@ const dirName = (p) => { const i = p.replace(/\/$/, '').lastIndexOf('/'); return
 let buildCheckToken = 0; // ignore stale async checks when boards switch quickly
 
 async function updateBuildButton(board) {
-  if (!buildBtn) return;
-  buildBtn.classList.add('hidden');
+  const group = $('build-group');
+  if (!group) return;
+  group.classList.add('hidden');
   const dir = board && board.dir;
   if (!dir) return;
   const token = ++buildCheckToken;
   let isHivemind = false;
   try { isHivemind = await window.api.build.isHivemind(dir); } catch (_) { /* hide */ }
   if (token !== buildCheckToken) return; // a different board was selected meanwhile
-  buildBtn.classList.toggle('hidden', !isHivemind);
+  group.classList.toggle('hidden', !isHivemind);
 }
 
 // electron-builder doesn't emit a real percentage, so map its log lines to a
@@ -4040,6 +4473,10 @@ function buildStageLabel(line) {
   return null;
 }
 
+// Entry point shared by the Settings button and the "hivemind build …"
+// command; assigned inside the guard so it exists only when the button does.
+let startPortableBuild = null;
+
 if (buildBtn) {
   let buildStage = 'Building';
   let buildStart = 0;
@@ -4052,7 +4489,7 @@ if (buildBtn) {
     buildBtn.textContent = `⏳ ${buildStage}… ${mm}:${ss}`;
   };
 
-  buildBtn.onclick = async () => {
+  startPortableBuild = async () => {
     const dir = activeDir();
     if (!dir || buildBtn.dataset.busy) return;
     buildBtn.dataset.busy = '1';
@@ -4080,6 +4517,7 @@ if (buildBtn) {
       window.api.notify({ title: 'Hivemind', body: 'Portable build failed: ' + ((res && res.message) || 'see terminal output') });
     }
   };
+  buildBtn.onclick = startPortableBuild;
 
   if (window.api.onBuildProgress) {
     window.api.onBuildProgress(({ line }) => {
@@ -4102,7 +4540,6 @@ function gitPanelOpen() { return gitPanel && !gitPanel.classList.contains('hidde
 const sidebarEl = $('sidebar');
 function setGitOpen(open) {
   if (open && typeof setFilesOpen === 'function') setFilesOpen(false); // one panel at a time
-  if (open && typeof setPlanOpen === 'function') setPlanOpen(false);
   if (open && typeof setTodoOpen === 'function') setTodoOpen(false);
   gitPanel.classList.toggle('hidden', !open);
   gitToggle.classList.toggle('active', open);
@@ -4562,7 +4999,6 @@ function setFilesMsg(text, kind) {
 
 function setFilesOpen(open) {
   if (open) setGitOpen(false); // one panel at a time
-  if (open && typeof setPlanOpen === 'function') setPlanOpen(false);
   if (open && typeof setTodoOpen === 'function') setTodoOpen(false);
   filesPanel.classList.toggle('hidden', !open);
   filesToggle.classList.toggle('active', open);
@@ -4804,7 +5240,6 @@ function setTodoOpen(open) {
   if (open) { // one panel at a time
     setGitOpen(false);
     setFilesOpen(false);
-    if (typeof setPlanOpen === 'function') setPlanOpen(false);
   }
   todoPanel.classList.toggle('hidden', !open);
   todoToggle.classList.toggle('active', open);
@@ -5159,62 +5594,293 @@ $('todo-clear-done').onclick = () => {
   renderTodo({ ok: true });
 };
 // ---------------------------------------------------------------------------
-// Plan panel
+// Plan review
 //
-// Renders the *focused thread's* plan. The thread writes its plan to
-// `.hivemind/plans/<planId>.md` in the project dir (the ⟳ button types that
-// request into the thread); we render it as markdown and let the user highlight
-// passages and attach comments — like review comments on a document. Comments
-// live in a sidecar `.comments.json` next to the plan, keyed to the quoted text
-// so they re-anchor on every re-render. "Send comments to thread" types them
-// back into the thread so Claude can revise.
+// A thread's plan as a full document — the VS Code-extension experience. Two
+// sources feed the same review window:
+//
+//  * Native Claude Code plan mode. The transcript shows the plan file being
+//    written (a Write/Edit tool_use targeting `~/.claude/plans/<slug>.md`) —
+//    that flips the pane to "drafting" and gives us the file to render live.
+//    When Claude finishes, its "Ready to code?" approval menu appears in the
+//    terminal; the screen probe spots it ("readiness" can't come from the
+//    transcript — Claude Code only flushes the ExitPlanMode line after the
+//    menu is answered), maps the menu options by label, and the review pops
+//    up (focused pane) or a 📋 header chip appears (unfocused). Approve /
+//    Request-changes answer that menu by pressing its option number in the
+//    hidden terminal; the eventual ExitPlanMode tool_result in the transcript
+//    settles the final state (approved / changes requested).
+//
+//  * Hivemind-requested plans (ChatGPT threads, or any thread outside plan
+//    mode): the ⟳ button types a request to write `.hivemind/plans/<id>.md`
+//    into the thread, exactly as before.
+//
+// Either way the document renders as markdown, the user highlights passages
+// and attaches comments (sidecar `.comments.json` under `.hivemind/plans/`,
+// keyed to the quoted text so they re-anchor on every re-render), and
+// "Request changes" sends the comments back so the thread can revise.
 // ---------------------------------------------------------------------------
 const planToggle = $('plan-toggle');
-const planPanel = $('plan-panel');
-const planBody = $('plan-body');
-const planCommentsEl = $('plan-comments');
-const planMsgbar = $('plan-msgbar');
-const planActionbar = $('plan-actionbar');
-const planSendBtn = $('plan-send');
-const planCommentBtn = $('plan-comment-btn');
+const planBackdrop = $('plan-backdrop');
+const planModal = $('plan-modal');
+const planDocStatus = $('plan-doc-status');
+const planDocTitle = $('plan-doc-title');
+const planDocThread = $('plan-doc-thread');
+const planDocBody = $('plan-doc-body');
+const planCommentsEl = $('plan-doc-comments');
+const planDocMsg = $('plan-doc-msg');
+const planDocNote = $('plan-doc-note');
+const planReqChangesBtn = $('plan-req-changes');
+const planApproveManualBtn = $('plan-approve-manual');
+const planApproveAutoBtn = $('plan-approve-auto');
+const planCommentBtn = $('plan-doc-comment-btn');
 
-let planPane = null;         // the pane whose plan is currently shown
+let planModalPane = null;    // the pane whose plan the review window shows
 let planText = null;         // raw markdown, or null when there's no plan file
-let planComments = [];       // [{ id, quote, occurrence, body, resolved }]
+let planRenderedMtime = 0;   // mtime of the content currently rendered
+let planComments = [];       // [{ id, quote, occurrence, body, resolved, sent }]
 let planPendingSel = null;   // { quote, occurrence } captured for a new comment
 let planDrafting = false;    // an inline comment editor is open
+let planPollTimer = null;    // live-refresh poll while the review is open
 
-function planPanelOpen() { return planPanel && !planPanel.classList.contains('hidden'); }
+// A plan file written by a thread, wherever it lives: Claude Code's native
+// plan-mode files (~/.claude/plans/…) or Hivemind's own (.hivemind/plans/…).
+const PLAN_FILE_RE = /[\\/]\.(?:claude|hivemind)[\\/]plans[\\/][^\\/]+\.md$/i;
+// The "Ready to code?" approval menu, matched by option label — the option
+// numbers shift with optional entries (clear-context, publish-as-artifact,
+// Ultraplan), so digits are always derived from the live screen parse. The
+// run-with-it option's label depends on the thread's permission mode
+// (verified against Claude Code v2.1.202): "Yes, auto-accept edits" in
+// default mode, "Yes, and bypass permissions" / "Yes, and use auto mode"
+// otherwise. The "Yes, clear context (N% used) and …" first-slot variant is
+// deliberately not matched — its keep-context sibling is always present. If
+// wording drifts and nothing matches, the buttons degrade to "answer in the
+// terminal" rather than sending blind digits.
+const PLAN_MENU_KEEP_RE = /keep planning/i;
+const PLAN_MENU_AUTO_RE = /^Yes, (auto-accept edits|and (bypass permissions|use auto mode))/i;
+const PLAN_MENU_MANUAL_RE = /^Yes, manually approve/i;
+// Deterministic ExitPlanMode tool_result strings (approval vs. kept planning).
+const PLAN_APPROVED_RE = /^User has approved your plan/i;
+// Placeholder of the inline feedback field "No, keep planning" opens.
+const PLAN_FEEDBACK_INPUT_RE = /Tell Claude what to change/i;
 
-function setPlanMsg(text, kind) {
-  if (!text) { planMsgbar.classList.add('hidden'); planMsgbar.textContent = ''; return; }
-  planMsgbar.textContent = text;
-  planMsgbar.className = 'git-msgbar' + (kind ? ' ' + kind : '');
-}
-
-function setPlanOpen(open) {
-  if (open) { // one panel at a time
-    setGitOpen(false);
-    setFilesOpen(false);
-    if (typeof setTodoOpen === 'function') setTodoOpen(false);
-  }
-  planPanel.classList.toggle('hidden', !open);
-  planToggle.classList.toggle('active', open);
-  sidebarEl.classList.toggle('plan-open', open); // board list yields its space
-  if (!open) hideCommentBtn();
-}
-
-planToggle.onclick = () => {
-  const open = planPanel.classList.contains('hidden');
-  setPlanOpen(open);
-  if (open) refreshPlan();
+const PLAN_STATE_LABEL = {
+  none: 'No plan',
+  drafting: 'Drafting…',
+  ready: 'Ready for review',
+  'pending-result': 'Waiting…',
+  approved: 'Approved',
+  'changes-requested': 'Changes requested',
 };
-$('plan-close').onclick = () => setPlanOpen(false);
-$('plan-refresh').onclick = () => requestPlanFromThread();
-$('plan-clear').onclick = () => clearPlanForThread();
 
-function planOnBoardChange() { if (planPanelOpen()) refreshPlan(); }
-function planOnFocusChange() { if (planPanelOpen()) refreshPlan(); }
+// Per-pane plan lifecycle state (lazily created — panes predate this feature).
+function panePlan(pane) {
+  if (!pane.plan) {
+    pane.plan = {
+      state: 'none', file: null, source: null, // 'native' | 'hivemind'
+      menu: null, menuMiss: 0,                 // live "Ready to code?" option map
+      exitIds: new Set(),                      // ExitPlanMode tool_use ids seen
+      exitPlanText: null,                      // input.plan — content of last resort
+    };
+  }
+  return pane.plan;
+}
+
+function planSetState(pane, state) {
+  const pl = panePlan(pane);
+  if (pl.state === state) return;
+  pl.state = state;
+  if (state !== 'ready') pl.menuMiss = 0;
+  if (state === 'drafting' || state === 'none') pl.menu = null;
+  updatePlanChip(pane);
+  if (planModalPane === pane && planOpen()) paintPlanActions();
+}
+
+// The 📋 chip in the pane header: visible while a plan is being drafted and,
+// pulsing, once it's ready for review. Click to open the review window.
+function updatePlanChip(pane) {
+  const chip = pane.planChip;
+  if (!chip) return;
+  const pl = panePlan(pane);
+  const show = pl.state === 'ready' || pl.state === 'drafting';
+  chip.classList.toggle('hidden', !show);
+  chip.classList.toggle('ready', pl.state === 'ready');
+  chip.textContent = pl.state === 'ready' ? '📋 plan ready' : '📋 planning';
+  chip.title = pl.state === 'ready'
+    ? 'This thread finished a plan and is waiting for approval — click to review it'
+    : 'This thread is writing a plan — click to watch it live';
+}
+
+// --- Detection hook A: the transcript --------------------------------------
+// Runs on every entry batch, before chatIngest (which bails while the user
+// browses history). Live plan-file writes flip the pane to "drafting"; the
+// ExitPlanMode tool_result settles approved / changes-requested. Backfill
+// (replayed history after a bind/restart) only reconstructs state — it never
+// pops the review or messages the user.
+function planScanEntries(pane, entries, backfill) {
+  const pl = panePlan(pane);
+  for (const e of entries) {
+    if (!e || e.isSidechain || !e.message) continue;
+    const content = Array.isArray(e.message.content) ? e.message.content : null;
+    if (!content) continue;
+    if (e.type === 'assistant') {
+      for (const part of content) {
+        if (!part || part.type !== 'tool_use') continue;
+        if ((part.name === 'Write' || part.name === 'Edit') && part.input &&
+            typeof part.input.file_path === 'string' && PLAN_FILE_RE.test(part.input.file_path)) {
+          pl.file = part.input.file_path;
+          pl.source = /[\\/]\.hivemind[\\/]/i.test(part.input.file_path) ? 'hivemind' : 'native';
+          if (!backfill) {
+            planSetState(pane, 'drafting');
+            if (planModalPane === pane && planOpen() && !planDrafting) refreshPlanReview();
+          }
+        } else if (part.name === 'ExitPlanMode') {
+          if (part.id) pl.exitIds.add(part.id);
+          const inp = part.input || {};
+          if (typeof inp.planFilePath === 'string' && inp.planFilePath) {
+            pl.file = inp.planFilePath;
+            pl.source = /[\\/]\.hivemind[\\/]/i.test(inp.planFilePath) ? 'hivemind' : 'native';
+          }
+          if (typeof inp.plan === 'string' && inp.plan) pl.exitPlanText = inp.plan;
+        }
+      }
+    } else if (e.type === 'user') {
+      for (const part of content) {
+        if (!part || part.type !== 'tool_result' || !pl.exitIds.has(part.tool_use_id)) continue;
+        planApplyResult(pane, PLAN_APPROVED_RE.test(planToolResultText(part)), backfill);
+      }
+    }
+  }
+}
+
+function planToolResultText(part) {
+  const c = part && part.content;
+  if (typeof c === 'string') return c;
+  if (Array.isArray(c)) {
+    return c.map((x) => (x && x.type === 'text' && typeof x.text === 'string') ? x.text : '').join('\n');
+  }
+  return '';
+}
+
+function planApplyResult(pane, approved, backfill) {
+  planSetState(pane, approved ? 'approved' : 'changes-requested');
+  if (backfill || planModalPane !== pane || !planOpen()) return;
+  if (approved) {
+    setPlanDocMsg('✓ Approved — the thread is implementing.', 'ok');
+    setTimeout(() => {
+      if (planModalPane === pane && panePlan(pane).state === 'approved') closePlanReview();
+    }, 1600);
+  } else {
+    setPlanDocMsg('Staying in plan mode — the thread will revise the plan.');
+  }
+}
+
+// --- Detection hook B: the visible screen -----------------------------------
+// Called from probeAttention/evaluateIdle with the screen they already read.
+// The "Ready to code?" menu is the only reliable readiness signal (see the
+// section comment); its parsed options double as the label→digit map the
+// Approve / Request-changes buttons need. Two consecutive probe misses while
+// "ready" mean the menu was answered somewhere else — actions disable and the
+// transcript result resolves the state.
+// Parse the approval menu's numbered options off the visible screen. The
+// plan dialog draws none of the "Enter to select … Esc to cancel" footer
+// chrome parseScreenQuestion anchors on (its footer reads "Tab/Arrow keys to
+// navigate · ctrl+g edit in … · escape cancel" — verified v2.1.202), so this
+// anchors on the numbering itself: the bottom-most "1." line with options
+// counting up from it, validated by the one option every variant of the menu
+// ends with — "No, keep planning". Non-option lines in between are wrapped
+// labels, option descriptions, or the feedback option's inline input.
+function parsePlanMenu(screen) {
+  // The dialog is a bordered box — shed the │ box chrome so the line-anchored
+  // option regex sees "❯ 1. Yes, …" rather than "│ ❯ 1. Yes, … │".
+  const lines = screen.split('\n')
+    .map((l) => l.replace(/^[\s│┃]+/, '').replace(/[\s│┃]+$/, ''));
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const m = SCREEN_OPT_RE.exec(lines[i]);
+    if (!m || m[2] !== '1') continue;
+    const options = [];
+    for (let j = i; j < lines.length; j++) {
+      const om = SCREEN_OPT_RE.exec(lines[j]);
+      if (om && Number(om[2]) === options.length + 1) options.push({ label: om[3].trim() });
+    }
+    // The bottom-most numbered block either is the menu or there is no menu
+    // on screen (a numbered list inside the plan preview fails the check).
+    return options.length >= 2 && options.some((o) => PLAN_MENU_KEEP_RE.test(o.label))
+      ? options : null;
+  }
+  return null;
+}
+
+function planScreenCheck(pane, screen) {
+  if (pane.agent !== 'claude' || pane.disposed || pane.state === 'dead') return;
+  const pl = panePlan(pane);
+  if (PLAN_MENU_KEEP_RE.test(screen)) {
+    const opts = parsePlanMenu(screen);
+    if (opts) {
+      pl.menu = { options: opts };
+      pl.menuMiss = 0;
+      if (pl.state !== 'ready' && pl.state !== 'pending-result') planBecameReady(pane);
+      return;
+    }
+  }
+  if (pl.state === 'ready' && ++pl.menuMiss >= 2) {
+    pl.menu = null;
+    planSetState(pane, 'pending-result');
+    if (planModalPane === pane && planOpen()) {
+      setPlanDocMsg('The approval menu was answered in the terminal — waiting for the result…');
+    }
+  }
+}
+
+function planBecameReady(pane) {
+  planSetState(pane, 'ready');
+  // The existing attention path already badges the pane and fires the OS
+  // notification (the menu matches MENU_PATTERNS); here we surface the doc.
+  if (planModalPane === pane && planOpen()) { refreshPlanReview(); return; }
+  if (localStorage.getItem('hm.planAutoOpen') === '0') return;
+  if (pane === focusedPane && !planOpen()) openPlanReview(pane);
+}
+
+// --- The review window -------------------------------------------------------
+function planOpen() { return !planBackdrop.classList.contains('hidden'); }
+
+function openPlanReview(pane) {
+  planModalPane = pane || null;
+  planDrafting = false;
+  planPendingSel = null;
+  planRenderedMtime = 0;
+  planDocNote.value = '';
+  setPlanDocMsg('');
+  planBackdrop.classList.remove('hidden');
+  refreshPlanReview();
+  startPlanPoll();
+}
+
+function closePlanReview() {
+  planBackdrop.classList.add('hidden');
+  stopPlanPoll();
+  hideCommentBtn();
+  planModalPane = null;
+  planText = null;
+  planDrafting = false;
+  planPendingSel = null;
+}
+
+planToggle.onclick = () => openPlanReview(focusedPane);
+$('plan-doc-close').onclick = () => closePlanReview();
+$('plan-doc-request').onclick = () => requestPlanFromThread();
+$('plan-doc-copy').onclick = async () => {
+  if (planText == null) { setPlanDocMsg('No plan to copy.', 'err'); return; }
+  try { await navigator.clipboard.writeText(planText); setPlanDocMsg('Copied ✓', 'ok'); }
+  catch (_) { setPlanDocMsg('Could not copy to the clipboard.', 'err'); }
+};
+planBackdrop.addEventListener('mousedown', (e) => { if (e.target === planBackdrop) closePlanReview(); });
+planDocNote.addEventListener('input', () => paintPlanActions());
+
+function setPlanDocMsg(text, kind) {
+  planDocMsg.textContent = text || '';
+  planDocMsg.className = kind || '';
+}
 
 // A live, non-dead focused thread (same guard the voice/insert paths use).
 function livePane() {
@@ -5230,17 +5896,24 @@ function ensurePlanId(pane) {
   return pane.planId;
 }
 
-// While waiting for a ⟳-requested rewrite: { planId, since } (the plan file's
-// mtime at request time) so refreshPlan can tell when the thread actually wrote.
+// While waiting for a ⟳-requested rewrite: { pane, since } (the plan file's
+// mtime at request time) so the refresh can tell when the thread actually wrote.
 let planAwait = null;
 
-// Type a request into the focused thread asking it to (re)write its plan file.
+// The pane the review's actions should drive: the one it was opened on, or
+// the focused thread as a fallback when that pane is gone.
+function planActionPane() {
+  if (planModalPane && !planModalPane.disposed && planModalPane.state !== 'dead') return planModalPane;
+  return livePane();
+}
+
+// Type a request into the thread asking it to (re)write its plan file — the
+// manual path for ChatGPT threads and threads outside plan mode.
 async function requestPlanFromThread() {
-  const pane = livePane();
-  if (!pane) { setPlanMsg('Click a thread first, then ask it for a plan.', 'err'); return; }
+  const pane = planActionPane();
+  if (!pane) { setPlanDocMsg('Click a thread first, then ask it for a plan.', 'err'); return; }
   const planId = ensurePlanId(pane);
-  planPane = pane;
-  const dir = activeDir();
+  const dir = pane.board && pane.board.dir;
   // Opting into plans → keep `.hivemind/` out of the project's Source Control.
   if (dir) window.api.plan.ensureIgnored(dir);
   // Note the plan's current mtime so we can detect the thread's rewrite.
@@ -5248,87 +5921,147 @@ async function requestPlanFromThread() {
   if (dir) { const cur = await window.api.plan.read(dir, planId); if (cur && cur.ok) since = cur.mtime || 0; }
   const rel = '.hivemind/plans/' + planId + '.md';
   typePrompt(pane, `Write your current plan to ${rel} as GitHub-flavoured markdown, overwriting any existing file. Create the folder if needed.`);
-  setPlanMsg('Asked the thread to write its plan — it will appear here once written.', 'ok');
-  const token = { planId, since };
+  setPlanDocMsg('Asked the thread to write its plan — it will appear here once written.', 'ok');
+  const token = { pane, since };
   planAwait = token;
   setTimeout(() => {
     if (planAwait === token) {
       planAwait = null;
-      setPlanMsg('No plan written yet — the thread may still be working.');
+      if (planModalPane === pane && planOpen()) {
+        setPlanDocMsg('No plan written yet — the thread may still be working.');
+      }
     }
   }, 30000);
 }
 
-// Clear the focused thread's plan file and its comment sidecar, then reset the
-// panel to its empty state. Destructive, so confirm first.
-async function clearPlanForThread() {
-  const pane = livePane();
-  if (!pane) { setPlanMsg('Click a thread first.', 'err'); return; }
-  if (!pane.planId) { renderPlanState({ ok: false, reason: 'not-found' }); return; }
-  const dir = activeDir();
-  if (!dir) { setPlanMsg('This hive has no project directory set.', 'err'); return; }
-  if (!confirm("Clear this thread's plan and all its comments? This cannot be undone.")) return;
-  const res = await window.api.plan.clear(dir, pane.planId);
-  if (!res || !res.ok) { setPlanMsg((res && res.message) || 'Could not clear the plan.', 'err'); return; }
-  planAwait = null;
-  planComments = [];
-  planPendingSel = null;
-  renderPlanState({ ok: false, reason: 'not-found' });
-  setPlanMsg('Plan cleared.', 'ok');
-}
-
-// Read the focused thread's plan + comments and render them.
-async function refreshPlan() {
-  if (!planPanelOpen()) return;
-  const pane = livePane();
-  planPane = pane;
-  if (!pane) { renderPlanState({ ok: false, reason: 'no-thread' }); return; }
-  const dir = activeDir();
-  if (!dir) { renderPlanState({ ok: false, reason: 'no-dir' }); return; }
-  if (!pane.planId) { renderPlanState({ ok: false, reason: 'not-found' }); return; }
-  const [planRes, cmtRes] = await Promise.all([
-    window.api.plan.read(dir, pane.planId),
-    window.api.plan.readComments(dir, pane.planId),
-  ]);
+// Read the shown pane's plan + comments and render them. Content source, in
+// order: the plan file the transcript revealed (native or hivemind), the
+// legacy ⟳ file keyed by planId, and the ExitPlanMode input as a last resort
+// (it can be truncated in transit, so the file is always preferred).
+async function refreshPlanReview() {
+  if (!planOpen()) return;
+  const pane = planModalPane;
+  if (!pane) { renderPlanDocState({ ok: false, reason: 'no-thread' }); return; }
+  const pl = panePlan(pane);
+  const dir = pane.board && pane.board.dir;
+  if (!dir) { renderPlanDocState({ ok: false, reason: 'no-dir' }); return; }
+  let res = null;
+  if (pl.file) res = await window.api.plan.readFile(dir, pl.file);
+  if ((!res || !res.ok) && pane.planId) {
+    const legacy = await window.api.plan.read(dir, pane.planId);
+    if (legacy && legacy.ok) { res = legacy; if (!pl.file) pl.source = 'hivemind'; }
+  }
+  if ((!res || !res.ok) && pl.exitPlanText) res = { ok: true, content: pl.exitPlanText, mtime: 0 };
+  const key = planCommentsKey(pane);
+  const cmtRes = key ? await window.api.plan.readComments(dir, key) : null;
+  if (planModalPane !== pane || !planOpen()) return; // moved on during the reads
   planComments = (cmtRes && cmtRes.comments) || [];
-  if (!planRes || !planRes.ok) { renderPlanState(planRes || { ok: false, reason: 'not-found' }); return; }
-  planText = planRes.content;
+  if (!res || !res.ok) { renderPlanDocState(res || { ok: false, reason: 'not-found' }); return; }
+  planText = res.content;
+  planRenderedMtime = res.mtime || 0;
   // If we were waiting on a ⟳ request and the file is now newer, confirm it.
-  const confirmed = planAwait && planAwait.planId === pane.planId && (planRes.mtime || 0) > planAwait.since;
+  const confirmed = planAwait && planAwait.pane === pane && (res.mtime || 0) > planAwait.since;
   if (confirmed) planAwait = null;
   renderPlan();
-  if (confirmed) setPlanMsg('Plan updated ✓', 'ok');
+  if (confirmed) setPlanDocMsg('Plan updated ✓', 'ok');
 }
 
-function renderPlanState(res) {
+// Live refresh while the review is open: re-read on mtime change (the same
+// polling transcript.js uses — fs.watch misses appends on Windows, and native
+// plan files live outside the watched project tree anyway). Paused while a
+// comment draft is open so a re-render can't clobber it.
+function startPlanPoll() {
+  if (!planPollTimer) planPollTimer = setInterval(planPollTick, 1200);
+}
+function stopPlanPoll() {
+  clearInterval(planPollTimer);
+  planPollTimer = null;
+}
+async function planPollTick() {
+  if (!planOpen() || planDrafting) return;
+  const pane = planModalPane;
+  if (!pane) return;
+  const pl = panePlan(pane);
+  const dir = pane.board && pane.board.dir;
+  if (!dir) return;
+  let res = null;
+  if (pl.file) res = await window.api.plan.readFile(dir, pl.file);
+  else if (pane.planId) res = await window.api.plan.read(dir, pane.planId);
+  if (!planOpen() || planModalPane !== pane || planDrafting) return;
+  if (res && res.ok && ((res.mtime || 0) !== planRenderedMtime || planText == null)) refreshPlanReview();
+}
+
+function renderPlanDocState(res) {
   planText = null;
-  planBody.innerHTML = '';
+  planRenderedMtime = 0;
+  planDocBody.innerHTML = '';
   planCommentsEl.innerHTML = '';
-  planActionbar.classList.add('hidden');
+  planCommentsEl.classList.add('hidden');
+  planDocTitle.textContent = 'Plan';
+  paintPlanActions();
   const wrap = document.createElement('div');
   wrap.className = 'git-empty';
   const reason = res && res.reason;
   if (reason === 'no-dir') {
     wrap.textContent = 'This hive has no project directory set. Edit the hive to choose one.';
   } else if (reason === 'no-thread') {
-    wrap.textContent = 'Click a thread to see its plan.';
+    wrap.textContent = 'Click a thread first, then open the plan review.';
   } else if (reason === 'not-found') {
-    wrap.textContent = 'No plan yet — click ⟳ above to ask this thread to write one.';
+    const p = document.createElement('p');
+    p.textContent = 'No plan yet. Start the thread in the Plan permission mode and its plan appears here on its own — or ask for one now:';
+    const btn = document.createElement('button');
+    btn.className = 'plan-send-btn plan-empty-btn';
+    btn.textContent = 'Ask this thread to write a plan';
+    btn.onclick = () => requestPlanFromThread();
+    wrap.append(p, btn);
   } else {
     wrap.textContent = (res && res.message ? res.message : 'Could not read the plan.').trim();
   }
-  planBody.appendChild(wrap);
+  planDocBody.appendChild(wrap);
 }
 
 // Render the markdown, re-anchor comment highlights, and draw the comment list.
 function renderPlan() {
-  setPlanMsg('');
-  planBody.innerHTML = markdownToHtml(planText || '');
+  const pane = planModalPane;
+  const pl = pane ? panePlan(pane) : null;
+  planDocBody.innerHTML = markdownToHtml(planText || '');
+  // Native plan-mode files belong to Claude Code while it plans — render
+  // their task checkboxes read-only instead of writing into ~/.claude/plans.
+  if (!pl || pl.source !== 'hivemind') {
+    planDocBody.querySelectorAll('input.plan-check').forEach((cb) => { cb.disabled = true; });
+  }
   for (const c of planComments) {
     if (c.resolved) continue;
-    c._anchored = highlightOccurrence(planBody, c.quote, c.occurrence || 0, c.id);
+    c._anchored = highlightOccurrence(planDocBody, c.quote, c.occurrence || 0, c.id);
   }
+  const heading = /^#{1,3}\s+(.+)$/m.exec(planText || '');
+  planDocTitle.textContent = heading ? heading[1].trim() : 'Plan';
+  paintPlanActions();
   renderCommentList();
+}
+
+// Status chip + action-button enablement for the current pane/state.
+function paintPlanActions() {
+  const pane = planModalPane;
+  const pl = pane ? panePlan(pane) : null;
+  const state = pl ? pl.state : 'none';
+  planDocStatus.textContent = PLAN_STATE_LABEL[state] || state;
+  planDocStatus.className = 'plan-chip ' + state;
+  planDocThread.textContent = pane ? ('— ' + (pane.captionText || pane.name || '')) : '';
+  const live = pane && !pane.disposed && pane.state !== 'dead';
+  const menu = (live && pl && pl.state === 'ready' && pl.menu && pl.menu.options) || null;
+  // The run-with-it label varies by permission mode ("Yes, and bypass
+  // permissions", …) — surface the exact option the button will pick.
+  const autoOpt = menu && menu.find((o) => PLAN_MENU_AUTO_RE.test(o.label));
+  planApproveAutoBtn.disabled = !autoOpt;
+  planApproveAutoBtn.title = autoOpt
+    ? 'Approve the plan — picks “' + autoOpt.label + '” in the thread'
+    : 'Approve the plan — edits are auto-accepted';
+  planApproveManualBtn.disabled = !(menu && menu.some((o) => PLAN_MENU_MANUAL_RE.test(o.label)));
+  // Request-changes also works without the menu (hivemind/manual plans): it
+  // then just types the comments into the thread.
+  const hasFeedback = planComments.some((c) => !c.resolved && !c.sent) || !!planDocNote.value.trim();
+  planReqChangesBtn.disabled = !live || !hasFeedback || planText == null;
 }
 
 // --- Minimal, dependency-free markdown -> HTML ------------------------------
@@ -5480,7 +6213,7 @@ function highlightOccurrence(root, quote, occurrence, id) {
 }
 
 // Links in a plan open in the OS browser, not the file:// renderer window.
-planBody.addEventListener('click', (e) => {
+planDocBody.addEventListener('click', (e) => {
   const a = e.target.closest && e.target.closest('a.plan-link');
   if (a) {
     e.preventDefault();
@@ -5491,13 +6224,15 @@ planBody.addEventListener('click', (e) => {
 
 // Toggling a task checkbox flips `[ ]`<->`[x]` on its source line and writes the
 // plan file back, so plan progress edited here persists (and the thread sees it).
-planBody.addEventListener('change', async (e) => {
+// Only for hivemind-source plans — native checkboxes render disabled.
+planDocBody.addEventListener('change', async (e) => {
   const cb = e.target;
-  if (!cb || !cb.classList || !cb.classList.contains('plan-check')) return;
+  if (!cb || !cb.classList || !cb.classList.contains('plan-check') || cb.disabled) return;
   const ln = parseInt(cb.dataset.line, 10);
-  const dir = activeDir();
-  const pane = planPane;
-  if (!Number.isInteger(ln) || planText == null || !dir || !pane || !pane.planId) return;
+  const pane = planModalPane;
+  const dir = pane && pane.board && pane.board.dir;
+  const key = planCommentsKey(pane); // hivemind plans: same basename as the .md
+  if (!Number.isInteger(ln) || planText == null || !dir || !key) return;
   const lines = planText.split('\n');
   if (ln < 0 || ln >= lines.length) return;
   const mark = cb.checked ? 'x' : ' ';
@@ -5506,22 +6241,41 @@ planBody.addEventListener('change', async (e) => {
   lines[ln] = next;
   planText = lines.join('\n');
   renderPlan();                          // instant feedback; re-anchors comments
-  const res = await window.api.plan.write(dir, pane.planId, planText);
-  if (res && !res.ok) setPlanMsg(res.message || 'Could not update the plan file.', 'err');
+  const res = await window.api.plan.write(dir, key, planText);
+  if (res && !res.ok) setPlanDocMsg(res.message || 'Could not update the plan file.', 'err');
+  else if (res && res.ok) planRenderedMtime = res.mtime || planRenderedMtime;
 });
 
 // --- Highlight-to-comment ---------------------------------------------------
 function hideCommentBtn() { planCommentBtn.classList.add('hidden'); }
 
+// The `.hivemind/plans/` key that comments (and hivemind plan write-backs)
+// are stored under: the plan file's basename when it's filesystem-safe
+// (covers both `plan-….md` and native `<slug>.md`), a hash of the path
+// otherwise, and the pane's legacy planId when no file is known yet.
+function planCommentsKey(pane) {
+  if (!pane) return null;
+  const pl = panePlan(pane);
+  if (pl.file) {
+    const base = String(pl.file).split(/[\\/]/).pop().replace(/\.md$/i, '');
+    if (/^[A-Za-z0-9._-]+$/.test(base)) return base;
+    let h = 5381;
+    const s = String(pl.file).toLowerCase();
+    for (let i = 0; i < s.length; i++) h = ((h << 5) + h + s.charCodeAt(i)) >>> 0;
+    return 'native-' + h.toString(16);
+  }
+  return pane.planId || null;
+}
+
 // Show the floating "＋ Comment" button when the user selects plan text.
-planBody.addEventListener('mouseup', () => {
+planDocBody.addEventListener('mouseup', () => {
   setTimeout(() => {
     const sel = window.getSelection();
     if (!sel || sel.isCollapsed || !sel.toString().trim()) { hideCommentBtn(); return; }
     const range = sel.getRangeAt(0);
-    if (!planBody.contains(range.commonAncestorContainer)) { hideCommentBtn(); return; }
+    if (!planDocBody.contains(range.commonAncestorContainer)) { hideCommentBtn(); return; }
     const rect = range.getBoundingClientRect();
-    const host = planPanel.getBoundingClientRect();
+    const host = planModal.getBoundingClientRect();
     planCommentBtn.style.top = (rect.bottom - host.top + 4) + 'px';
     planCommentBtn.style.left = Math.max(4, rect.left - host.left) + 'px';
     planCommentBtn.classList.remove('hidden');
@@ -5536,10 +6290,10 @@ planCommentBtn.onclick = () => {
   const range = sel.getRangeAt(0);
   // Global offset of the selection start within the plan's plaintext.
   const pre = document.createRange();
-  pre.setStart(planBody, 0);
+  pre.setStart(planDocBody, 0);
   pre.setEnd(range.startContainer, range.startOffset);
   const startIndex = pre.toString().length;
-  const full = planBody.textContent;
+  const full = planDocBody.textContent;
   let occ = 0, from = 0, at;
   while ((at = full.indexOf(quote, from)) !== -1 && at < startIndex) { occ++; from = at + 1; }
   planPendingSel = { quote, occurrence: occ };
@@ -5549,11 +6303,12 @@ planCommentBtn.onclick = () => {
   renderCommentList();
 };
 
-// Draw the comment list (plus an inline draft editor when adding one).
+// Draw the comment rail (plus an inline draft editor when adding one).
 function renderCommentList() {
   planCommentsEl.innerHTML = '';
   const unresolved = planComments.filter((c) => !c.resolved);
-  planActionbar.classList.toggle('hidden', unresolved.length === 0);
+  planCommentsEl.classList.toggle('hidden', !unresolved.length && !planDrafting);
+  paintPlanActions();
 
   if (planDrafting && planPendingSel) {
     const box = document.createElement('div');
@@ -5587,7 +6342,8 @@ function renderCommentList() {
 
   unresolved.forEach((c, n) => {
     const item = document.createElement('div');
-    item.className = 'plan-cmt-item' + (c._anchored === false ? ' orphaned' : '');
+    item.className = 'plan-cmt-item' +
+      (c._anchored === false ? ' orphaned' : '') + (c.sent ? ' sent' : '');
     const num = document.createElement('span');
     num.className = 'plan-cmt-num';
     num.textContent = String(n + 1);
@@ -5597,7 +6353,7 @@ function renderCommentList() {
     q.className = 'plan-cmt-quote';
     q.textContent = '“' + c.quote + '”' + (c._anchored === false ? '  (not found in current plan)' : '');
     q.onclick = () => {
-      const mark = planBody.querySelector('mark.plan-cmt[data-id="' + c.id + '"]');
+      const mark = planDocBody.querySelector('mark.plan-cmt[data-id="' + c.id + '"]');
       if (mark) mark.scrollIntoView({ block: 'center' });
     };
     const body = document.createElement('div');
@@ -5606,8 +6362,16 @@ function renderCommentList() {
     main.append(q, body);
     const act = document.createElement('div');
     act.className = 'plan-cmt-act';
+    if (c.sent) {
+      const tag = document.createElement('span');
+      tag.className = 'plan-cmt-tag';
+      tag.textContent = 'sent';
+      tag.title = 'Already sent to the thread with a Request-changes round';
+      item.append(num, main, tag, act);
+    } else {
+      item.append(num, main, act);
+    }
     act.appendChild(mkMini('✓', 'Resolve (remove) this comment', () => resolveComment(c.id)));
-    item.append(num, main, act);
     planCommentsEl.appendChild(item);
   });
 }
@@ -5617,7 +6381,7 @@ async function saveDraftComment(text) {
   if (!body || !planPendingSel) { planDrafting = false; planPendingSel = null; renderCommentList(); return; }
   planComments.push({
     id: nextId('cmt'), quote: planPendingSel.quote,
-    occurrence: planPendingSel.occurrence, body, resolved: false,
+    occurrence: planPendingSel.occurrence, body, resolved: false, sent: false,
   });
   planDrafting = false;
   planPendingSel = null;
@@ -5632,23 +6396,86 @@ async function resolveComment(id) {
 }
 
 async function persistComments() {
-  const dir = activeDir();
-  const pane = planPane;
-  if (!dir || !pane || !pane.planId) return;
-  const res = await window.api.plan.writeComments(dir, pane.planId, planComments);
-  if (res && !res.ok) setPlanMsg(res.message || 'Could not save comments.', 'err');
+  const pane = planModalPane;
+  const dir = pane && pane.board && pane.board.dir;
+  const key = planCommentsKey(pane);
+  if (!dir || !key) return;
+  window.api.plan.ensureIgnored(dir); // sidecars live in `.hivemind/` — keep it out of Git
+  const res = await window.api.plan.writeComments(dir, key, planComments);
+  if (res && !res.ok) setPlanDocMsg(res.message || 'Could not save comments.', 'err');
 }
 
-// Type the unresolved comments into the thread so it can revise the plan.
-planSendBtn.onclick = () => {
-  const pane = (planPane && !planPane.disposed && planPane.state !== 'dead') ? planPane : livePane();
-  if (!pane) { setPlanMsg('The thread for this plan is no longer open.', 'err'); return; }
-  const unresolved = planComments.filter((c) => !c.resolved);
-  if (!unresolved.length) { setPlanMsg('No comments to send.', 'err'); return; }
-  const parts = unresolved.map((c, n) => `[${n + 1}] on "${c.quote}": ${c.body}`);
-  const msg = 'Please revise your plan based on these comments, then rewrite the plan file. Comments: ' + parts.join('  ');
-  sendToPane(pane, msg);
-  setPlanMsg('Sent ' + unresolved.length + ' comment(s) to the thread.', 'ok');
+// --- Approve / Request changes ----------------------------------------------
+// Both drive Claude Code's own "Ready to code?" menu in the hidden terminal,
+// finding the option to press by label in the live screen parse (the digits
+// move when optional menu entries appear).
+function planAnswerMenu(labelRe, busyMsg) {
+  const pane = planModalPane;
+  if (!pane || pane.disposed || pane.state === 'dead') {
+    setPlanDocMsg('This thread is no longer running.', 'err');
+    return;
+  }
+  const pl = panePlan(pane);
+  const opts = (pl.menu && pl.menu.options) || [];
+  const idx = opts.findIndex((o) => labelRe.test(o.label));
+  if (pl.state !== 'ready' || idx < 0) {
+    setPlanDocMsg('The thread isn’t showing its approval menu right now — answer in the terminal.', 'err');
+    paintPlanActions();
+    return;
+  }
+  sendToPane(pane, String(idx + 1));
+  planSetState(pane, 'pending-result');
+  setPlanDocMsg(busyMsg);
+}
+
+planApproveAutoBtn.onclick = () => planAnswerMenu(PLAN_MENU_AUTO_RE, 'Approving (auto-accept edits)…');
+planApproveManualBtn.onclick = () => planAnswerMenu(PLAN_MENU_MANUAL_RE, 'Approving (manual edits)…');
+
+// Wait for the screen to show `re` (e.g. the feedback input's placeholder)
+// before pasting — pasting into a menu that hasn't opened its input yet would
+// scatter keystrokes into the select.
+async function planAwaitScreen(pane, re, timeoutMs) {
+  const t0 = Date.now();
+  while (Date.now() - t0 < timeoutMs) {
+    if (pane.disposed || pane.state === 'dead') return false;
+    if (re.test(screenText(pane))) return true;
+    await new Promise((r) => setTimeout(r, 120));
+  }
+  return false;
+}
+
+planReqChangesBtn.onclick = async () => {
+  const pane = planModalPane;
+  if (!pane || pane.disposed || pane.state === 'dead') {
+    setPlanDocMsg('This thread is no longer running.', 'err');
+    return;
+  }
+  const pl = panePlan(pane);
+  const unsent = planComments.filter((c) => !c.resolved && !c.sent);
+  const note = planDocNote.value.trim();
+  if (!unsent.length && !note) { setPlanDocMsg('Add a comment (or overall feedback) first.', 'err'); return; }
+  const parts = unsent.map((c, n) => `[${n + 1}] Re "${c.quote}": ${c.body}`);
+  if (note) parts.push(`[${parts.length + 1}] ${note}`);
+  const feedback = 'Please revise the plan. Comments:\n' + parts.join('\n');
+  const opts = (pl.menu && pl.menu.options) || [];
+  const keepIdx = opts.findIndex((o) => PLAN_MENU_KEEP_RE.test(o.label));
+  if (pl.state === 'ready' && keepIdx >= 0) {
+    // Native plan mode: pick "No, keep planning", wait for its inline feedback
+    // input to appear, then paste the comments as the revision request.
+    sendToPane(pane, String(keepIdx + 1));
+    planSetState(pane, 'pending-result');
+    setPlanDocMsg('Sending your feedback…');
+    await planAwaitScreen(pane, PLAN_FEEDBACK_INPUT_RE, 2500);
+    typePrompt(pane, feedback);
+  } else {
+    // No approval menu (hivemind/manual plans): just ask the thread directly.
+    typePrompt(pane, feedback + '\nThen rewrite the plan file at the same path.');
+  }
+  unsent.forEach((c) => { c.sent = true; });
+  planDocNote.value = '';
+  await persistComments();
+  renderCommentList();
+  setPlanDocMsg('Feedback sent — the thread will revise the plan.', 'ok');
 };
 
 // -- Diff viewer ------------------------------------------------------------
@@ -5728,7 +6555,8 @@ branchBackdrop.addEventListener('mousedown', (e) => { if (e.target === branchBac
 
 document.addEventListener('keydown', (e) => {
   if (e.key !== 'Escape') return;
-  if (!diffBackdrop.classList.contains('hidden')) diffBackdrop.classList.add('hidden');
+  if (!planBackdrop.classList.contains('hidden')) closePlanReview();
+  else if (!diffBackdrop.classList.contains('hidden')) diffBackdrop.classList.add('hidden');
   else if (!branchBackdrop.classList.contains('hidden')) branchBackdrop.classList.add('hidden');
   else if (!ghBackdrop.classList.contains('hidden')) closeWizard();
   else { const ub = document.getElementById('usage-backdrop'); if (ub && !ub.classList.contains('hidden')) { ub.classList.add('hidden'); return; } const hb = document.getElementById('help-backdrop'); if (hb && !hb.classList.contains('hidden')) { hb.classList.add('hidden'); return; } const sb = document.getElementById('settings-backdrop'); if (sb && !sb.classList.contains('hidden')) sb.classList.add('hidden'); }
@@ -6157,10 +6985,11 @@ function commitVoiceText(raw) {
   if (!text) return;
 
   // A dictated utterance addressed to Hivemind ("Hivemind, open a new thread…")
-  // runs as an app command instead of being typed into the thread; unrecognized
-  // phrasing falls through and is typed as normal.
+  // runs as an app command instead of being typed into the thread. Anything
+  // starting with the wake word is consumed (unrecognized phrasing toasts an
+  // error); mentioning Hivemind mid-sentence types as normal.
   const hmCmd = matchHivemindCommand(text);
-  if (hmCmd !== null && runHivemindCommand(hmCmd, pane)) return;
+  if (hmCmd !== null) { runHivemindCommand(hmCmd, pane); return; }
 
   // A dictated utterance starting with "todo" becomes a Todo-panel item
   // instead of being typed into the thread.
@@ -6681,6 +7510,8 @@ function syncGeneralFields() {
   if (sf) sf.value = String(defaultFontSize);
   const sn = $('set-notify');
   if (sn) sn.checked = !notifyMuted;
+  const sp = $('set-plan-autopopup');
+  if (sp) sp.checked = localStorage.getItem('hm.planAutoOpen') !== '0';
   const sa = $('set-autocorrect');
   if (sa) sa.checked = autocorrectEnabled;
   const sv = $('set-app-version');
@@ -6690,6 +7521,9 @@ function syncGeneralFields() {
 function openSettings(tab) {
   syncGeneralFields();
   syncVoiceFields();
+  // Reveal the "Build portable copy" group only when the active hive is the
+  // Hivemind source checkout (the group is not per-board, so check on open).
+  updateBuildButton(activeBoard());
   setSettingsTab(tab || 'general');
   settingsBackdrop.classList.remove('hidden');
 }
@@ -6906,6 +7740,10 @@ const setNotify = $('set-notify');
 if (setNotify) setNotify.addEventListener('change', () => {
   notifyMuted = !setNotify.checked;
   localStorage.setItem('hm.muteNotifications', notifyMuted ? '1' : '0');
+});
+const setPlanAuto = $('set-plan-autopopup');
+if (setPlanAuto) setPlanAuto.addEventListener('change', () => {
+  localStorage.setItem('hm.planAutoOpen', setPlanAuto.checked ? '1' : '0');
 });
 const setAutocorrect = $('set-autocorrect');
 if (setAutocorrect) setAutocorrect.addEventListener('change', () => {

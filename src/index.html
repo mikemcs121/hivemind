@@ -53,24 +53,6 @@
           <div id="git-msgbar" class="git-msgbar hidden"></div>
         </aside>
 
-        <!-- Plan panel — renders the focused thread's plan.md + highlight comments -->
-        <aside id="plan-panel" class="hidden">
-          <div class="git-header">
-            <span class="git-title">Plan</span>
-            <div class="spacer"></div>
-            <button id="plan-refresh" class="git-icon" title="Ask the focused thread to (re)write its plan">⟳</button>
-            <button id="plan-clear" class="git-icon" title="Clear this thread's plan and comments">🗑</button>
-            <button id="plan-close" class="git-icon" title="Close">✕</button>
-          </div>
-          <div id="plan-body"></div>
-          <div id="plan-comments"></div>
-          <div id="plan-actionbar" class="plan-actionbar hidden">
-            <button id="plan-send" class="plan-send-btn" title="Type your comments into the focused thread so it can revise the plan">Send comments to thread</button>
-          </div>
-          <div id="plan-msgbar" class="git-msgbar hidden"></div>
-          <button id="plan-comment-btn" class="plan-comment-btn hidden" title="Comment on the selected text">＋ Comment</button>
-        </aside>
-
         <!-- Todo panel — a per-hive checklist stored in .hivemind/todos.json -->
         <aside id="todo-panel" class="hidden">
           <div class="git-header">
@@ -108,7 +90,7 @@
               <path d="M18 9a9 9 0 0 1-9 9" />
             </svg>
           </button>
-          <button id="plan-toggle" class="sidebar-action-btn" title="Plan" aria-label="Plan" disabled>
+          <button id="plan-toggle" class="sidebar-action-btn" title="Plan review — the focused thread's plan as a document" aria-label="Plan review" disabled>
             <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor"
                  stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
               <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
@@ -132,7 +114,6 @@
 
       <main id="workspace">
         <header id="board-bar">
-          <button id="build-portable" class="pill-btn hidden" title="Build a portable copy of Hivemind from this checkout">📦</button>
           <div id="board-title">No hive selected</div>
           <div id="board-meta"></div>
           <div class="spacer"></div>
@@ -172,6 +153,36 @@
           <button id="diff-close" class="git-icon" title="Close">✕</button>
         </div>
         <pre id="diff-body"></pre>
+      </div>
+    </div>
+
+    <!-- Plan review — a thread's plan as a full document, with inline comments
+         and Approve / Request-changes actions that answer Claude Code's own
+         plan-approval menu in the hidden terminal. -->
+    <div id="plan-backdrop" class="hidden">
+      <div id="plan-modal">
+        <div class="plan-doc-head">
+          <span id="plan-doc-status" class="plan-chip none">No plan</span>
+          <span id="plan-doc-title">Plan</span>
+          <span id="plan-doc-thread"></span>
+          <div class="spacer"></div>
+          <button id="plan-doc-copy" class="git-icon" title="Copy the plan's markdown">⧉</button>
+          <button id="plan-doc-request" class="git-icon" title="Ask this thread to (re)write its plan file">⟳</button>
+          <button id="plan-doc-close" class="git-icon" title="Close (Esc)">✕</button>
+        </div>
+        <div class="plan-doc-main">
+          <div id="plan-doc-body"></div>
+          <aside id="plan-doc-comments" class="hidden"></aside>
+        </div>
+        <div class="plan-doc-actions">
+          <span id="plan-doc-msg"></span>
+          <div class="spacer"></div>
+          <input id="plan-doc-note" type="text" placeholder="Overall feedback (optional)…" spellcheck="true" />
+          <button id="plan-req-changes" class="plan-mini-btn" title="Pick “No, keep planning” in the thread and send your comments as feedback">Request changes</button>
+          <button id="plan-approve-manual" class="plan-mini-btn" title="Approve the plan — you approve each edit as it happens">Approve · manual edits</button>
+          <button id="plan-approve-auto" class="plan-send-btn" title="Approve the plan — edits are auto-accepted">Approve · auto-accept</button>
+        </div>
+        <button id="plan-doc-comment-btn" class="plan-comment-btn hidden" title="Comment on the selected text">＋ Comment</button>
       </div>
     </div>
 
@@ -257,6 +268,17 @@
             </div>
 
             <div class="settings-group">
+              <div class="settings-group-title">Plan review</div>
+              <label class="settings-check">
+                <input type="checkbox" id="set-plan-autopopup" />
+                <span>Automatically open the plan review when the focused thread
+                  finishes planning and asks for approval</span>
+              </label>
+              <small>Unfocused threads never pop up — they show a <em>📋 plan ready</em>
+                chip in their header instead; click it (or the Plan button) to review.</small>
+            </div>
+
+            <div class="settings-group">
               <div class="settings-group-title">Typing</div>
               <label class="settings-check">
                 <input type="checkbox" id="set-autocorrect" />
@@ -266,6 +288,13 @@
               </label>
               <small>Ctrl+Z undoes a correction. Right-click a squiggled word and
                 choose <em>Add to dictionary</em> to stop it being corrected.</small>
+            </div>
+
+            <div class="settings-group hidden" id="build-group">
+              <div class="settings-group-title">Building Hivemind</div>
+              <button id="build-portable" class="pill-btn" title="Build a portable copy of Hivemind from this checkout">📦 Build portable copy</button>
+              <small>Bumps the patch version, builds the portable .exe, and publishes a GitHub
+                release. Only available when this hive points at the Hivemind source checkout.</small>
             </div>
 
             <div class="settings-group">
@@ -350,10 +379,10 @@
                 <strong><svg class="help-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><line x1="6" y1="3" x2="6" y2="15" /><circle cx="18" cy="6" r="3" /><circle cx="6" cy="18" r="3" /><path d="M18 9a9 9 0 0 1-9 9" /></svg> Source Control</strong>
                 buttons to browse files and manage Git, and the
                 <strong><svg class="help-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" /><path d="M14 2v6h6" /><line x1="8" y1="13" x2="16" y2="13" /><line x1="8" y1="17" x2="13" y2="17" /></svg> Plan</strong>
-                button to review the focused thread's plan, and the
+                button to open the focused thread's plan review, and the
                 <strong><svg class="help-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 11l3 3L22 4" /><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11" /></svg> Todo</strong>
                 button to keep a checklist for the hive.</li>
-              <li><strong>Drag the sidebar's right edge</strong> to make it (and the Explorer, Source Control, Plan and Todo panels docked in it) wider or narrower. Double-click the edge to reset the width; it's remembered across restarts.</li>
+              <li><strong>Drag the sidebar's right edge</strong> to make it (and the Explorer, Source Control and Todo panels docked in it) wider or narrower. Double-click the edge to reset the width; it's remembered across restarts.</li>
             </ol>
           </div>
 
@@ -393,22 +422,12 @@
             <div class="settings-group-title">Hivemind commands</div>
             <p class="help-note">Start a composer message (or a single dictated sentence) with
               <strong>“Hivemind”</strong> and the rest is a command Hivemind itself carries out instead of
-              text sent to Claude — e.g. <em>“Hivemind, open a new thread and fix the failing login test.”</em>
-              A toast at the bottom of the workspace confirms what it did. If the rest isn't a command
-              Hivemind recognizes, the message is sent to the thread as normal — so talking
-              <em>about</em> Hivemind never gets swallowed.</p>
-            <ul class="help-list">
-              <li><strong>open a new thread</strong> <em>[and/to &lt;task&gt;]</em> — opens a thread on this hive; with a task, the new Claude starts working on it the moment it boots.</li>
-              <li><strong>tell &lt;thread&gt; to &lt;task&gt;</strong> — sends the task to the named thread (names and captions both match, so “tell claude 2 to…” or “tell the login thread to…” work).</li>
-              <li><strong>close this thread</strong> / <strong>close thread &lt;name&gt;</strong></li>
-              <li><strong>rename this thread to &lt;name&gt;</strong></li>
-              <li><strong>maximize</strong> / <strong>restore</strong> — zoom the current thread or go back to the tiled layout.</li>
-              <li><strong>focus thread &lt;name&gt;</strong> — jump to a thread by name.</li>
-              <li><strong>stop</strong> / <strong>interrupt</strong> <em>[thread &lt;name&gt;]</em> — sends the same Ctrl+C as the ⏹ button.</li>
-              <li><strong>add a todo &lt;text&gt;</strong> — adds an item to this hive's Todo panel.</li>
-              <li><strong>switch to hive &lt;name&gt;</strong></li>
-              <li><strong>help</strong> — opens this window.</li>
-            </ul>
+              text sent to Claude — e.g. <em>“Hivemind, open a new thread and fix the failing login test”</em>
+              or <em>“Hivemind, increase the font size”</em>. A toast at the bottom of the workspace confirms
+              what it did. Anything that <em>starts</em> with “Hivemind” is treated as a command — if it isn't
+              one Hivemind recognizes, the toast says so and nothing is sent to the thread. Mentioning
+              Hivemind mid-sentence is sent to the thread as normal.</p>
+            <ul class="help-list" id="hm-cmd-list"><!-- generated from the command registry in renderer.js --></ul>
             <p class="help-note">“This thread” means the one whose composer you typed into (or the focused
               one when dictating). If voice typing mishears the wake word (e.g. <em>“hive mine”</em>), add a
               correction in <strong>⚙ Settings → Voice</strong>'s dictionary.</p>
@@ -425,14 +444,15 @@
           </div>
 
           <div class="settings-group">
-            <div class="settings-group-title">Plan</div>
+            <div class="settings-group-title">Plan review</div>
             <ul class="help-list">
-              <li>The <strong>Plan</strong> panel shows the <em>focused thread's</em> plan as formatted markdown. Each thread has its own plan — switch threads and the panel follows.</li>
-              <li>Click <strong>⟳</strong> in the panel header to ask the focused thread to (re)write its plan. It types a request into that thread; Claude writes the plan to <code>.hivemind/plans/</code> in your project and the panel renders it automatically. The panel confirms with <em>“Plan updated ✓”</em> once the thread writes the file (<code>.hivemind/</code> is added to your <code>.gitignore</code> so plans stay out of Source Control).</li>
-              <li>Plans render as rich markdown — headings, tables, links (which open in your browser), block quotes and task lists. <strong>Tick a checkbox</strong> in a <code>- [ ]</code> task list to mark it done; the change is written straight back to the plan file.</li>
-              <li><strong>Highlight any text</strong> in the plan and click <strong>＋ Comment</strong> to attach a note to it — like review comments on a document. Comments are saved with the project, so they survive restarts.</li>
-              <li><strong>Send comments to thread</strong> types your comments (each with the text it refers to) into the focused thread, so Claude can revise the plan. This closes the loop: comment → revise → refresh.</li>
-              <li>Click <strong>🗑</strong> in the panel header to clear this thread's plan and all its comments, resetting the panel to empty. This deletes the files from <code>.hivemind/plans/</code> and cannot be undone.</li>
+              <li>When a Claude thread works in <strong>plan mode</strong> (the <em>Plan</em> permission mode, or whenever Claude plans on its own), Hivemind detects the plan automatically. While Claude drafts it the thread's header shows a <strong>📋 planning</strong> chip; the moment Claude finishes and asks <em>“Ready to code?”</em>, the plan pops up as a <strong>full document</strong> — rendered markdown in an editor-style window that live-updates as the plan is written. If the thread isn't focused, nothing pops up: the header shows a <strong>📋 plan ready</strong> chip instead — click it (or the sidebar's Plan button) to open the review. The auto-popup can be turned off in <strong>⚙ Settings → General → Plan review</strong>.</li>
+              <li><strong>Approve · auto-accept</strong> and <strong>Approve · manual edits</strong> answer Claude Code's own approval menu in the hidden terminal — exactly like picking <em>“Yes, auto-accept edits”</em> (or its equivalent in the thread's permission mode, e.g. <em>“Yes, and bypass permissions”</em> — hover the button to see which) or <em>“Yes, manually approve edits”</em> there. The status chip flips to <em>Approved</em> once Claude confirms, and the thread starts implementing.</li>
+              <li><strong>Inline feedback</strong>: highlight any text in the plan and click <strong>＋ Comment</strong> to attach a note to it — like review comments on a document. Comments are saved with the project (in <code>.hivemind/plans/</code>, kept out of Git), so they survive restarts.</li>
+              <li><strong>Request changes</strong> picks <em>“No, keep planning”</em> in the thread and sends your comments (each with the text it refers to, plus the optional overall-feedback line) as the revision request. Claude revises, the document updates live, and comments you already sent show collapsed with a <em>sent</em> tag. Comments whose text no longer appears in the revised plan are marked <em>(not found in current plan)</em>.</li>
+              <li>Plans render as rich markdown — headings, tables, links (which open in your browser), block quotes and task lists. On plans requested via <strong>⟳</strong> (see below) you can <strong>tick a checkbox</strong> in a <code>- [ ]</code> task list to mark it done — the change is written back to the plan file. Native plan-mode files belong to Claude Code, so their checkboxes are read-only.</li>
+              <li><strong>ChatGPT and other threads</strong> (no native plan mode): click <strong>⟳</strong> in the review window to ask the thread to write its plan to <code>.hivemind/plans/</code> in your project — it renders in the same document view with the same commenting, and <em>Request changes</em> types the comments straight into the thread.</li>
+              <li><strong>⧉</strong> copies the plan's raw markdown to the clipboard. <kbd>Esc</kbd>, ✕, or clicking the backdrop closes the review; the plan stays available on its thread.</li>
             </ul>
           </div>
 
@@ -474,7 +494,8 @@
 
           <div class="settings-group">
             <div class="settings-group-title">Building Hivemind</div>
-            <p class="help-note">The <strong>📦</strong> button (left of the hive name) appears only when the active
+            <p class="help-note">The <strong>📦 Build portable copy</strong> button in
+              <strong>Settings → General → Building Hivemind</strong> appears only when the active
               hive is pointed at the Hivemind source checkout. It bumps the patch version in
               <code>package.json</code>, runs electron-builder's portable target to produce a single
               self-contained <code>.exe</code>, then publishes it as a GitHub release (tag

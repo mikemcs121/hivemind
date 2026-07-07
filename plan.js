@@ -14,6 +14,7 @@
 // ---------------------------------------------------------------------------
 
 const fs = require('fs');
+const os = require('os');
 const path = require('path');
 
 const PLANS_REL = '.hivemind/plans';
@@ -39,6 +40,30 @@ async function readPlan(root, planId) {
   try {
     const content = await fs.promises.readFile(p, 'utf8');
     const { mtimeMs } = await fs.promises.stat(p);
+    return { ok: true, content, mtime: mtimeMs };
+  } catch (err) {
+    if (err.code === 'ENOENT') return { ok: false, reason: 'not-found' };
+    return { ok: false, reason: 'error', message: err.message };
+  }
+}
+
+// Read an arbitrary plan file by absolute path. Used for Claude Code's native
+// plan-mode files, which live outside the project tree (~/.claude/plans/…).
+// Only two roots are allowed: the user's ~/.claude/plans directory and the
+// project's own .hivemind/plans — anything else is denied.
+async function readPlanFile(root, file) {
+  if (typeof file !== 'string' || !file.length) return { ok: false, reason: 'error', message: 'Invalid plan file.' };
+  const resolved = path.resolve(file);
+  const roots = [path.join(os.homedir(), '.claude', 'plans')];
+  if (typeof root === 'string' && root.length) roots.push(path.resolve(root, PLANS_REL));
+  // Windows paths are case-insensitive — a transcript path can differ in
+  // drive-letter or folder case from os.homedir() and still be the same dir.
+  const norm = (p) => (process.platform === 'win32' ? p.toLowerCase() : p);
+  const inside = roots.some((dir) => norm(resolved).startsWith(norm(path.resolve(dir) + path.sep)));
+  if (!inside) return { ok: false, reason: 'denied' };
+  try {
+    const content = await fs.promises.readFile(resolved, 'utf8');
+    const { mtimeMs } = await fs.promises.stat(resolved);
     return { ok: true, content, mtime: mtimeMs };
   } catch (err) {
     if (err.code === 'ENOENT') return { ok: false, reason: 'not-found' };
@@ -134,4 +159,4 @@ async function ensureIgnored(root) {
   }
 }
 
-module.exports = { readPlan, readComments, writeComments, writePlan, clearPlan, ensureIgnored };
+module.exports = { readPlan, readPlanFile, readComments, writeComments, writePlan, clearPlan, ensureIgnored };

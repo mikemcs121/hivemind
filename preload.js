@@ -106,6 +106,7 @@ contextBridge.exposeInMainWorld('api', {
   // per-thread plan file the thread writes and the comments Hivemind attaches.
   plan: {
     read: (cwd, planId) => ipcRenderer.invoke('plan:read', { cwd, planId }),
+    readFile: (cwd, file) => ipcRenderer.invoke('plan:readFile', { cwd, file }),
     write: (cwd, planId, content) => ipcRenderer.invoke('plan:write', { cwd, planId, content }),
     readComments: (cwd, planId) => ipcRenderer.invoke('plan:comments:read', { cwd, planId }),
     writeComments: (cwd, planId, comments) => ipcRenderer.invoke('plan:comments:write', { cwd, planId, comments }),
