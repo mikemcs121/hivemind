@@ -2692,7 +2692,15 @@ function addBubbleCopyBtn(bubble, text) {
       setTimeout(() => { btn.classList.remove('copied'); btn.textContent = '⧉'; }, 1200);
     } catch (_) { /* clipboard unavailable — ignore */ }
   });
-  bubble.appendChild(btn);
+  // Sit the button inline, right after the last word, when the message ends in
+  // a normal text block (paragraph, list item, heading, quote) — appending it
+  // into that block keeps it on the same row as the text. For messages that end
+  // in a code block / table / bare list, fall back to the bubble so it drops to
+  // its own line rather than landing inside a code fence.
+  const last = bubble.lastElementChild;
+  const inlineHost = last && /^(P|LI|H[1-6]|BLOCKQUOTE)$/.test(last.tagName) ? last : bubble;
+  inlineHost.classList.toggle('has-inline-copy', inlineHost !== bubble);
+  inlineHost.appendChild(btn);
 }
 
 // User lines that are really app/CLI plumbing (slash-command envelopes, meta
