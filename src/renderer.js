@@ -2624,6 +2624,7 @@ function renderChatEntry(pane, e) {
       if (part.type === 'text' && part.text && part.text.trim()) {
         upsertChatRow(pane, key, 'assistant', (row) => {
           row.innerHTML = '<div class="chat-bubble assistant chat-md">' + markdownToHtml(part.text) + '</div>';
+          addCodeCopyBtns(row.firstChild);
           addBubbleCopyBtn(row.firstChild, part.text);
         });
       } else if (part.type === 'thinking' && part.thinking) {
@@ -2672,6 +2673,23 @@ function upsertChatRow(pane, key, kind, render) {
   return row;
 }
 
+// Wire a copy-to-clipboard button: on click copy `text` and briefly flash a
+// check, then restore the copy glyph. Shared by the message- and code-copy
+// buttons so both behave identically.
+function wireCopyButton(btn, getText, glyph) {
+  glyph = glyph || '⧉';
+  btn.addEventListener('click', async (ev) => {
+    ev.preventDefault();
+    ev.stopPropagation();
+    try {
+      await navigator.clipboard.writeText(typeof getText === 'function' ? getText() : getText);
+      btn.classList.add('copied');
+      btn.textContent = '✓';
+      setTimeout(() => { btn.classList.remove('copied'); btn.textContent = glyph; }, 1200);
+    } catch (_) { /* clipboard unavailable — ignore */ }
+  });
+}
+
 // Hover-revealed "copy" button tucked at the end of an assistant message —
 // like the one in the Claude VS Code extension. Copies the message's raw
 // markdown to the clipboard. Re-run on every re-render (upsertChatRow rewrites
@@ -2682,16 +2700,7 @@ function addBubbleCopyBtn(bubble, text) {
   btn.title = 'Copy message';
   btn.setAttribute('aria-label', 'Copy message');
   btn.textContent = '⧉';
-  btn.addEventListener('click', async (ev) => {
-    ev.preventDefault();
-    ev.stopPropagation();
-    try {
-      await navigator.clipboard.writeText(text);
-      btn.classList.add('copied');
-      btn.textContent = '✓';
-      setTimeout(() => { btn.classList.remove('copied'); btn.textContent = '⧉'; }, 1200);
-    } catch (_) { /* clipboard unavailable — ignore */ }
-  });
+  wireCopyButton(btn, text);
   // Sit the button inline, right after the last word, when the message ends in
   // a normal text block (paragraph, list item, heading, quote) — appending it
   // into that block keeps it on the same row as the text. For messages that end
@@ -2701,6 +2710,29 @@ function addBubbleCopyBtn(bubble, text) {
   const inlineHost = last && /^(P|LI|H[1-6]|BLOCKQUOTE)$/.test(last.tagName) ? last : bubble;
   inlineHost.classList.toggle('has-inline-copy', inlineHost !== bubble);
   inlineHost.appendChild(btn);
+}
+
+// Give every fenced code block in an assistant bubble its own hover-revealed
+// copy button, floated at the top-right of the block. Each <pre> is wrapped in
+// a positioned .chat-code container so the button stays pinned even when a long
+// line scrolls the <pre> horizontally. Re-run on every re-render, so guard with
+// the wrapper class to avoid double-wrapping.
+function addCodeCopyBtns(bubble) {
+  bubble.querySelectorAll('pre').forEach((pre) => {
+    if (pre.parentElement && pre.parentElement.classList.contains('chat-code')) return;
+    const code = pre.querySelector('code') || pre;
+    const wrap = document.createElement('div');
+    wrap.className = 'chat-code';
+    pre.parentNode.insertBefore(wrap, pre);
+    wrap.appendChild(pre);
+    const btn = document.createElement('button');
+    btn.className = 'chat-code-copy';
+    btn.title = 'Copy code';
+    btn.setAttribute('aria-label', 'Copy code');
+    btn.textContent = '⧉';
+    wireCopyButton(btn, () => code.textContent);
+    wrap.appendChild(btn);
+  });
 }
 
 // User lines that are really app/CLI plumbing (slash-command envelopes, meta

@@ -663,6 +663,33 @@ button.usage-pill.crit { color: var(--danger); }
   overflow-x: auto;
   font-size: calc(var(--pane-font, 13px) - 1px);
 }
+
+/* Wrapper that positions a hover-revealed copy button at the top-right of a
+   fenced code block (addCodeCopyBtns). The button lives on the wrapper, not the
+   <pre>, so it stays pinned while long lines scroll the <pre> horizontally. */
+.chat-code { position: relative; margin: 8px 0; }
+.chat-code > pre { margin: 0; }
+.chat-code-copy {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  display: inline-flex;
+  align-items: center;
+  padding: 1px 7px;
+  font-size: calc(var(--pane-font, 13px) - 3px);
+  line-height: 1.4;
+  color: var(--muted);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity .12s ease, color .12s ease, border-color .12s ease;
+}
+.chat-row[data-kind="assistant"]:hover .chat-code-copy,
+.chat-code-copy:focus-visible { opacity: .85; }
+.chat-code-copy:hover { opacity: 1; color: var(--text); border-color: var(--muted); }
+.chat-code-copy.copied { opacity: 1; color: var(--accent, #89b4fa); border-color: var(--accent, #89b4fa); }
 .chat-md code { font-family: 'Cascadia Code', Consolas, monospace; font-size: calc(var(--pane-font, 13px) - 1px); }
 .chat-md :not(pre) > code { background: var(--bg-alt); border-radius: 4px; padding: 1px 4px; }
 .chat-md ul, .chat-md ol { margin: 4px 0 8px; padding-left: 22px; }
