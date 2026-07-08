@@ -1807,7 +1807,17 @@ function initChatUI(pane, body) {
   const noticeBtn = document.createElement('button');
   noticeBtn.className = 'chat-open-term';
   noticeBtn.textContent = 'Open terminal';
-  noticeBtn.onclick = (e) => { e.stopPropagation(); setPaneView(pane, 'term'); };
+  // This is a *temporary* escape hatch while the chat can't find its transcript
+  // — not a lasting "I prefer the terminal" choice. Don't persist it, and mark
+  // the pane so the view snaps back to chat the moment the transcript binds
+  // (chatBindStatus). Persisting it here trapped threads in terminal view: once
+  // the transcript later bound, the chat view stayed hidden behind the terminal
+  // on every subsequent launch.
+  noticeBtn.onclick = (e) => {
+    e.stopPropagation();
+    pane.termFallback = true;
+    setPaneView(pane, 'term', { persist: false });
+  };
   notice.append(noticeText, noticeBtn);
 
   // Working indicator: a spinning swirl below the last message while the
@@ -2330,6 +2340,11 @@ function updateViewBtn(pane) {
 
 function setPaneView(pane, view, { persist = true } = {}) {
   if (!chatSupported(pane)) view = 'term';
+  // A persisted view change is a deliberate user choice (the >_/💬 toggle, the
+  // show-terminal/show-chat commands): it overrides any pending "terminal only
+  // because the transcript was missing" fallback, so the chat view won't snap
+  // back on the next bind against the user's wishes.
+  if (persist) pane.termFallback = false;
   pane.view = view;
   pane.el.classList.toggle('term-view', view === 'term');
   // Terminal-backed chat (agents with a composer but no readable session log):
@@ -2422,6 +2437,14 @@ function chatBindStatus(pane, status) {
     // the binder takes a mis-bound file away (self-heal), 'searching' drops
     // the other thread's conversation instead of leaving it on screen.
     if (status === 'bound' || status === 'searching') resetChat(pane);
+    // If the terminal was only showing because the chat couldn't find its
+    // transcript (the notice's "Open terminal" fallback), the reason is gone
+    // now that it's bound — snap back to the chat view. Non-persistent, so a
+    // deliberate terminal-view choice (which clears the flag) is never touched.
+    if (status === 'bound' && pane.termFallback) {
+      pane.termFallback = false;
+      if (pane.view === 'term') setPaneView(pane, 'chat', { persist: false });
+    }
   }
 }
 
@@ -2601,6 +2624,7 @@ function renderChatEntry(pane, e) {
       if (part.type === 'text' && part.text && part.text.trim()) {
         upsertChatRow(pane, key, 'assistant', (row) => {
           row.innerHTML = '<div class="chat-bubble assistant chat-md">' + markdownToHtml(part.text) + '</div>';
+          addBubbleCopyBtn(row.firstChild, part.text);
         });
       } else if (part.type === 'thinking' && part.thinking) {
         upsertChatRow(pane, key, 'thinking', (row) => {
@@ -2646,6 +2670,29 @@ function upsertChatRow(pane, key, kind, render) {
     if (f) f.open = true;
   }
   return row;
+}
+
+// Hover-revealed "copy" button tucked at the end of an assistant message —
+// like the one in the Claude VS Code extension. Copies the message's raw
+// markdown to the clipboard. Re-run on every re-render (upsertChatRow rewrites
+// the bubble's innerHTML), so it's always freshly wired to the latest text.
+function addBubbleCopyBtn(bubble, text) {
+  const btn = document.createElement('button');
+  btn.className = 'chat-copy-btn';
+  btn.title = 'Copy message';
+  btn.setAttribute('aria-label', 'Copy message');
+  btn.textContent = '⧉';
+  btn.addEventListener('click', async (ev) => {
+    ev.preventDefault();
+    ev.stopPropagation();
+    try {
+      await navigator.clipboard.writeText(text);
+      btn.classList.add('copied');
+      btn.textContent = '✓';
+      setTimeout(() => { btn.classList.remove('copied'); btn.textContent = '⧉'; }, 1200);
+    } catch (_) { /* clipboard unavailable — ignore */ }
+  });
+  bubble.appendChild(btn);
 }
 
 // User lines that are really app/CLI plumbing (slash-command envelopes, meta
