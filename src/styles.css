@@ -381,7 +381,6 @@ button.usage-pill.crit { color: var(--danger); }
 .pane:not(.term-view) .chat-wrap.terminal-backed .chat-filters,
 .pane:not(.term-view) .chat-wrap.terminal-backed .chat-list,
 .pane:not(.term-view) .chat-wrap.terminal-backed .chat-notice,
-.pane:not(.term-view) .chat-wrap.terminal-backed .chat-banner,
 .pane:not(.term-view) .chat-wrap.terminal-backed .chat-history-bar {
   display: none;
 }
@@ -432,36 +431,39 @@ button.usage-pill.crit { color: var(--danger); }
 .chat-wrap.hide-meta .chat-row[data-kind="meta"],
 .chat-wrap.hide-subagent .chat-row[data-kind="subagent"] { display: none; }
 
-/* Attention banner: the hidden TUI wants input the transcript can't show. */
-.chat-banner {
-  flex: none;
+/* Inline prompt card: the hidden TUI wants input the transcript can't show
+   (permission prompt, menu, error, or process exit). Rendered in the message
+   flow and styled like a question card so it reads as part of the conversation
+   rather than a separate banner strip. */
+.chat-prompt-card {
+  max-width: 92%;
   display: flex;
-  align-items: center;
-  gap: 10px;
-  margin: 6px 8px 0;
-  padding: 7px 10px;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px 12px;
   border: 1px solid var(--peach);
-  border-radius: 8px;
-  background: color-mix(in srgb, var(--peach) 12%, transparent);
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--peach) 8%, transparent);
 }
-.chat-banner.hidden { display: none; }
-.chat-banner.error { border-color: var(--danger); background: color-mix(in srgb, var(--danger) 12%, transparent); }
-.chat-banner-text {
-  flex: 1;
-  min-width: 0;
+.chat-prompt-card.error {
+  border-color: var(--danger);
+  background: color-mix(in srgb, var(--danger) 8%, transparent);
+}
+.chat-prompt-text {
   margin: 0;
   font-family: 'Cascadia Code', Consolas, monospace;
-  font-size: 11px;
+  font-size: calc(var(--pane-font, 13px) - 2px);
   color: var(--text);
   white-space: pre-wrap;
   word-break: break-word;
-  max-height: 60px;
-  overflow: hidden;
+  max-height: 120px;
+  overflow-y: auto;
 }
-.chat-banner-actions { flex: none; display: flex; align-items: center; gap: 6px; }
-.chat-banner-keys { display: flex; gap: 4px; }
-.chat-banner.error .chat-banner-keys { display: none; }
-.chat-banner-actions button {
+.chat-prompt-foot { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.chat-prompt-keys { display: flex; gap: 4px; }
+.chat-prompt-card.error .chat-prompt-keys { display: none; }
+.chat-prompt-foot button {
+  flex: none;
   background: var(--surface);
   border: 1px solid var(--border);
   color: var(--text);
@@ -470,7 +472,13 @@ button.usage-pill.crit { color: var(--danger); }
   padding: 3px 8px;
   cursor: pointer;
 }
-.chat-banner-actions button:hover { border-color: var(--accent); }
+.chat-prompt-foot button:hover { border-color: var(--accent); }
+
+/* Composer locked while a prompt is waiting — a typed line wouldn't reach the
+   TUI, so dim the input/send and block interaction (they're disabled in JS).
+   Attach and interrupt stay usable. */
+.chat-wrap.composer-locked .chat-input,
+.chat-wrap.composer-locked .chat-send { opacity: .5; cursor: not-allowed; }
 
 /* Transcript-binding trouble notice. */
 .chat-notice {

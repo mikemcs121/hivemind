@@ -244,10 +244,13 @@ if (!isValidModel(defaultModel)) defaultModel = 'default';
 // ---------------------------------------------------------------------------
 const CODEX_MODELS = [
   { value: 'default', label: 'Default' },
-  { value: 'gpt-5.1-codex-max', label: 'Codex Max' },
-  { value: 'gpt-5.1-codex', label: 'Codex' },
-  { value: 'gpt-5.1-codex-mini', label: 'Codex Mini' },
-  { value: 'gpt-5.1', label: 'GPT-5.1' },
+  { value: 'gpt-5.6-sol', label: 'GPT-5.6 Sol' },
+  { value: 'gpt-5.6-terra', label: 'GPT-5.6 Terra' },
+  { value: 'gpt-5.6-luna', label: 'GPT-5.6 Luna' },
+  { value: 'gpt-5.5', label: 'GPT-5.5' },
+  { value: 'gpt-5.3-codex-spark', label: 'Codex Spark' },
+  { value: 'gpt-5.4', label: 'GPT-5.4' },
+  { value: 'gpt-5.4-mini', label: 'GPT-5.4 Mini' },
 ];
 const isValidCodexModel = (m) => CODEX_MODELS.some((x) => x.value === m);
 
@@ -1770,35 +1773,6 @@ function initChatUI(pane, body) {
     filters.appendChild(chip);
   }
 
-  // Attention banner: the hidden TUI wants something the transcript can't
-  // show (permission prompt, menu, error). Quick keys go straight to the PTY.
-  const banner = document.createElement('div');
-  banner.className = 'chat-banner hidden';
-  const bannerText = document.createElement('pre');
-  bannerText.className = 'chat-banner-text';
-  const bannerActions = document.createElement('div');
-  bannerActions.className = 'chat-banner-actions';
-  const keyWrap = document.createElement('span');
-  keyWrap.className = 'chat-banner-keys';
-  for (const [label, seq, hint] of [
-    ['1', '1', 'Choose option 1'],
-    ['2', '2', 'Choose option 2'],
-    ['Enter', '\r', 'Press Enter'],
-    ['Esc', '\x1b', 'Press Escape'],
-  ]) {
-    const b = document.createElement('button');
-    b.textContent = label;
-    b.title = `${hint} in the hidden terminal`;
-    b.onclick = (e) => { e.stopPropagation(); sendToPane(pane, seq); };
-    keyWrap.appendChild(b);
-  }
-  const openTermBtn = document.createElement('button');
-  openTermBtn.className = 'chat-open-term';
-  openTermBtn.textContent = 'Open terminal';
-  openTermBtn.onclick = (e) => { e.stopPropagation(); setPaneView(pane, 'term'); };
-  bannerActions.append(keyWrap, openTermBtn);
-  banner.append(bannerText, bannerActions);
-
   // Binding trouble notice ("couldn't find this thread's transcript").
   const notice = document.createElement('div');
   notice.className = 'chat-notice hidden';
@@ -1887,11 +1861,11 @@ function initChatUI(pane, body) {
   historyBackBtn.onclick = (e) => { e.stopPropagation(); exitHistory(pane); };
   historyBar.append(historyBarText, historyBackBtn);
 
-  wrap.append(filters, banner, notice, historyBar, list, composer);
+  wrap.append(filters, notice, historyBar, list, composer);
   body.appendChild(wrap);
 
   pane.chat = {
-    wrap, list, input, sendBtn, banner, bannerText, notice, chips, attachRow, topic, working,
+    wrap, list, input, sendBtn, notice, chips, attachRow, topic, working,
     historyBtn, historyMenu, historyBar, historyBarText,
     viewingHistory: false,   // true while showing a past session over the live view
     historySession: null,    // the session being viewed (so the composer can resume it)
@@ -3063,6 +3037,9 @@ function chatHistoryNav(pane, dir) {
 function sendChatMessage(pane) {
   const c = pane.chat;
   if (!c) return;
+  // A prompt is waiting in the terminal — a typed line won't reach it (the TUI
+  // wants a menu keypress), so the composer is locked; ignore stray sends too.
+  if (pane.state === 'attention' && !c.viewingHistory) return;
   const raw = c.input.value.replace(/\r\n?/g, '\n');
   let text = raw.trim();
   if (!text && !c.attachments.length) return;
@@ -3173,18 +3150,114 @@ function confirmEcho(pane, text) {
   c.byKey.delete(p.key);
 }
 
-// -- Attention banner ----------------------------------------------------------
+// -- Attention: inline prompt card + composer lock ---------------------------
+
+// Stable row key for the inline prompt card, and the placeholder shown while
+// the composer is locked because the terminal is waiting on a prompt.
+const PROMPT_CARD_KEY = 'attn-prompt';
+const PROMPT_LOCK_PLACEHOLDER =
+  'Answer the prompt above to continue — open the terminal to type a custom reply';
+
+// The text shown in the inline prompt card: the process-exit note, the last
+// error lines, or the prompt scraped from the visible screen (starting at the
+// line the attention scan matched, so a menu/approval's options follow the
+// header rather than trailing the spinner line above them).
+function promptCardText(pane, state) {
+  if (state === 'dead') return 'The process behind this thread exited.';
+  if (state === 'error') {
+    const lines = (pane.buf || '').split('\n').map((s) => s.trim()).filter(Boolean).slice(-3);
+    return lines.join('\n') || 'The thread hit an error.';
+  }
+  const lines = screenText(pane).split('\n').map((s) => s.trim()).filter(Boolean);
+  const i = lines.findIndex((l) =>
+    MENU_PATTERNS.some((re) => re.test(l)) || QUESTION_PATTERNS.some((re) => re.test(l)));
+  const block = i >= 0 ? lines.slice(i, i + 6) : lines.slice(-3);
+  return block.join('\n') || 'The thread needs your input.';
+}
+
+// Surface the hidden TUI's prompt (permission/menu/error/exit) as an inline
+// card in the message flow — the same embedded look as a question card, rather
+// than a separate banner strip. Quick keys and Open terminal act on the PTY.
+function renderPromptCard(pane, state) {
+  const c = pane.chat;
+  const isErr = state === 'error' || state === 'dead';
+  const text = promptCardText(pane, state);
+  const row = upsertChatRow(pane, PROMPT_CARD_KEY, 'prompt', (r) => {
+    r.innerHTML = '';
+    const card = document.createElement('div');
+    card.className = 'chat-prompt-card' + (isErr ? ' error' : '');
+    const body = document.createElement('pre');
+    body.className = 'chat-prompt-text';
+    body.textContent = text;
+    card.appendChild(body);
+    const foot = document.createElement('div');
+    foot.className = 'chat-prompt-foot';
+    // Errors and process exits have nothing to answer — only offer the terminal.
+    if (!isErr) {
+      const keys = document.createElement('span');
+      keys.className = 'chat-prompt-keys';
+      for (const [label, seq, hint] of [
+        ['1', '1', 'Choose option 1'],
+        ['2', '2', 'Choose option 2'],
+        ['Enter', '\r', 'Press Enter'],
+        ['Esc', '\x1b', 'Press Escape'],
+      ]) {
+        const b = document.createElement('button');
+        b.textContent = label;
+        b.title = `${hint} in the hidden terminal`;
+        b.onclick = (e) => { e.stopPropagation(); sendToPane(pane, seq); };
+        keys.appendChild(b);
+      }
+      foot.appendChild(keys);
+    }
+    const openTerm = document.createElement('button');
+    openTerm.className = 'chat-prompt-open';
+    openTerm.textContent = 'Open terminal';
+    openTerm.onclick = (e) => { e.stopPropagation(); setPaneView(pane, 'term'); };
+    foot.appendChild(openTerm);
+    card.appendChild(foot);
+    r.appendChild(card);
+  });
+  // Keep the card trailing the newest message, just above the working swirl.
+  c.list.insertBefore(row, c.working);
+  if (c.pinned) c.list.scrollTop = c.list.scrollHeight;
+}
+
+function removePromptCard(pane) {
+  const c = pane.chat;
+  const row = c.byKey.get(PROMPT_CARD_KEY);
+  if (row) { row.remove(); c.byKey.delete(PROMPT_CARD_KEY); }
+}
+
+// Lock the composer while the thread is waiting on a prompt: text typed there
+// would never reach the TUI (which wants a menu keypress, not a pasted line),
+// so disable it and point the user at the card's keys or the terminal. History
+// mode owns the composer itself, so it never locks — and keeps its own
+// placeholder (updateHistoryChrome).
+function updateComposerLock(pane) {
+  const c = pane.chat;
+  if (!c) return;
+  const locked = pane.state === 'attention' && !c.viewingHistory;
+  c.input.disabled = locked;
+  c.sendBtn.disabled = locked;
+  c.wrap.classList.toggle('composer-locked', locked);
+  if (c.viewingHistory) return;
+  c.input.placeholder = locked ? PROMPT_LOCK_PLACEHOLDER : CHAT_PLACEHOLDER;
+}
 
 // Mirror the pane's heuristic state into the chat view: when the hidden TUI is
-// waiting on a prompt (or errored/exited), surface it with quick actions.
+// waiting on a prompt (or errored/exited), surface it as an inline card and
+// lock the composer. A recognized question already renders as its own inline
+// card, so skip the generic prompt card there to avoid doubling up.
 function updateChatBanner(pane) {
   const c = pane.chat;
   if (!c) return;
-  // While browsing history the swirl and attention banner don't apply to the
-  // (past, finished) conversation on screen — keep them hidden.
+  updateComposerLock(pane);
+  // While browsing history the swirl and prompt card don't apply to the (past,
+  // finished) conversation on screen — keep them hidden.
   if (c.viewingHistory) {
     c.working.classList.add('hidden');
-    c.banner.classList.add('hidden');
+    removePromptCard(pane);
     return;
   }
   const state = pane.state;
@@ -3194,28 +3267,8 @@ function updateChatBanner(pane) {
   // view scrolled to the bottom so it's actually visible.
   if (wasHidden && state === 'busy' && c.pinned) c.list.scrollTop = c.list.scrollHeight;
   const show = state === 'attention' || state === 'error' || state === 'dead';
-  c.banner.classList.toggle('hidden', !show);
-  if (!show) return;
-  c.banner.classList.toggle('error', state === 'error' || state === 'dead');
-  if (state === 'dead') {
-    c.bannerText.textContent = 'The process behind this thread exited.';
-  } else if (state === 'error') {
-    const lines = (pane.buf || '').split('\n').map((s) => s.trim()).filter(Boolean).slice(-3);
-    c.bannerText.textContent = lines.join('\n') || 'The thread hit an error.';
-  } else if (chatHasPendingQuestion(pane)) {
-    // A question card is sitting in the chat below — point at it rather than
-    // scraping the screen (the TUI's select menu is a worse copy of the card).
-    c.bannerText.textContent = [...c.pendingQuestions.values()].join('\n');
-  } else {
-    // Show the prompt itself, from the visible screen: start at the line the
-    // attention scan matched (the question header) so the codex approval's
-    // command preview and options follow it, not the spinner line under them.
-    const lines = screenText(pane).split('\n').map((s) => s.trim()).filter(Boolean);
-    const i = lines.findIndex((l) =>
-      MENU_PATTERNS.some((re) => re.test(l)) || QUESTION_PATTERNS.some((re) => re.test(l)));
-    const block = i >= 0 ? lines.slice(i, i + 6) : lines.slice(-3);
-    c.bannerText.textContent = block.join('\n') || 'The thread needs your input.';
-  }
+  if (!show || chatHasPendingQuestion(pane)) { removePromptCard(pane); return; }
+  renderPromptCard(pane, state);
 }
 
 // ---------------------------------------------------------------------------
