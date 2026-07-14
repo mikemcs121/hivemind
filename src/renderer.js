@@ -341,6 +341,7 @@ function respawnPane(pane, { resume, initialPrompt } = {}) {
   pane.state = null;
   pane.buf = '';
   pane.errored = false;
+  pane.errorText = '';
   pane.hintShown = false;
   try { pane.term.reset(); } catch (_) { /* ignore */ }
   // The new process starts a fresh live session — drop any history view so
@@ -782,12 +783,20 @@ function evaluateIdle(pane) {
     } catch (_) { /* ignore */ }
   }
 
-  if (ERROR_PATTERNS.some((re) => re.test(buf))) {
+  const errLines = buf.split('\n').map((s) => s.trim())
+    .filter((l) => l && ERROR_PATTERNS.some((re) => re.test(l)));
+  if (errLines.length) {
     pane.errored = true;
+    // Keep the matched line for the prompt card (the buffer's tail is usually
+    // just the CLI's redrawn input box, not the error), and drop the buffer so
+    // a recovered thread doesn't re-flag this same stale error on every quiet.
+    pane.errorText = errLines.slice(-3).join('\n');
+    pane.buf = '';
     setPaneState(pane, 'error');
     return;
   }
   pane.errored = false;
+  pane.errorText = '';
   // Quiet means the turn ended or the CLI is waiting. Judge the visible
   // screen: a blocking menu, or a turn that finished on a question for the
   // user, both read "needs you"; anything else is a finished turn.
@@ -3165,6 +3174,7 @@ const PROMPT_LOCK_PLACEHOLDER =
 function promptCardText(pane, state) {
   if (state === 'dead') return 'The process behind this thread exited.';
   if (state === 'error') {
+    if (pane.errorText) return pane.errorText;
     const lines = (pane.buf || '').split('\n').map((s) => s.trim()).filter(Boolean).slice(-3);
     return lines.join('\n') || 'The thread hit an error.';
   }
