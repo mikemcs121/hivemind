@@ -234,6 +234,23 @@ let defaultModel = localStorage.getItem('hm.model') || 'default';
 if (!isValidModel(defaultModel)) defaultModel = 'default';
 
 // ---------------------------------------------------------------------------
+// Claude API list prices, $ per million tokens, matched against the full model
+// id from the transcript (e.g. "claude-opus-4-8") — first match wins. Cache
+// rates derive from the input rate: reads 0.1×, 5-minute cache writes 1.25×,
+// 1-hour writes 2×. Used only for the header cost-estimate chip.
+// ---------------------------------------------------------------------------
+const MODEL_PRICES = [
+  { re: /fable|mythos/i, input: 10, output: 50 },
+  { re: /opus-4-1|opus-4-2025/i, input: 15, output: 75 }, // legacy Opus 4.0/4.1
+  { re: /opus/i, input: 5, output: 25 },
+  { re: /haiku/i, input: 1, output: 5 },
+  { re: /sonnet/i, input: 3, output: 15 },
+];
+const FALLBACK_PRICE = { input: 3, output: 15 };
+const priceForModel = (model) =>
+  (MODEL_PRICES.find((p) => p.re.test(model || '')) || FALLBACK_PRICE);
+
+// ---------------------------------------------------------------------------
 // Per-thread ChatGPT (Codex) model
 //
 // ChatGPT threads get their own model dropdown, mirroring the Claude one. The
@@ -317,6 +334,10 @@ function setPaneAgent(pane, agent) {
   if (pane.permSelect) pane.permSelect.style.display = agent === 'claude' ? '' : 'none';
   // Claude and ChatGPT are transcript-backed; Gemini stays terminal-only.
   updateChatAvailability(pane);
+  // The cost estimate only applies to Claude conversations, and switching
+  // agents starts a new one anyway — drop the accumulator and hide the chip.
+  pane.costFile = null;
+  resetPaneCost(pane);
   // Auto names track the running command ("codex 2"); manual names stay put.
   if (pane.autoName) {
     const num = (/(\d+)\s*$/.exec(pane.name || '') || [])[1];
@@ -676,6 +697,61 @@ function parsePlanScreenQuestion(pane, screen) {
   };
 }
 
+// Codex approval modals (run command / make edits / grant permissions /
+// network access) draw a "Press enter to confirm or esc to cancel" footer that
+// SELECT_FOOTER_RE happens to match — but the generic parser keeps only the
+// text block directly above the options as the question, dropping the header
+// line that says what's being approved (and the Reason:/command lines between
+// them). Parse the whole modal instead so a ChatGPT approval card reads like a
+// Claude permission card: header + context as the question, numbered options
+// with their trailing "(y)"-style key hints stripped (cards click, they don't
+// type). Codex list menus select-and-confirm on a digit press, so the ordinary
+// click-sends-digit card works unchanged. Layout verified against the
+// codex-rs 0.144.4 TUI snapshot tests.
+const CODEX_APPROVAL_HEAD_RE =
+  /^(?:Would you like to (?:run the following command|grant these permissions|make the following edits)\?|Do you want to approve network access to .{0,120}\?|Allow Codex to .{0,160}\?)$/;
+const CODEX_KEYHINT_RE = /\s*\((?:[a-z]\+)?[a-z]{1,5}\)$/i;
+
+function parseCodexApproval(pane, screen) {
+  if (pane.agent !== 'codex') return null;
+  const lines = screen.split('\n');
+  let foot = -1;
+  for (let i = lines.length - 1; i >= 0; i--) {
+    if (SELECT_FOOTER_RE.test(lines[i])) { foot = i; break; }
+  }
+  if (foot < 0) return null;
+  let head = -1;
+  for (let i = foot - 1; i >= 0; i--) {
+    if (CODEX_APPROVAL_HEAD_RE.test(lines[i].trim())) { head = i; break; }
+  }
+  if (head < 0) return null;
+  const detail = []; // Reason: / Permission rule: / $ command … between header and options
+  const options = [];
+  for (let i = head + 1; i < foot; i++) {
+    const t = lines[i].trim();
+    const m = SCREEN_OPT_RE.exec(lines[i]);
+    if (m && Number(m[2]) === options.length + 1) {
+      options.push({ label: m[3].trim().replace(CODEX_KEYHINT_RE, ''), description: '', checked: false });
+    } else if (!t || SCREEN_SEP_RE.test(lines[i])) {
+      continue;
+    } else if (options.length) {
+      // A wrapped option label — cosmetically a description, same treatment
+      // as parseScreenQuestion.
+      const o = options[options.length - 1];
+      o.description = (o.description ? o.description + ' ' : '') + t.replace(CODEX_KEYHINT_RE, '');
+    } else if (detail.length < 8) {
+      detail.push(t);
+    }
+  }
+  if (options.length < 2) return null;
+  return {
+    header: 'Approval',
+    question: [lines[head].trim(), ...detail].join('\n'),
+    options,
+    multiSelect: false,
+  };
+}
+
 const screenQuestionKey = (pane) => 'screenq:' + pane.id;
 
 function syncScreenQuestion(pane, screen) {
@@ -683,7 +759,7 @@ function syncScreenQuestion(pane, screen) {
   if (!c) return;
   const s = screen !== undefined ? screen : screenText(pane);
   const parsed = !c.viewingHistory && pane.state !== 'dead'
-    ? parseScreenQuestion(s) || parsePlanScreenQuestion(pane, s)
+    ? parseCodexApproval(pane, s) || parseScreenQuestion(s) || parsePlanScreenQuestion(pane, s)
     : null;
   if (!parsed) {
     removeScreenQuestion(pane);
@@ -1885,6 +1961,7 @@ function initChatUI(pane, body) {
     pendingQuestions: new Map(), // AskUserQuestion tool_use id -> question text, until answered
     pendingEcho: [],         // optimistic user bubbles awaiting their transcript line
     echoSeq: 0,
+    topicFromMsg: false,     // codex topic fallback already taken from a user message
     pinned: true,
     history: [],             // past sent messages, oldest→newest (↑/↓ to recall)
     histIdx: null,           // index into history while browsing; null = live draft
@@ -2360,8 +2437,10 @@ function updateChatChrome(pane) {
   }
   if (!transcript) c.notice.classList.add('hidden');
   // Claude's topic comes from the transcript's rolling summary; other agents
-  // don't write one, so show the agent name instead.
-  if (pane.agent !== 'claude') {
+  // don't write one. ChatGPT threads take their topic from the first user
+  // message once one lands (addUserOrMetaRow) — until then, and for other
+  // agents always, show the agent name.
+  if (pane.agent !== 'claude' && !c.topicFromMsg) {
     c.topic.textContent = agentFor(pane.agent).label;
     c.topic.title = agentFor(pane.agent).label + ' thread';
   }
@@ -2402,6 +2481,7 @@ function resetChat(pane) {
   c.pinned = true;
   c.topic.textContent = '';
   c.topic.title = '';
+  c.topicFromMsg = false;
   updateChatChrome(pane);
 }
 
@@ -2729,6 +2809,13 @@ function addUserOrMetaRow(pane, e, text) {
     return;
   }
   confirmEcho(pane, text);
+  // ChatGPT rollouts never carry summary lines (Claude's topic source), so
+  // title the conversation by its first real user message — the same fallback
+  // the history picker uses for untitled Claude sessions.
+  if (pane.agent === 'codex' && !pane.chat.topicFromMsg) {
+    pane.chat.topicFromMsg = true;
+    setChatTopic(pane, text);
+  }
   upsertChatRow(pane, chatKeyFor(e), 'user', (row) => {
     row.innerHTML = '<div class="chat-bubble user"></div>';
     row.firstChild.textContent = text;
@@ -3929,6 +4016,11 @@ function createPane(board, col, opts = {}) {
   if (startAgent !== 'claude') permSelect.style.display = 'none';
   const statusEl = document.createElement('span');
   statusEl.className = 'status';
+  // Estimated API-price cost of this conversation (Claude threads only —
+  // see costIngest / renderPaneCost). Hidden until there's usage to price.
+  const costEl = document.createElement('span');
+  costEl.className = 'cost';
+  costEl.style.display = 'none';
   // "📋 plan ready" chip — shown while this thread drafts a plan / waits on
   // plan approval; clicking it opens the plan review (see "Plan review").
   const planChip = document.createElement('button');
@@ -3939,7 +4031,7 @@ function createPane(board, col, opts = {}) {
   // Chat/terminal view toggle (Claude threads only — see initChatUI).
   const viewBtn = document.createElement('button');
   viewBtn.className = 'font-btn view-btn';
-  header.append(dot, titleWrap, planChip, statusEl, agentSelect, modelSelect, codexModelSelect, permSelect, viewBtn, fontDownBtn, fontUpBtn, zoomBtn, closeBtn);
+  header.append(dot, titleWrap, planChip, costEl, statusEl, agentSelect, modelSelect, codexModelSelect, permSelect, viewBtn, fontDownBtn, fontUpBtn, zoomBtn, closeBtn);
 
   const termWrap = document.createElement('div');
   termWrap.className = 'pane-term';
@@ -3996,11 +4088,14 @@ function createPane(board, col, opts = {}) {
   term.open(termWrap);
 
   const pane = {
-    id, el, term, fitAddon, searchAddon, dot, statusEl, planChip, agentSelect, modelSelect, codexModelSelect, permSelect, title, caption,
+    id, el, term, fitAddon, searchAddon, dot, statusEl, costEl, planChip, agentSelect, modelSelect, codexModelSelect, permSelect, title, caption,
     findBar, findInput, viewBtn, flex: opts.flex || 1, col, board, disposed: false,
     name: startName, state: null, buf: '', idleTimer: null, probeTimer: null, menuMiss: 0,
     fontSize: startFont, agent: startAgent, model: startModel, codexModel: startCodexModel, permMode: startPerm, captionText: '', capBuf: '',
     errored: false, hintShown: false,
+    // Cost-estimate accumulator (see costIngest). Rebuilt from transcript
+    // backfill on every bind; costFile detects /clear session rollovers.
+    costSeen: new Set(), costByModel: {}, costFile: null,
     planId: opts.planId || null, // assigned lazily the first time a ⟳ plan request needs it
     // Plan-review lifecycle (see the "Plan review" section). The file/source
     // survive restarts via the layout; the rest is rebuilt from transcript
@@ -4324,6 +4419,84 @@ window.api.onPtyExit(({ id }) => {
   }
 });
 
+// ---------------------------------------------------------------------------
+// Per-thread cost estimate
+//
+// Sums the token usage of every assistant message streamed from this pane's
+// Claude transcript and prices it at API list rates (MODEL_PRICES), so the
+// header shows what the conversation would have cost if it weren't covered by
+// the plan. Mirrors usage.js: dedup by message.id + requestId (streamed
+// messages appear as several transcript lines sharing one usage block), skip
+// `<synthetic>`. Backfill on bind replays the whole session file, so the total
+// always covers the full conversation — nothing is persisted.
+// ---------------------------------------------------------------------------
+function costIngest(pane, entries) {
+  let changed = false;
+  for (const e of entries) {
+    if (!e || e.type !== 'assistant' || !e.message || !e.message.usage) continue;
+    const model = e.message.model || 'unknown';
+    if (model === '<synthetic>') continue;
+    const key = (e.message.id || '') + ':' + (e.requestId || '');
+    if (key !== ':' && pane.costSeen.has(key)) continue;
+    pane.costSeen.add(key);
+    const u = e.message.usage;
+    const m = pane.costByModel[model] || (pane.costByModel[model] = {
+      input: 0, output: 0, cacheRead: 0, cacheCreate5m: 0, cacheCreate1h: 0,
+    });
+    m.input += u.input_tokens || 0;
+    m.output += u.output_tokens || 0;
+    m.cacheRead += u.cache_read_input_tokens || 0;
+    // Newer transcripts break cache writes down by TTL (1-hour writes cost
+    // more); older ones only have the flat total — price those as 5-minute.
+    const cc = u.cache_creation;
+    if (cc && typeof cc === 'object' && (cc.ephemeral_5m_input_tokens || cc.ephemeral_1h_input_tokens)) {
+      m.cacheCreate5m += cc.ephemeral_5m_input_tokens || 0;
+      m.cacheCreate1h += cc.ephemeral_1h_input_tokens || 0;
+    } else {
+      m.cacheCreate5m += u.cache_creation_input_tokens || 0;
+    }
+    changed = true;
+  }
+  if (changed) renderPaneCost(pane);
+}
+
+function costUsd(m, p) {
+  return (m.input * p.input
+    + m.output * p.output
+    + m.cacheRead * 0.1 * p.input
+    + m.cacheCreate5m * 1.25 * p.input
+    + m.cacheCreate1h * 2 * p.input) / 1e6;
+}
+
+function resetPaneCost(pane) {
+  pane.costSeen = new Set();
+  pane.costByModel = {};
+  renderPaneCost(pane);
+}
+
+function renderPaneCost(pane) {
+  if (!pane.costEl) return;
+  let total = 0;
+  const lines = [];
+  for (const model of Object.keys(pane.costByModel).sort()) {
+    const m = pane.costByModel[model];
+    const usd = costUsd(m, priceForModel(model));
+    total += usd;
+    const write = m.cacheCreate5m + m.cacheCreate1h;
+    lines.push(`${model}: $${usd.toFixed(2)} — in ${fmtTokens(m.input)}, out ${fmtTokens(m.output)}, `
+      + `cache read ${fmtTokens(m.cacheRead)}, cache write ${fmtTokens(write)}`);
+  }
+  if (pane.agent !== 'claude' || total <= 0) {
+    pane.costEl.textContent = '';
+    pane.costEl.style.display = 'none';
+    return;
+  }
+  pane.costEl.style.display = '';
+  pane.costEl.textContent = '~$' + (total >= 10 ? String(Math.round(total)) : total.toFixed(2));
+  pane.costEl.title = 'Estimated cost of this conversation at Claude API list prices\n'
+    + '(informational — usage is covered by your plan)\n' + lines.join('\n');
+}
+
 // Transcript entries/status for the chat view (see "Chat wrapper" section).
 // Plan detection scans first: chatIngest bails while the user browses history,
 // but the plan lifecycle must never miss an entry (see "Plan review" section).
@@ -4332,6 +4505,9 @@ window.api.transcript.onEntries(({ paneId, entries, backfill }) => {
   if (!pane || pane.disposed) return;
   try { planScanEntries(pane, entries || [], !!backfill); } catch (_) { /* never block the chat */ }
   chatIngest(pane, entries || [], !!backfill);
+  if (pane.agent === 'claude') {
+    try { costIngest(pane, entries || []); } catch (_) { /* cost chip is best-effort */ }
+  }
 });
 
 window.api.transcript.onStatus(({ paneId, status, file }) => {
@@ -4348,6 +4524,12 @@ window.api.transcript.onStatus(({ paneId, status, file }) => {
     if (isSessionId(sid) && sid !== pane.sessionId) {
       pane.sessionId = sid;
       persistLayout(pane.board.id);
+    }
+    // A different session file means a new conversation (/clear rollover) —
+    // start the cost estimate over; the new file's backfill repopulates it.
+    if (pane.costFile !== file) {
+      pane.costFile = file;
+      if (pane.costSeen.size) resetPaneCost(pane);
     }
   }
   chatBindStatus(pane, status);

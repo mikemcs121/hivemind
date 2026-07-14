@@ -718,7 +718,13 @@ function slimEntry(o) {
       model: o.message.model,
       content: o.message.content,
     };
+    // Token usage for the per-pane cost estimate. Forwarded verbatim so the
+    // cache_creation 5m/1h breakdown (newer transcripts) survives; id and
+    // requestId let the renderer dedup multi-line messages like usage.js does.
+    if (o.message.id) e.message.id = o.message.id;
+    if (o.message.usage) e.message.usage = o.message.usage;
   }
+  if (o.requestId) e.requestId = o.requestId;
   if (o.toolUseResult !== undefined) e.toolUseResult = o.toolUseResult;
   return capStrings(e);
 }
@@ -762,6 +768,28 @@ const codexToolUse = (name, id, input) => ({
   type: 'assistant',
   message: { role: 'assistant', content: [{ type: 'tool_use', id, name, input }] },
 });
+
+// Codex tool names are raw snake_case ids ("apply_patch", "web_search"); give
+// the chat's tool rows the same title-case look Claude tool names have.
+const CODEX_TOOL_LABELS = {
+  shell: 'Shell',
+  local_shell: 'Shell',
+  unified_exec: 'Shell',
+  exec_command: 'Shell',
+  apply_patch: 'Apply patch',
+  update_plan: 'Update plan',
+  view_image: 'View image',
+  web_search: 'Web search',
+};
+function codexToolLabel(name) {
+  if (!name) return 'tool';
+  if (CODEX_TOOL_LABELS[name]) return CODEX_TOOL_LABELS[name];
+  if (/^[a-z0-9_]+$/.test(name)) {
+    const s = name.replace(/_/g, ' ');
+    return s.charAt(0).toUpperCase() + s.slice(1);
+  }
+  return name; // MCP-style names stay as-is
+}
 
 function normalizeCodexEntry(o, lineNo) {
   const e = codexPayloadEntry(o && o.type, (o && o.payload) || {});
@@ -808,11 +836,11 @@ function codexPayloadEntry(type, p) {
         if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) input = parsed;
       } catch (_) { /* not JSON — keep raw below */ }
       if (!input) input = typeof p.arguments === 'string' && p.arguments ? { arguments: p.arguments } : {};
-      return codexToolUse(p.name || 'tool', p.call_id, input);
+      return codexToolUse(codexToolLabel(p.name), p.call_id, input);
     }
     case 'local_shell_call': {
       const cmd = p.action && Array.isArray(p.action.command) ? p.action.command.join(' ') : '';
-      return codexToolUse('shell', p.call_id || p.id, { command: cmd });
+      return codexToolUse('Shell', p.call_id || p.id, { command: cmd });
     }
     case 'custom_tool_call': {
       const input = {};
@@ -823,10 +851,10 @@ function codexPayloadEntry(type, p) {
         if (m) input.file_path = m[1].trim();
         input.input = p.input;
       }
-      return codexToolUse(p.name || 'tool', p.call_id, input);
+      return codexToolUse(codexToolLabel(p.name), p.call_id, input);
     }
     case 'web_search_call':
-      return codexToolUse('web_search', p.call_id || p.id, {
+      return codexToolUse('Web search', p.call_id || p.id, {
         query: (p.action && p.action.query) || '',
       });
     case 'function_call_output':
