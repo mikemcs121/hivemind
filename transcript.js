@@ -804,7 +804,7 @@ function codexPayloadEntry(type, p) {
   if (type === 'event_msg') {
     // agent_message/user_message/reasoning events all have response_item
     // twins; only surface what exists nowhere else.
-    if (p.type === 'error') return { type: 'system', content: 'error: ' + (p.message || '') };
+    if (p.type === 'error') return { type: 'system', subtype: 'error', content: p.message || 'error' };
     if (p.type === 'turn_aborted') return { type: 'system', content: 'turn interrupted' };
     return null;
   }

@@ -499,7 +499,11 @@ const QUESTION_PATTERNS = [
 // Patterns that mean a thread hit a wall and won't make progress on its own —
 // API/usage errors that otherwise read as "ready" and never pull you back.
 const ERROR_PATTERNS = [
-  /usage limit reached|reached your (usage|daily) limit|rate limit/i,
+  // "rate limit" alone is too loose — codex shows an "Approaching rate limits"
+  // reminder menu on healthy threads.
+  /usage limit reached|(hit|reached) your (usage|daily|rate) limit/i,
+  /rate limit (reached|exceeded|hit)|rate_limit_error/i,
+  /not supported when using Codex/i,
   /\b(overloaded_error|api_error|authentication_error|invalid_request_error)\b/i,
   /\b5\d\d\s+(Internal Server Error|Service Unavailable|Bad Gateway)\b/i,
   /Request timed out|ECONNRESET|ETIMEDOUT|fetch failed/i,
@@ -691,9 +695,17 @@ function parsePlanScreenQuestion(pane, screen) {
   if (!options) return null;
   return {
     header: 'Plan',
-    question: /Ready to code\?/i.test(screen) ? 'Ready to code?' : 'Approve this plan?',
+    question: /Ready to code\?/i.test(screen) ? 'Ready to code?'
+      : /Would you like to proceed\?/i.test(screen)
+        ? 'Claude has written up a plan and is ready to execute. Would you like to proceed?'
+        : 'Approve this plan?',
     options: options.map((o) => ({ label: o.label, description: '', checked: false })),
     multiSelect: false,
+    // The plan itself, rendered on the card so the terminal view isn't needed
+    // to read what's being approved. Served from a cache — the file read is
+    // async and re-syncs this card when the content lands (planCardText).
+    planMd: planCardText(pane),
+    planReview: true,
   };
 }
 
@@ -859,8 +871,22 @@ function evaluateIdle(pane) {
     } catch (_) { /* ignore */ }
   }
 
-  const errLines = buf.split('\n').map((s) => s.trim())
-    .filter((l) => l && ERROR_PATTERNS.some((re) => re.test(l)));
+  // The TUI hard-wraps long messages at pane width, so an error sentence can
+  // split mid-phrase across lines — scan wrap-joined runs of non-blank lines
+  // so a pattern matches regardless of where the wrap fell. Repaints repeat
+  // the same text, hence the Set.
+  const blocks = buf.split(/\n\s*\n/)
+    .map((run) => run.split('\n').map((s) => s.trim()).filter(Boolean).join(' '))
+    .filter(Boolean);
+  const errLines = [...new Set(blocks
+    .filter((b) => ERROR_PATTERNS.some((re) => re.test(b)))
+    .map((b) => {
+      // Codex prefixes its error lines with ■ — cut the screen chrome the
+      // wrap-join glued on in front of it.
+      const i = b.indexOf('■');
+      if (i > 0) b = b.slice(i);
+      return b.length > 300 ? b.slice(0, 300) + '…' : b;
+    }))];
   if (errLines.length) {
     pane.errored = true;
     // Keep the matched line for the prompt card (the buffer's tail is usually
@@ -868,6 +894,11 @@ function evaluateIdle(pane) {
     // a recovered thread doesn't re-flag this same stale error on every quiet.
     pane.errorText = errLines.slice(-3).join('\n');
     pane.buf = '';
+    // Also pin the message into the chat flow as a red card: the prompt card
+    // is suppressed while a screen menu waits (codex pairs API errors with a
+    // "switch model?" menu), and it vanishes on the next state change — the
+    // chat row keeps the reason visible either way.
+    if (pane.chat) addErrorRow(pane, 'err:' + pane.errorText.slice(0, 60), pane.errorText);
     setPaneState(pane, 'error');
     return;
   }
@@ -2706,6 +2737,13 @@ function renderChatEntry(pane, e) {
     });
     return;
   }
+  // API/CLI errors (e.g. Codex rejecting the chosen model, usage limits) get a
+  // red card — as a dim meta line they're invisible right when the thread
+  // stops responding.
+  if (e.type === 'system' && e.subtype === 'error' && typeof e.content === 'string') {
+    addErrorRow(pane, chatKeyFor(e), e.content);
+    return;
+  }
   addMetaRow(pane, chatKeyFor(e), metaLabel(e));
 }
 
@@ -2841,6 +2879,16 @@ function addMetaRow(pane, key, label) {
   });
 }
 
+function addErrorRow(pane, key, text) {
+  const t = stripAnsi(String(text || '')).trim().slice(0, 1000);
+  if (!t) return;
+  upsertChatRow(pane, key, 'error', (row) => {
+    row.innerHTML = '<div class="chat-error-card"></div>';
+    row.firstChild.textContent = t;
+  });
+  if (pane.chat.pinned) pane.chat.list.scrollTop = pane.chat.list.scrollHeight;
+}
+
 function addSidechainRow(pane, e) {
   let brief = e.type;
   if (e.message && Array.isArray(e.message.content)) {
@@ -2928,6 +2976,10 @@ function addQuestionRow(pane, key, part) {
     // carrying the old highlights would pre-select "Submit answers".
     const prevSel = new Set(isScreenCard ? [] :
       [...row.querySelectorAll('.chat-question-opt.selected')].map((b) => b.dataset.opt));
+    // Keep the plan fold's collapsed/expanded choice across re-renders (the
+    // card re-renders when the plan content lands or changes).
+    const prevFold = row.querySelector('.chat-plan-fold');
+    const planFoldOpen = prevFold ? prevFold.open : true;
     row.innerHTML = '';
     const card = document.createElement('div');
     card.className = 'chat-question';
@@ -2947,6 +2999,25 @@ function addQuestionRow(pane, key, part) {
       text.textContent = String(q.question || '');
       head.appendChild(text);
       card.appendChild(head);
+      // A plan-approval card carries the plan itself — render it as markdown
+      // in a collapsible fold above the options, so the plan can be read (and
+      // approved) without opening the terminal or the review window.
+      if (typeof q.planMd === 'string' && q.planMd.trim()) {
+        const fold = document.createElement('details');
+        fold.className = 'chat-plan-fold';
+        fold.open = planFoldOpen;
+        const sum = document.createElement('summary');
+        const heading = /^#{1,3}\s+(.+)$/m.exec(q.planMd);
+        sum.textContent = '📋 ' + (heading ? heading[1].trim() : 'The plan');
+        const body = document.createElement('div');
+        body.className = 'chat-md chat-plan-body';
+        body.innerHTML = markdownToHtml(q.planMd);
+        // Native plan-mode files belong to Claude Code while it plans —
+        // checkboxes render read-only here, same as the review window.
+        body.querySelectorAll('input.plan-check').forEach((cb) => { cb.disabled = true; });
+        fold.append(sum, body);
+        card.appendChild(fold);
+      }
       const opts = document.createElement('div');
       opts.className = 'chat-question-options';
       (Array.isArray(q.options) ? q.options : []).forEach((o, i) => {
@@ -3023,6 +3094,16 @@ function addQuestionRow(pane, key, part) {
         sendToPane(pane, '\t');
       };
       foot.appendChild(review);
+    }
+    if (questions.some((q) => q.planReview)) {
+      // The plan-approval card links to the full review window — comments and
+      // request-changes live there.
+      const planBtn = document.createElement('button');
+      planBtn.className = 'chat-question-key';
+      planBtn.textContent = '📋 Review plan';
+      planBtn.title = 'Open the plan review window — comment on the plan or request changes there';
+      planBtn.onclick = (e) => { e.stopPropagation(); openPlanReview(pane); };
+      foot.appendChild(planBtn);
     }
     const openTerm = document.createElement('button');
     openTerm.className = 'chat-question-key';
@@ -3191,6 +3272,7 @@ function sendChatMessage(pane) {
   c.histDraft = '';
   // Sending while viewing a past conversation continues *that* conversation:
   // the thread restarts on it (claude --resume <session>) with this message.
+  recordPromptHistory(typed, pane.agent); // per-hive Prompt History panel
   if (c.viewingHistory && c.historySession) {
     continueHistorySession(pane, c.historySession, text);
     return;
@@ -3647,6 +3729,8 @@ function selectBoard(id) {
   if (typeof planToggle !== 'undefined' && planToggle) planToggle.disabled = false;
   if (typeof todoToggle !== 'undefined' && todoToggle) todoToggle.disabled = false;
   if (typeof todoOnBoardChange === 'function') todoOnBoardChange();
+  if (typeof historyToggle !== 'undefined' && historyToggle) historyToggle.disabled = false;
+  if (typeof historyOnBoardChange === 'function') historyOnBoardChange();
   fitBoard(id);
 }
 
@@ -4103,6 +4187,7 @@ function createPane(board, col, opts = {}) {
     plan: {
       state: 'none', file: opts.planFile || null, source: opts.planSource || null,
       menu: null, menuMiss: 0, exitIds: new Set(), exitPlanText: null,
+      cardText: null, cardFetch: null,
     },
     // Claude Code session id this pane owns. Set before spawn (fresh threads
     // get a generated UUID passed as --session-id; resumes reuse the old id)
@@ -4672,7 +4757,12 @@ function showEmpty() {
     todoToggle.classList.remove('active');
   }
   if (typeof todoPanel !== 'undefined' && todoPanel) todoPanel.classList.add('hidden');
-  const sb = $('sidebar'); if (sb) sb.classList.remove('git-open', 'files-open', 'todo-open');
+  if (typeof historyToggle !== 'undefined' && historyToggle) {
+    historyToggle.disabled = true;
+    historyToggle.classList.remove('active');
+  }
+  if (typeof historyPanel !== 'undefined' && historyPanel) historyPanel.classList.add('hidden');
+  const sb = $('sidebar'); if (sb) sb.classList.remove('git-open', 'files-open', 'todo-open', 'history-open');
 }
 
 // ---------------------------------------------------------------------------
@@ -4900,6 +4990,7 @@ const sidebarEl = $('sidebar');
 function setGitOpen(open) {
   if (open && typeof setFilesOpen === 'function') setFilesOpen(false); // one panel at a time
   if (open && typeof setTodoOpen === 'function') setTodoOpen(false);
+  if (open && typeof setHistoryOpen === 'function') setHistoryOpen(false);
   gitPanel.classList.toggle('hidden', !open);
   gitToggle.classList.toggle('active', open);
   sidebarEl.classList.toggle('git-open', open); // board list yields its space
@@ -5030,15 +5121,8 @@ function renderBranchBar(st) {
     gh.title = 'Open project on GitHub';
     gh.setAttribute('aria-label', 'Open project on GitHub');
     gh.innerHTML =
-      '<svg class="gh-mark" viewBox="0 0 24 24" width="16" height="16" fill="currentColor" aria-hidden="true">' +
-      '<path d="M12 .5C5.73.5.75 5.48.75 11.75c0 4.98 3.23 9.2 7.71 10.69.56.1.77-.24.77-.54' +
-      'v-1.9c-3.14.68-3.8-1.35-3.8-1.35-.51-1.3-1.25-1.65-1.25-1.65-1.02-.7.08-.68.08-.68' +
-      '1.13.08 1.72 1.16 1.72 1.16 1 1.72 2.63 1.22 3.27.94.1-.73.39-1.22.71-1.5' +
-      '-2.51-.29-5.15-1.25-5.15-5.58 0-1.23.44-2.24 1.16-3.03-.12-.29-.5-1.44.11-3' +
-      '0 0 .95-.3 3.1 1.16a10.7 10.7 0 0 1 5.64 0c2.15-1.46 3.1-1.16 3.1-1.16' +
-      '.61 1.56.23 2.71.11 3 .72.79 1.16 1.8 1.16 3.03 0 4.34-2.64 5.29-5.16 5.57' +
-      '.4.35.76 1.04.76 2.1v3.11c0 .3.2.65.78.54a11.26 11.26 0 0 0 7.7-10.69' +
-      'C23.25 5.48 18.27.5 12 .5z"/></svg>' +
+      '<svg class="gh-mark" viewBox="0 0 16 16" width="16" height="16" fill="currentColor" aria-hidden="true">' +
+      '<path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8z"/></svg>' +
       // Small "opens externally" arrow that fades in on hover so the control
       // reads as a link out to the browser, not an in-app action.
       '<svg class="gh-out" viewBox="0 0 24 24" width="9" height="9" fill="none" ' +
@@ -5359,6 +5443,7 @@ function setFilesMsg(text, kind) {
 function setFilesOpen(open) {
   if (open) setGitOpen(false); // one panel at a time
   if (open && typeof setTodoOpen === 'function') setTodoOpen(false);
+  if (open && typeof setHistoryOpen === 'function') setHistoryOpen(false);
   filesPanel.classList.toggle('hidden', !open);
   filesToggle.classList.toggle('active', open);
   sidebarEl.classList.toggle('files-open', open); // board list yields its space
@@ -5599,6 +5684,7 @@ function setTodoOpen(open) {
   if (open) { // one panel at a time
     setGitOpen(false);
     setFilesOpen(false);
+    if (typeof setHistoryOpen === 'function') setHistoryOpen(false);
   }
   todoPanel.classList.toggle('hidden', !open);
   todoToggle.classList.toggle('active', open);
@@ -5953,6 +6039,208 @@ $('todo-clear-done').onclick = () => {
   renderTodo({ ok: true });
 };
 // ---------------------------------------------------------------------------
+// Prompt History panel
+//
+// A per-hive log of prompts sent to threads, stored in
+// `.hivemind/prompt-history.json` (shared per project, like todos — not
+// per-thread). Prompts are captured in sendChatMessage after the Hivemind /
+// todo command interception, so only text actually delivered to a thread is
+// recorded. Clicking an entry reposts it to the focused live thread.
+// ---------------------------------------------------------------------------
+const historyToggle = $('history-toggle');
+const historyPanel = $('history-panel');
+const historyBody = $('history-body');
+const historyMsgbar = $('history-msgbar');
+
+let historyEntries = []; // [{ id, text, ts, agent }] oldest→newest (rendered reversed)
+let historyRefreshGen = 0; // bumped on refresh/mutation so stale disk reads are discarded
+
+function historyPanelOpen() { return historyPanel && !historyPanel.classList.contains('hidden'); }
+
+function setHistoryMsg(text, kind) {
+  if (!text) { historyMsgbar.classList.add('hidden'); historyMsgbar.textContent = ''; return; }
+  historyMsgbar.textContent = text;
+  historyMsgbar.className = 'git-msgbar' + (kind ? ' ' + kind : '');
+}
+
+function setHistoryOpen(open) {
+  if (open) { // one panel at a time
+    setGitOpen(false);
+    setFilesOpen(false);
+    setTodoOpen(false);
+  }
+  historyPanel.classList.toggle('hidden', !open);
+  historyToggle.classList.toggle('active', open);
+  sidebarEl.classList.toggle('history-open', open); // board list yields its space
+}
+
+historyToggle.onclick = () => {
+  const open = historyPanel.classList.contains('hidden');
+  setHistoryOpen(open);
+  if (open) refreshHistory();
+};
+$('history-close').onclick = () => setHistoryOpen(false);
+$('history-refresh').onclick = () => refreshHistory();
+$('history-clear').onclick = async () => {
+  const dir = activeDir();
+  if (!dir) return;
+  historyRefreshGen++; // an in-flight read must not resurrect the list
+  historyEntries = [];
+  const res = await window.api.promptHistory.write(dir, []);
+  if (!res || !res.ok) setHistoryMsg((res && res.message) || 'Could not clear history.', 'err');
+  renderHistory();
+};
+
+function historyOnBoardChange() { if (historyPanelOpen()) refreshHistory(); }
+
+async function refreshHistory() {
+  if (!historyPanelOpen()) return;
+  setHistoryMsg('');
+  const gen = ++historyRefreshGen;
+  const dir = activeDir();
+  if (!dir) { historyEntries = []; renderHistory(); return; }
+  const res = await window.api.promptHistory.read(dir);
+  if (gen !== historyRefreshGen) return; // superseded by a newer refresh or a mutation
+  historyEntries = (res && res.ok && Array.isArray(res.entries)) ? res.entries : [];
+  renderHistory();
+}
+
+function renderHistory() {
+  historyBody.innerHTML = '';
+  if (!historyEntries.length) {
+    const empty = document.createElement('div');
+    empty.className = 'history-empty';
+    empty.textContent = 'Prompts you send to threads will appear here.';
+    historyBody.appendChild(empty);
+    return;
+  }
+  for (let i = historyEntries.length - 1; i >= 0; i--) { // newest first
+    const entry = historyEntries[i];
+    if (!entry || !entry.text) continue;
+    const row = document.createElement('div');
+    row.className = 'history-row';
+    row.title = entry.text;
+
+    const main = document.createElement('div');
+    main.className = 'history-row-main';
+    const text = document.createElement('div');
+    text.className = 'history-row-text';
+    text.textContent = entry.text;
+    const time = document.createElement('div');
+    time.className = 'history-row-time';
+    time.textContent = relTimeShort(entry.ts || 0);
+    main.appendChild(text);
+    main.appendChild(time);
+
+    const send = document.createElement('button');
+    send.className = 'history-row-send';
+    send.title = 'Send again to the focused thread';
+    send.textContent = '↩';
+    send.onclick = (e) => {
+      e.stopPropagation();
+      repostPrompt(entry);
+    };
+
+    const del = document.createElement('button');
+    del.className = 'history-row-del';
+    del.title = 'Remove from history';
+    del.textContent = '🗑';
+    del.onclick = async (e) => {
+      e.stopPropagation();
+      historyRefreshGen++; // an in-flight read must not resurrect the row
+      historyEntries = historyEntries.filter((x) => x !== entry);
+      const dir = activeDir();
+      if (dir) {
+        const res = await window.api.promptHistory.write(dir, historyEntries);
+        if (!res || !res.ok) setHistoryMsg((res && res.message) || 'Could not save history.', 'err');
+      }
+      renderHistory();
+    };
+
+    row.appendChild(main);
+    row.appendChild(send);
+    row.appendChild(del);
+    row.onclick = () => revealPrompt(entry);
+    historyBody.appendChild(row);
+  }
+}
+
+// Repost a history entry to the focused thread — same delivery path as the
+// composer. Guards mirror sendChatMessage: never type into a pending TUI menu,
+// and never into a pane from another hive or one viewing a past session.
+async function repostPrompt(entry) {
+  const pane = (focusedPane && !focusedPane.disposed && focusedPane.state !== 'dead'
+                && focusedPane.board && focusedPane.board.id === activeBoardId)
+    ? focusedPane : null;
+  if (!pane) { setHistoryMsg('Focus a running thread first.', 'err'); return; }
+  if (pane.state === 'attention') { setHistoryMsg('Thread is waiting on an answer — respond to it first.', 'err'); return; }
+  if (pane.chat && pane.chat.viewingHistory) { setHistoryMsg('Thread is viewing a past conversation — return to live first.', 'err'); return; }
+  deliverPrompt(pane, entry.text);
+  await recordPromptHistory(entry.text, pane.agent); // move-to-top with a fresh stamp
+  setHistoryMsg('Sent to ' + (pane.name || 'thread') + '.', 'ok'); // after the refresh, which clears the bar
+}
+
+// Jump to a history entry's prompt where it appears in a thread's chat — like
+// an anchor link. The focused pane is searched first, then the rest of the
+// board (history is per-hive, so the prompt may have gone to any thread).
+// Within a pane the last matching bubble wins: history dedupes repeats, so the
+// newest occurrence is the one the entry's timestamp refers to.
+function revealPrompt(entry) {
+  const g = grids.get(activeBoardId);
+  if (!g) { setHistoryMsg('Open a hive first.', 'err'); return; }
+  const panes = [];
+  if (focusedPane && !focusedPane.disposed && focusedPane.chat
+      && focusedPane.board && focusedPane.board.id === activeBoardId) panes.push(focusedPane);
+  for (const col of g.columns) {
+    for (const p of col.panes) {
+      if (p.disposed || !p.chat || panes.includes(p)) continue; // Gemini panes have no chat
+      panes.push(p);
+    }
+  }
+  for (const pane of panes) {
+    const bubbles = pane.chat.list.querySelectorAll('.chat-row[data-kind="user"] > .chat-bubble.user');
+    for (let i = bubbles.length - 1; i >= 0; i--) {
+      if (bubbles[i].textContent.trim() !== entry.text) continue;
+      jumpToChatRow(pane, bubbles[i].parentElement);
+      return;
+    }
+  }
+  setHistoryMsg('Prompt not found in an open conversation — it may be from a past session or a closed thread.', 'err');
+}
+
+// Focus the pane, make its chat visible, and scroll the row to center with a
+// brief highlight flash. Scrolling away from the bottom unpins auto-scroll via
+// the chat list's scroll handler, so a mid-turn thread won't yank the view back.
+function jumpToChatRow(pane, row) {
+  const g = grids.get(pane.board.id);
+  if (g && g.zoomed && g.zoomed !== pane) { // board maximized on another thread — swap, like a zoom tab click
+    g.zoomed.el.classList.remove('zoomed');
+    g.zoomed = pane;
+    layout(pane.board.id);
+  }
+  if (focusedPane !== pane) focusPane(pane);
+  if (pane.view !== 'chat') setPaneView(pane, 'chat', { persist: false }); // a jump shouldn't overwrite the remembered view
+  pane.chat.pinned = false; // unpin NOW — a transcript entry landing mid-smooth-scroll must not yank back to bottom
+  row.scrollIntoView({ block: 'center', behavior: 'smooth' });
+  if (row.__hiliteTimer) clearTimeout(row.__hiliteTimer);
+  row.classList.remove('hilite');
+  void row.offsetWidth; // restart the flash animation on a re-click
+  row.classList.add('hilite');
+  row.__hiliteTimer = setTimeout(() => row.classList.remove('hilite'), 1800);
+}
+
+// Record one sent prompt into this hive's history. Appending happens in the
+// main process (read-modify-write on disk) so sends from several threads and
+// an open panel never clobber each other — same rationale as addTodoItem.
+async function recordPromptHistory(text, agent) {
+  const t = String(text || '').trim();
+  const dir = activeDir();
+  if (!t || !dir) return;
+  window.api.promptHistory.ensureIgnored(dir);
+  await window.api.promptHistory.append(dir, { id: nextId('ph'), text: t, ts: Date.now(), agent: agent || '' });
+  if (historyPanelOpen()) refreshHistory(); // live update while the panel is open
+}
+// ---------------------------------------------------------------------------
 // Plan review
 //
 // A thread's plan as a full document — the VS Code-extension experience. Two
@@ -6005,17 +6293,22 @@ let planPollTimer = null;    // live-refresh poll while the review is open
 // A plan file written by a thread, wherever it lives: Claude Code's native
 // plan-mode files (~/.claude/plans/…) or Hivemind's own (.hivemind/plans/…).
 const PLAN_FILE_RE = /[\\/]\.(?:claude|hivemind)[\\/]plans[\\/][^\\/]+\.md$/i;
-// The "Ready to code?" approval menu, matched by option label — the option
-// numbers shift with optional entries (clear-context, publish-as-artifact,
-// Ultraplan), so digits are always derived from the live screen parse. The
-// run-with-it option's label depends on the thread's permission mode
-// (verified against Claude Code v2.1.202): "Yes, auto-accept edits" in
-// default mode, "Yes, and bypass permissions" / "Yes, and use auto mode"
-// otherwise. The "Yes, clear context (N% used) and …" first-slot variant is
-// deliberately not matched — its keep-context sibling is always present. If
-// wording drifts and nothing matches, the buttons degrade to "answer in the
-// terminal" rather than sending blind digits.
+// The plan-approval menu ("Ready to code?" / v2.1.21x "…ready to execute.
+// Would you like to proceed?"), matched by option label — the option numbers
+// shift with optional entries (clear-context, publish-as-artifact, Ultraplan),
+// so digits are always derived from the live screen parse. The run-with-it
+// option's label depends on the thread's permission mode (verified against
+// Claude Code v2.1.211): "Yes, auto-accept edits" in default mode, "Yes, and
+// bypass permissions" / "Yes, and use auto mode" otherwise. The "Yes, clear
+// context (N% used) and …" first-slot variant is deliberately not matched —
+// its keep-context sibling is always present. If wording drifts and nothing
+// matches, the buttons degrade to "answer in the terminal" rather than
+// sending blind digits.
 const PLAN_MENU_KEEP_RE = /keep planning/i;
+// The keep-planning option in v2.1.21x is an inline input — its label is
+// still "No, keep planning" but the screen renders its placeholder ("Tell
+// Claude what to change") instead, so match either.
+const PLAN_MENU_FEEDBACK_RE = /^(No, keep planning|Tell Claude what to change)/i;
 const PLAN_MENU_AUTO_RE = /^Yes, (auto-accept edits|and (bypass permissions|use auto mode))/i;
 const PLAN_MENU_MANUAL_RE = /^Yes, manually approve/i;
 // Deterministic ExitPlanMode tool_result strings (approval vs. kept planning).
@@ -6040,6 +6333,7 @@ function panePlan(pane) {
       menu: null, menuMiss: 0,                 // live "Ready to code?" option map
       exitIds: new Set(),                      // ExitPlanMode tool_use ids seen
       exitPlanText: null,                      // input.plan — content of last resort
+      cardText: null, cardFetch: null,         // chat-card plan cache (planCardText)
     };
   }
   return pane.plan;
@@ -6078,6 +6372,7 @@ function updatePlanChip(pane) {
 // pops the review or messages the user.
 function planScanEntries(pane, entries, backfill) {
   const pl = panePlan(pane);
+  let cardStale = false;
   for (const e of entries) {
     if (!e || e.isSidechain || !e.message) continue;
     const content = Array.isArray(e.message.content) ? e.message.content : null;
@@ -6089,6 +6384,7 @@ function planScanEntries(pane, entries, backfill) {
             typeof part.input.file_path === 'string' && PLAN_FILE_RE.test(part.input.file_path)) {
           pl.file = part.input.file_path;
           pl.source = /[\\/]\.hivemind[\\/]/i.test(part.input.file_path) ? 'hivemind' : 'native';
+          cardStale = true;
           if (!backfill) {
             planSetState(pane, 'drafting');
             if (planModalPane === pane && planOpen() && !planDrafting) refreshPlanReview();
@@ -6101,6 +6397,7 @@ function planScanEntries(pane, entries, backfill) {
             pl.source = /[\\/]\.hivemind[\\/]/i.test(inp.planFilePath) ? 'hivemind' : 'native';
           }
           if (typeof inp.plan === 'string' && inp.plan) pl.exitPlanText = inp.plan;
+          cardStale = true;
         }
       }
     } else if (e.type === 'user') {
@@ -6110,6 +6407,11 @@ function planScanEntries(pane, entries, backfill) {
       }
     }
   }
+  // The transcript can reveal the plan (file or text) after the screen probe
+  // already drew the approval card — and probes stop once the PTY goes quiet,
+  // so nothing else would refresh the card's plan fold. Re-sync: it re-parses
+  // the screen, which re-kicks planCardText with the newly known source.
+  if (cardStale) syncScreenQuestion(pane);
 }
 
 function planToolResultText(part) {
@@ -6143,12 +6445,13 @@ function planApplyResult(pane, approved, backfill) {
 // transcript result resolves the state.
 // Parse the approval menu's numbered options off the visible screen. The
 // plan dialog draws none of the "Enter to select … Esc to cancel" footer
-// chrome parseScreenQuestion anchors on (its footer reads "Tab/Arrow keys to
-// navigate · ctrl+g edit in … · escape cancel" — verified v2.1.202), so this
-// anchors on the numbering itself: the bottom-most "1." line with options
-// counting up from it, validated by the one option every variant of the menu
-// ends with — "No, keep planning". Non-option lines in between are wrapped
-// labels, option descriptions, or the feedback option's inline input.
+// chrome parseScreenQuestion anchors on, so this anchors on the numbering
+// itself: the bottom-most "1." line with options counting up from it,
+// validated by the option every variant of the menu ends with — the
+// keep-planning entry ("No, keep planning", or its "Tell Claude what to
+// change" placeholder once it became an inline input in v2.1.21x) — plus at
+// least one "Yes, …" option (the manual-approve entry is unconditional).
+// Non-option lines in between are wrapped labels or option descriptions.
 function parsePlanMenu(screen) {
   // The dialog is a bordered box — shed the │ box chrome so the line-anchored
   // option regex sees "❯ 1. Yes, …" rather than "│ ❯ 1. Yes, … │".
@@ -6164,16 +6467,49 @@ function parsePlanMenu(screen) {
     }
     // The bottom-most numbered block either is the menu or there is no menu
     // on screen (a numbered list inside the plan preview fails the check).
-    return options.length >= 2 && options.some((o) => PLAN_MENU_KEEP_RE.test(o.label))
+    return options.length >= 2
+      && options.some((o) => PLAN_MENU_FEEDBACK_RE.test(o.label))
+      && options.some((o) => /^Yes, /i.test(o.label))
       ? options : null;
   }
   return null;
 }
 
+// The plan markdown for the chat approval card. The screen probe parses
+// synchronously, so this serves a per-pane cache and refreshes it in the
+// background: content comes from the plan file the transcript revealed
+// (native or hivemind), the legacy ⟳ file, or the ExitPlanMode input — the
+// same order refreshPlanReview uses. When a read lands with new content the
+// screen question re-syncs, which re-renders the card with the plan body.
+function planCardText(pane) {
+  const pl = panePlan(pane);
+  if (!pl.cardFetch) {
+    pl.cardFetch = (async () => {
+      const dir = pane.board && pane.board.dir;
+      let res = null;
+      if (pl.file) res = await window.api.plan.readFile(dir, pl.file);
+      if ((!res || !res.ok) && dir && pane.planId) {
+        const legacy = await window.api.plan.read(dir, pane.planId);
+        if (legacy && legacy.ok) res = legacy;
+      }
+      const text = res && res.ok ? res.content : pl.exitPlanText;
+      if (typeof text === 'string' && text !== pl.cardText && !pane.disposed) {
+        pl.cardText = text;
+        syncScreenQuestion(pane);
+      }
+    // The body completes synchronously when there's nothing to read (both
+    // reads are conditional) — clearing the flag inside the body would be
+    // clobbered by this assignment, so clear it in a .finally, which always
+    // runs after the assignment. Also clears on a rejected read.
+    })().finally(() => { pl.cardFetch = null; });
+  }
+  return typeof pl.cardText === 'string' ? pl.cardText : null;
+}
+
 function planScreenCheck(pane, screen) {
   if (pane.agent !== 'claude' || pane.disposed || pane.state === 'dead') return;
   const pl = panePlan(pane);
-  if (PLAN_MENU_KEEP_RE.test(screen)) {
+  if (PLAN_MENU_KEEP_RE.test(screen) || PLAN_FEEDBACK_INPUT_RE.test(screen)) {
     const opts = parsePlanMenu(screen);
     if (opts) {
       pl.menu = { options: opts };
@@ -6571,8 +6907,10 @@ function highlightOccurrence(root, quote, occurrence, id) {
   return segs.length > 0;
 }
 
-// Links in a plan open in the OS browser, not the file:// renderer window.
-planDocBody.addEventListener('click', (e) => {
+// Links in rendered markdown open in the OS browser, not the file:// renderer
+// window. Document-level: the same anchors appear in the plan review window,
+// chat bubbles, and the chat plan-approval card.
+document.addEventListener('click', (e) => {
   const a = e.target.closest && e.target.closest('a.plan-link');
   if (a) {
     e.preventDefault();
@@ -6817,13 +7155,17 @@ planReqChangesBtn.onclick = async () => {
   if (note) parts.push(`[${parts.length + 1}] ${note}`);
   const feedback = 'Please revise the plan. Comments:\n' + parts.join('\n');
   const opts = (pl.menu && pl.menu.options) || [];
-  const keepIdx = opts.findIndex((o) => PLAN_MENU_KEEP_RE.test(o.label));
+  const keepIdx = opts.findIndex((o) => PLAN_MENU_FEEDBACK_RE.test(o.label));
   if (pl.state === 'ready' && keepIdx >= 0) {
     // Native plan mode: pick "No, keep planning", wait for its inline feedback
-    // input to appear, then paste the comments as the revision request.
+    // input to appear, then paste the comments as the revision request. In the
+    // v2.1.21x menu the input (and its placeholder) is always on screen, so
+    // the await returns immediately — the fixed delay keeps the paste from
+    // racing the digit keypress that moves selection onto the input row.
     sendToPane(pane, String(keepIdx + 1));
     planSetState(pane, 'pending-result');
     setPlanDocMsg('Sending your feedback…');
+    await new Promise((r) => setTimeout(r, 200));
     await planAwaitScreen(pane, PLAN_FEEDBACK_INPUT_RE, 2500);
     typePrompt(pane, feedback);
   } else {
