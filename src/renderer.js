@@ -4729,7 +4729,7 @@ gitToggle.onclick = () => {
   if (open) refreshGit();
 };
 $('git-close').onclick = () => setGitOpen(false);
-$('git-refresh').onclick = () => refreshGit();
+$('git-refresh').onclick = () => refreshGit({ forceFetch: true });
 
 function gitOnBoardChange() {
   if (gitPanelOpen()) refreshGit();
@@ -4769,7 +4769,42 @@ async function refreshGit(opts = {}) {
   const st = await window.api.git.status(dir);
   lastStatus = st;
   renderGitState(st, opts);
+  if (!opts.noFetch && st.ok && st.hasRemote) autoFetchGit(dir, opts.forceFetch);
 }
+
+// -- Background fetch: keep the ↓/↑ counters honest --------------------------
+// `git status` compares against the *local* copy of the remote ref, so ↓ can't
+// move until something actually talks to GitHub. Fetch quietly after a status
+// load (throttled) and on a slow tick while the panel stays open, then repaint
+// if the user is still looking at the same repo.
+const GIT_AUTOFETCH_MS = 3 * 60 * 1000;
+const gitLastFetch = new Map(); // dir -> epoch ms of the last completed fetch
+let gitFetching = false;        // single-flight: one fetch at a time
+
+async function autoFetchGit(dir, force) {
+  if (!dir || gitFetching) return;
+  if (!force && Date.now() - (gitLastFetch.get(dir) || 0) < GIT_AUTOFETCH_MS) return;
+  gitFetching = true;
+  try {
+    const res = await window.api.git.fetch(dir);
+    if (res && res.code === 0) gitLastFetch.set(dir, Date.now());
+  } catch (_) {
+    // Offline or auth trouble — keep showing the local view, try again later.
+  } finally {
+    gitFetching = false;
+  }
+  // Same guards as the fs-watcher refresh: never repaint mid-op or while the
+  // ⋯ menu is open, and only if the panel still shows the repo we fetched.
+  if (gitPanelOpen() && activeDir() === dir && !gitBusy && !gitMenuOpen) {
+    refreshGit({ keepMsg: true, noFetch: true });
+  }
+}
+
+setInterval(() => {
+  if (gitPanelOpen() && !gitBusy && lastStatus && lastStatus.ok && lastStatus.hasRemote) {
+    autoFetchGit(activeDir());
+  }
+}, 60 * 1000);
 
 function renderGitState(st, opts = {}) {
   gitMenuOpen = false; // any prior overflow menu is about to be torn out of the DOM
