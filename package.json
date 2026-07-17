@@ -1,6 +1,6 @@
 {
   "name": "hivemind",
-  "version": "0.1.13",
+  "version": "0.1.14",
   "description": "Run a swarm of Claude threads in tiled panes, organized into project boards",
   "main": "main.js",
   "scripts": {
