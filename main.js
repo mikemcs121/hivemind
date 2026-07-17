@@ -106,6 +106,7 @@ const git = require('./git');
 const files = require('./files');
 const plan = require('./plan');
 const todo = require('./todo');
+const promptHistory = require('./promptHistory');
 const build = require('./build');
 const usage = require('./usage');
 const transcript = require('./transcript');
@@ -779,6 +780,13 @@ app.whenReady().then(() => {
   // Reuse the plan module's helper — both keep the shared `.hivemind/` folder
   // out of Git via the same .gitignore entry.
   ipcMain.handle('todo:ensureIgnored', (_e, { cwd }) => plan.ensureIgnored(cwd));
+
+  // -- IPC: Prompt History panel ----------------------------------------------
+  // A per-hive log of sent prompts stored in `.hivemind/prompt-history.json`.
+  ipcMain.handle('promptHistory:read', (_e, { cwd }) => promptHistory.readHistory(cwd));
+  ipcMain.handle('promptHistory:append', (_e, { cwd, entry }) => promptHistory.appendPrompt(cwd, entry));
+  ipcMain.handle('promptHistory:write', (_e, { cwd, entries }) => promptHistory.writeHistory(cwd, entries));
+  ipcMain.handle('promptHistory:ensureIgnored', (_e, { cwd }) => plan.ensureIgnored(cwd));
 
   // -- IPC: open an external link in the OS browser ---------------------------
   // Plan markdown can contain links; the file:// renderer can't navigate to them

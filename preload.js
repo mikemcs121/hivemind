@@ -122,6 +122,15 @@ contextBridge.exposeInMainWorld('api', {
     ensureIgnored: (cwd) => ipcRenderer.invoke('todo:ensureIgnored', { cwd }),
   },
 
+  // Prompt History panel. `cwd` is the active board's project directory; the
+  // log is shared per-hive (one `.hivemind/prompt-history.json`), not per-thread.
+  promptHistory: {
+    read: (cwd) => ipcRenderer.invoke('promptHistory:read', { cwd }),
+    append: (cwd, entry) => ipcRenderer.invoke('promptHistory:append', { cwd, entry }),
+    write: (cwd, entries) => ipcRenderer.invoke('promptHistory:write', { cwd, entries }),
+    ensureIgnored: (cwd) => ipcRenderer.invoke('promptHistory:ensureIgnored', { cwd }),
+  },
+
   // Chat wrapper: bind a pane to its Claude Code session transcript (JSONL
   // under ~/.claude/projects/) and stream parsed entries back. `noteSent`
   // reports composer sends so binding can match files by first user message.

@@ -313,6 +313,8 @@ button.usage-pill.crit { color: var(--danger); }
 .pane-header .dot.attention { background: var(--peach); animation: hm-pulse 1.1s ease-in-out infinite; }
 .pane-header .dot.dead { background: var(--danger); }
 .pane-header .status { flex: none; font-size: 11px; color: var(--muted); }
+/* Estimated API-price cost of the conversation (Claude threads only). */
+.pane-header .cost { flex: none; font-size: 11px; color: var(--muted); cursor: default; }
 .pane-header .status.busy { color: var(--yellow); }
 .pane-header .status.idle { color: var(--accent-2); }
 .pane-header .status.attention { color: var(--peach); font-weight: 600; }
@@ -352,6 +354,7 @@ button.usage-pill.crit { color: var(--danger); }
 @container (max-width: 560px) { .pane-header .font-btn:not(.view-btn) { display: none; } }
 @container (max-width: 520px) { .pane-header .perm-select { display: none; } }
 @container (max-width: 440px) { .pane-header .model-select:not(.agent-select) { display: none; } }
+@container (max-width: 380px) { .pane-header .cost { display: none; } }
 @container (max-width: 340px) { .pane-header .agent-select { display: none; } }
 @container (max-width: 240px) { .pane-header .status { display: none; } }
 @container (max-width: 170px) { .pane-header .view-btn { display: none; } }
@@ -612,6 +615,15 @@ button.usage-pill.crit { color: var(--danger); }
 .chat-row { display: flex; flex-direction: column; }
 .chat-row[data-kind="user"] { align-items: flex-end; }
 
+/* Anchor-jump flash: clicking a Prompt History entry scrolls its bubble into
+   view and pulses it so the eye lands on the right message. */
+.chat-row.hilite .chat-bubble { animation: chat-hilite 1.8s ease-out; }
+@keyframes chat-hilite {
+  0%   { box-shadow: 0 0 0 2px var(--accent); background: color-mix(in srgb, var(--accent) 22%, var(--surface)); }
+  60%  { box-shadow: 0 0 0 2px var(--accent); }
+  100% { box-shadow: 0 0 0 2px transparent; }
+}
+
 /* Chat text scales with the pane's font size (--pane-font, set per pane by
    setPaneFontSize). Secondary text keeps its usual offset from the base. */
 .chat-bubble {
@@ -748,7 +760,8 @@ button.usage-pill.crit { color: var(--danger); }
   white-space: nowrap;
 }
 .chat-question.answered .chat-question-chip { border-color: var(--border); color: var(--muted); }
-.chat-question-text { color: var(--text); word-break: break-word; }
+/* pre-line: codex approval cards stack header / Reason / command as lines */
+.chat-question-text { color: var(--text); word-break: break-word; white-space: pre-line; }
 .chat-question-options { display: flex; flex-direction: column; gap: 4px; }
 .chat-question-opt {
   display: flex;
@@ -785,6 +798,37 @@ button.usage-pill.crit { color: var(--danger); }
   color: var(--muted);
   word-break: break-word;
 }
+/* The plan itself, rendered inside the plan-approval card — a collapsible
+   document above the options, capped so a long plan scrolls in place. */
+.chat-plan-fold {
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: var(--surface);
+}
+.chat-plan-fold > summary {
+  cursor: pointer;
+  padding: 5px 9px;
+  color: var(--muted);
+  font-size: calc(var(--pane-font, 13px) - 2px);
+  user-select: none;
+}
+.chat-plan-fold > summary:hover { color: var(--text); }
+.chat-plan-fold[open] > summary { border-bottom: 1px solid var(--border); }
+.chat-plan-body {
+  padding: 8px 12px;
+  max-height: 340px;
+  overflow-y: auto;
+  font-size: calc(var(--pane-font, 13px) - 1px);
+  user-select: text;
+  cursor: text;
+}
+.chat-plan-body li.plan-task { list-style: none; margin-left: -18px; display: flex; gap: 7px; align-items: flex-start; }
+.chat-plan-body li.plan-task > input.plan-check { margin-top: 3px; flex: none; accent-color: var(--accent); }
+.chat-plan-body li.plan-task > span { flex: 1; min-width: 0; }
+.chat-plan-body a.plan-link { color: var(--accent); text-decoration: underline; cursor: pointer; }
+.chat-plan-body a.plan-link:hover { color: var(--accent-2); }
+.chat-plan-body hr { border: 0; border-top: 1px solid var(--border); margin: 10px 0; }
+
 .chat-question-foot { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
 .chat-question.answered .chat-question-foot { display: none; }
 .chat-question-hint { flex: 1; min-width: 0; font-size: calc(var(--pane-font, 13px) - 3px); color: var(--muted); }
@@ -828,6 +872,19 @@ button.usage-pill.crit { color: var(--danger); }
   overflow-y: auto;
 }
 .chat-pre.hidden { display: none; }
+/* API/CLI error reported in the session log — full text, red, unmissable. */
+.chat-error-card {
+  max-width: 92%;
+  padding: 8px 12px;
+  border: 1px solid var(--danger);
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--danger) 8%, transparent);
+  font-family: 'Cascadia Code', Consolas, monospace;
+  font-size: calc(var(--pane-font, 13px) - 2px);
+  color: var(--text);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
 .chat-meta-line {
   font-size: calc(var(--pane-font, 13px) - 2px);
   color: var(--muted);
@@ -1389,6 +1446,49 @@ button.usage-pill.crit { color: var(--danger); }
   cursor: pointer; font-size: 12px; padding: 2px 4px; border-radius: 4px;
 }
 .todo-linkbtn:hover { text-decoration: underline; }
+
+/* ---------------- Prompt History panel ---------------- */
+#history-panel {
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  background: var(--bg-alt);
+  border-top: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+}
+#history-panel.hidden { display: none; }
+
+/* When the history panel is open, the board list yields its space to it. */
+#sidebar.history-open #board-list { display: none; }
+
+#history-body { flex: 1; overflow-y: auto; padding: 4px 0; }
+
+.history-row {
+  display: flex; align-items: flex-start; gap: 6px;
+  padding: 7px 10px; cursor: pointer;
+  border-bottom: 1px solid var(--border);
+}
+.history-row:hover { background: var(--surface); }
+.history-row-main { flex: 1; min-width: 0; }
+.history-row-text {
+  font-size: 13px; word-break: break-word;
+  display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+.history-row-time { font-size: 11px; color: var(--muted); margin-top: 2px; }
+.history-row-del,
+.history-row-send {
+  flex: none; display: none;
+  background: transparent; border: none; color: var(--muted);
+  cursor: pointer; font-size: 13px; padding: 1px 4px; border-radius: 4px;
+}
+.history-row:hover .history-row-del,
+.history-row:hover .history-row-send { display: block; }
+.history-row-del:hover { color: var(--danger); background: var(--bg); }
+.history-row-send:hover { color: var(--accent); background: var(--bg); }
+
+.history-empty { color: var(--muted); padding: 12px; font-size: 12px; }
 
 /* ---------------- Plan review ---------------- */
 /* A full-document modal (diff-viewer pattern, editor-sized): rendered plan
