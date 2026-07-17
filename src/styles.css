@@ -296,17 +296,7 @@ button.usage-pill.crit { color: var(--danger); }
   user-select: none;
 }
 .pane-header .title-wrap { flex: 1; min-width: 0; display: flex; align-items: center; gap: 6px; overflow: hidden; }
-.pane-header .title { flex: none; max-width: 60%; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-size: 17px; font-weight: 600; }
-.pane-header .title.is-hidden { display: none; }
-.pane-header .caption {
-  flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
-  color: var(--muted); font-size: 13px; opacity: .8;
-}
-.pane-header .caption:empty { display: none; }
-.pane-header .caption:not(:empty)::before { content: '— '; opacity: .55; }
-/* When the caption stands in for the name, promote it to a full title. */
-.pane-header .title-wrap.titled .caption { color: var(--text); font-size: 18px; font-weight: 600; opacity: 1; }
-.pane-header .title-wrap.titled .caption::before { content: none; }
+.pane-header .title { flex: none; max-width: 100%; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-size: 17px; font-weight: 600; }
 .pane-header .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); flex: none; }
 .pane-header .dot.busy { background: var(--yellow); width: 12px; height: 12px; }
 .pane-header .dot.idle { background: var(--accent-2); }
@@ -406,16 +396,30 @@ button.usage-pill.crit { color: var(--danger); }
   flex: none;
   position: relative; /* anchors the history dropdown */
 }
-/* The topic div takes the free space even while empty so the chips stay
-   right-aligned instead of jumping when the first summary lands. */
+/* The topic shrinks to its text (capped at half the row) so the caption
+   sits left-aligned right after it instead of being pushed to the chips. */
 .chat-topic {
-  flex: 1;
+  flex: 0 1 auto;
   min-width: 0;
+  max-width: 50%;
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
   font-size: 13px;
   font-weight: 600;
   color: var(--text);
 }
+/* Thread caption — what the thread is working on; left-aligned in the row,
+   taking the free space between the topic and the chips. */
+.chat-filters .chat-caption {
+  flex: 1 1 auto;
+  min-width: 0;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  color: var(--muted);
+  font-size: 12px;
+}
+.chat-filters .chat-caption:empty { display: none; }
+/* With topic and caption both shrink-to-fit/hideable, the History button
+   anchors the chip group to the right edge whatever text is present. */
+.chat-filters .chat-history-btn { margin-left: auto; }
 .chat-chip {
   background: transparent;
   border: 1px solid var(--border);
@@ -1867,6 +1871,83 @@ mark.plan-cmt {
 #hm-toast.hidden { display: none; }
 #hm-toast.err { border-color: var(--danger); }
 
+/* Learned-correction offer ("you keep fixing X to Y — add it?") — sits just
+   above the command toast so both can show at once. */
+#voice-suggest {
+  position: absolute;
+  left: 50%;
+  bottom: 100px;
+  transform: translateX(-50%);
+  max-width: min(78%, 900px);
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 14px;
+  background: var(--bg-alt);
+  border: 1px solid var(--accent);
+  border-radius: 10px;
+  box-shadow: 0 8px 24px rgba(0,0,0,.45);
+  font-size: 13px;
+  color: var(--text);
+  z-index: 41;
+}
+#voice-suggest.hidden { display: none; }
+#voice-suggest button.primary { padding: 3px 12px; font-size: 12px; flex: none; }
+#voice-suggest #voice-suggest-no {
+  background: none; border: none; color: var(--muted);
+  cursor: pointer; font-size: 13px; padding: 2px 4px; flex: none;
+}
+#voice-suggest #voice-suggest-no:hover { color: var(--text); }
+
+/* Chat with Hivemind — docked inside the sidebar: fills the board-list area
+   when open, like the other sidebar panels. */
+#hm-chat {
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  background: var(--bg-alt);
+  border-top: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+}
+#hm-chat.hidden { display: none; }
+
+/* When the chat is open, the board list yields its space to it. */
+#sidebar.hm-open #board-list { display: none; }
+
+#hm-chat-log {
+  flex: 1; overflow-y: auto; min-height: 120px;
+  padding: 12px; display: flex; flex-direction: column; gap: 8px;
+}
+.hm-msg {
+  max-width: 85%; padding: 7px 11px; border-radius: 10px;
+  font-size: 13px; line-height: 1.45; white-space: pre-wrap;
+  overflow-wrap: break-word;
+}
+.hm-msg.user { align-self: flex-end; background: var(--surface); }
+.hm-msg.bee { align-self: flex-start; background: var(--panel); border: 1px solid var(--border); }
+.hm-msg.err { border-color: var(--danger); }
+.hm-chat-inputrow {
+  display: flex; align-items: flex-end; gap: 8px;
+  padding: 10px; border-top: 1px solid var(--border);
+}
+.hm-chat-input {
+  flex: 1; resize: none; min-height: 32px; max-height: 90px;
+  background: var(--panel); border: 1px solid var(--border); color: var(--text);
+  border-radius: 8px; padding: 7px 10px; font-size: 13px; font-family: inherit;
+  line-height: 1.4;
+}
+.hm-chat-input:focus { outline: none; border-color: var(--accent); }
+/* Compact ➤ arrow, sized to match the 32px inputrow height. */
+#hm-chat-send {
+  flex: none;
+  width: 32px;
+  height: 32px;
+  padding: 0;
+  font-size: 14px;
+  line-height: 1;
+}
+
 /* Workspace must be the positioning context for the absolute HUD. */
 #workspace { position: relative; }
 
@@ -1945,6 +2026,67 @@ mark.plan-cmt {
 .voice-msg.err { color: var(--danger); }
 .voice-msg.ok { color: var(--accent-2); }
 .voice-msg.hidden { display: none; }
+
+/* -- Voice dictionary training ------------------------------------------- */
+.voice-train-row { display: flex; align-items: center; gap: 10px; margin-top: 10px; }
+.voice-train-row small { color: var(--muted); font-size: 12px; }
+.voice-train-row button { flex: none; }
+
+.voice-train-row button, #voice-train-modal button:not(.primary):not(.git-icon) {
+  background: var(--surface); color: var(--text); border: none;
+  border-radius: 6px; padding: 8px 12px; font-size: 13px; cursor: pointer;
+}
+.voice-train-row button:hover, #voice-train-modal button:not(.primary):not(.git-icon):hover { filter: brightness(1.15); }
+
+/* Stacks above Settings (z 60), which stays open underneath. */
+#voice-train-backdrop {
+  position: fixed; inset: 0; background: rgba(0,0,0,.55);
+  display: flex; align-items: center; justify-content: center; z-index: 70;
+}
+#voice-train-backdrop.hidden { display: none; }
+#voice-train-modal {
+  background: var(--bg-alt); border: 1px solid var(--border); border-radius: 12px;
+  width: 560px; max-width: 94vw; max-height: 88vh;
+  display: flex; flex-direction: column; overflow: hidden;
+}
+#voice-train-progress { color: var(--muted); font-size: 12px; margin-left: 12px; }
+#voice-train-body { padding: 18px; overflow-y: auto; display: flex; flex-direction: column; gap: 12px; }
+.vt-prompt-label { color: var(--muted); font-size: 12px; }
+#voice-train-sentence {
+  font-size: 20px; line-height: 1.6; user-select: text;
+  padding: 12px 14px; background: var(--panel); border: 1px solid var(--border); border-radius: 8px;
+}
+#voice-train-heard {
+  min-height: 40px; margin-top: 10px; padding: 8px 12px; font-size: 13px;
+  color: var(--text); font-family: "Cascadia Code", Consolas, monospace;
+  border: 1px dashed var(--border); border-radius: 8px; white-space: pre-wrap;
+}
+#voice-train-heard.vt-heard-empty { color: var(--muted); font-style: italic; }
+#voice-train-mic { margin-top: 10px; align-self: flex-start; }
+#voice-train-mic.listening { color: var(--accent-2); border-color: var(--accent-2); }
+#voice-train-read { display: flex; flex-direction: column; }
+#voice-train-cands { list-style: none; margin: 12px 0 0; padding: 0; display: flex; flex-direction: column; gap: 4px; }
+#voice-train-cands li {
+  display: flex; align-items: center; gap: 8px; padding: 7px 10px;
+  background: var(--panel); border: 1px solid var(--border); border-radius: 6px; font-size: 13px;
+}
+#voice-train-cands .vd-from { color: var(--text); font-family: "Cascadia Code", Consolas, monospace; }
+#voice-train-cands .vd-arrow { color: var(--muted); }
+#voice-train-cands .vd-to { flex: 1; min-width: 0; color: var(--accent-2); font-family: "Cascadia Code", Consolas, monospace; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+#voice-train-cands li.vt-added { border-color: var(--accent-2); }
+#voice-train-cands li.vt-skipped { opacity: .55; }
+#voice-train-cands .vt-cand-state { flex: none; color: var(--muted); font-size: 12px; }
+#voice-train-modal #voice-train-cands button { flex: none; padding: 4px 10px; font-size: 12px; }
+#voice-train-cands li.vt-added .vt-cand-state { color: var(--accent-2); }
+#voice-train-done { display: flex; flex-direction: column; gap: 14px; padding: 10px 0; }
+#voice-train-done.hidden { display: none; }
+#voice-train-done-text { font-size: 14px; }
+.vt-done-actions { display: flex; gap: 8px; }
+.vt-actions {
+  display: flex; justify-content: flex-end; gap: 8px;
+  padding: 12px 18px; border-top: 1px solid var(--border);
+}
+.vt-actions .hidden, #voice-train-read.hidden { display: none; }
 
 /* ---------------- Added features ---------------- */
 

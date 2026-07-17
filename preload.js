@@ -86,6 +86,12 @@ contextBridge.exposeInMainWorld('api', {
     aiCommitMessage: (cwd) => ipcRenderer.invoke('git:aiCommit', { cwd }),
   },
 
+  // Conversational Hivemind commands: ask a one-shot `claude -p` (fast model)
+  // to map free-form phrasing onto a canonical command from the registry.
+  hm: {
+    interpret: (payload) => ipcRenderer.invoke('hm:interpret', { payload }),
+  },
+
   // Filesystem watch on the active board's directory (auto-refresh panels).
   setWatch: (cwd) => ipcRenderer.send('watch:set', { cwd }),
   onFsChanged: (cb) => {

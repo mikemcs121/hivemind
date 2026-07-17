@@ -74,6 +74,25 @@
           <div id="todo-msgbar" class="git-msgbar hidden"></div>
         </aside>
 
+        <!-- Chat with Hivemind — command console docked inside the sidebar.
+             Every message is a command, no wake word needed; the workspace
+             stays visible so commands like "focus alpha" are seen taking
+             effect. Dictate with the ~ voice hotkey; stopping it sends the command. -->
+        <aside id="hm-chat" class="hidden">
+          <div class="git-header">
+            <span class="git-title">🐝 Chat with Hivemind</span>
+            <div class="spacer"></div>
+            <button id="hm-chat-clear" class="git-icon" title="Clear transcript">🗑</button>
+            <button id="hm-chat-close" class="git-icon" title="Close (Esc)">✕</button>
+          </div>
+          <div id="hm-chat-log"></div>
+          <div class="hm-chat-inputrow">
+            <textarea id="hm-chat-input" class="hm-chat-input" rows="1" spellcheck="false"
+              placeholder="Type a command — no &quot;Hivemind&quot; needed"></textarea>
+            <button id="hm-chat-send" class="primary" title="Send (Enter)" aria-label="Send">➤</button>
+          </div>
+        </aside>
+
         <!-- Prompt History panel — per-hive log stored in .hivemind/prompt-history.json -->
         <aside id="history-panel" class="hidden">
           <div class="git-header">
@@ -103,15 +122,6 @@
               <path d="M18 9a9 9 0 0 1-9 9" />
             </svg>
           </button>
-          <button id="plan-toggle" class="sidebar-action-btn" title="Plan review — the focused thread's plan as a document" aria-label="Plan review" disabled>
-            <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor"
-                 stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-              <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
-              <path d="M14 2v6h6" />
-              <line x1="8" y1="13" x2="16" y2="13" />
-              <line x1="8" y1="17" x2="13" y2="17" />
-            </svg>
-          </button>
           <button id="todo-toggle" class="sidebar-action-btn" title="Todo" aria-label="Todo" disabled>
             <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor"
                  stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
@@ -124,6 +134,12 @@
                  stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
               <circle cx="12" cy="12" r="9" />
               <polyline points="12 7 12 12 15.5 14" />
+            </svg>
+          </button>
+          <button id="hm-chat-toggle" class="sidebar-action-btn" title="Chat with Hivemind — every message is a command, no wake word needed (Ctrl+Shift+H)" aria-label="Chat with Hivemind">
+            <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor"
+                 stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" />
             </svg>
           </button>
         </div>
@@ -155,6 +171,12 @@
         </div>
         <!-- Feedback toast for Hivemind commands ("Hivemind, open a new thread…") -->
         <div id="hm-toast" class="hidden"></div>
+        <!-- Learned-correction offer: voice noticed you keep fixing a dictated phrase -->
+        <div id="voice-suggest" class="hidden">
+          <span id="voice-suggest-text"></span>
+          <button id="voice-suggest-add" class="primary">Add</button>
+          <button id="voice-suggest-no" title="Don't suggest this correction again">✕</button>
+        </div>
         <div id="empty-state" class="empty">
           <h2>Welcome 👋</h2>
           <p>Create a hive, point it at a project directory, and open as many
@@ -295,7 +317,7 @@
                   finishes planning and asks for approval</span>
               </label>
               <small>Unfocused threads never pop up — they show a <em>📋 plan ready</em>
-                chip in their header instead; click it (or the Plan button) to review.</small>
+                chip in their header instead; click it (or the plan card in the chat) to review.</small>
             </div>
 
             <div class="settings-group">
@@ -353,12 +375,18 @@
                 <input type="checkbox" id="voice-auto-space" />
                 <span>Add a space after each phrase</span>
               </label>
+              <label class="voice-check">
+                <input type="checkbox" id="voice-reply-enabled" />
+                <span>Speak Hivemind’s replies aloud in the Chat with Hivemind panel (uses your system voice)</span>
+              </label>
             </div>
 
             <div class="voice-dict-head">
               <span class="voice-dict-title">User dictionary</span>
               <small>Fix words speech keeps mishearing. Each phrase you say on the
-                left is replaced with the text on the right before it is typed.</small>
+                left is replaced with the text on the right before it is typed.
+                Hivemind also watches for fixes you make to dictated text by hand
+                and offers to add repeated ones here for you.</small>
             </div>
 
             <div class="voice-dict-addrow">
@@ -372,10 +400,55 @@
             <div id="voice-dict-empty" class="voice-dict-empty hidden">
               No entries yet. Add a correction above.
             </div>
+
+            <div class="voice-train-row">
+              <button id="voice-train-open">🎓 Train dictionary…</button>
+              <small>Read short practice sentences built from your own prompts;
+                Hivemind proposes corrections for whatever it misheard.</small>
+            </div>
           </section>
         </div>
 
         <div id="voice-modal-msg" class="voice-msg hidden"></div>
+      </div>
+    </div>
+
+    <!-- Voice dictionary training — read sentences aloud, review proposed fixes -->
+    <div id="voice-train-backdrop" class="hidden">
+      <div id="voice-train-modal">
+        <div class="settings-head">
+          <span>🎓 Train voice dictionary</span>
+          <span id="voice-train-progress"></span>
+          <div class="spacer"></div>
+          <button id="voice-train-close" class="git-icon" title="Close">✕</button>
+        </div>
+
+        <div id="voice-train-body">
+          <div id="voice-train-read">
+            <div class="vt-prompt-label">Read this aloud:</div>
+            <div id="voice-train-sentence"></div>
+            <div id="voice-train-heard"></div>
+            <button id="voice-train-mic">🎤 Start reading</button>
+            <ul id="voice-train-cands"></ul>
+          </div>
+
+          <div id="voice-train-done" class="hidden">
+            <div id="voice-train-done-text"></div>
+            <div class="vt-done-actions">
+              <button id="voice-train-again">Train again</button>
+              <button id="voice-train-finish" class="primary">Done</button>
+            </div>
+          </div>
+
+          <div id="voice-train-msg" class="voice-msg hidden"></div>
+        </div>
+
+        <div class="vt-actions">
+          <button id="voice-train-retry">Retry</button>
+          <button id="voice-train-skip">Skip</button>
+          <button id="voice-train-check" class="primary">Check</button>
+          <button id="voice-train-next" class="primary hidden">Next</button>
+        </div>
       </div>
     </div>
 
@@ -398,21 +471,20 @@
                 and
                 <strong><svg class="help-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><line x1="6" y1="3" x2="6" y2="15" /><circle cx="18" cy="6" r="3" /><circle cx="6" cy="18" r="3" /><path d="M18 9a9 9 0 0 1-9 9" /></svg> Source Control</strong>
                 buttons to browse files and manage Git, and the
-                <strong><svg class="help-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" /><path d="M14 2v6h6" /><line x1="8" y1="13" x2="16" y2="13" /><line x1="8" y1="17" x2="13" y2="17" /></svg> Plan</strong>
-                button to open the focused thread's plan review, and the
                 <strong><svg class="help-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 11l3 3L22 4" /><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11" /></svg> Todo</strong>
                 button to keep a checklist for the hive, and the
                 <strong><svg class="help-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9" /><polyline points="12 7 12 12 15.5 14" /></svg> Prompt History</strong>
                 button to see the prompts you've sent in this hive — click one to jump to that prompt in the conversation where it appears (the thread is focused and the message flashes briefly). Hover an entry for its <strong>↩</strong> button to send it again to the focused thread, or <strong>🗑</strong> to remove it from the list.</li>
-              <li><strong>Drag the sidebar's right edge</strong> to make it (and the Explorer, Source Control, Todo and Prompt History panels docked in it) wider or narrower. Double-click the edge to reset the width; it's remembered across restarts.</li>
+              <li><strong>Drag the sidebar's right edge</strong> to make it (and the Explorer, Source Control, Todo, Prompt History and 🐝 Chat with Hivemind panels docked in it) wider or narrower. Double-click the edge to reset the width; it's remembered across restarts.</li>
             </ol>
           </div>
 
           <div class="settings-group">
             <div class="settings-group-title">Threads</div>
             <ul class="help-list">
-              <li><strong>🎤 Voice typing</strong> — dictate into the focused thread; speech is transcribed on-device (English, fully offline) and typed at the cursor when you pause. Toggle with the <kbd>~</kbd> key. You can start speaking right away — words spoken while the model loads are kept, and toggling off still types what you had just said. If the HUD says “Didn’t catch that”, the model heard you but couldn’t make out words. In <strong>⚙ Settings → Voice</strong> you can pick the <strong>recognition model</strong> (the default Moonshine model is bundled; others download once, then run offline) and use the user dictionary to fix words it mishears.</li>
-              <li>Each thread's header shows a <strong>caption</strong> built from the last prompt you send it, so you can see what every thread is working on at a glance. Short replies like <em>yes</em>, <em>no</em> or a menu number don't replace the caption, so answering a prompt keeps the real task on show. Once a thread has a caption it takes over as the header title and the default <em>claude&nbsp;#</em> name is hidden. Double-click the title to rename a thread — a name you set yourself always stays shown.</li>
+              <li><strong>🎤 Voice typing</strong> — dictate into the focused thread; speech is transcribed on-device (English, fully offline) and typed at the cursor when you pause. Toggle with the <kbd>~</kbd> key. You can start speaking right away — words spoken while the model loads are kept, and toggling off still types what you had just said. If the HUD says “Didn’t catch that”, the model heard you but couldn’t make out words. In <strong>⚙ Settings → Voice</strong> you can pick the <strong>recognition model</strong> (the default Moonshine model is bundled; others download once, then run offline) and use the user dictionary to fix words it mishears. Hivemind also <strong>learns from your fixes</strong>: when you edit dictated text in a composer before sending and make the same fix twice, a small offer appears to add that correction to the dictionary with one click (✕ declines it for good). You can also <strong>train the dictionary proactively</strong>: click <strong>🎓 Train dictionary</strong> in <strong>⚙ Settings → Voice</strong> (or say <em>“Hivemind, train dictionary”</em>) to read short practice sentences built from your own prompt history — Hivemind compares what it heard with the sentence and proposes corrections you can add with one click.</li>
+              <li>Every new thread gets a short random <strong>name</strong> — <em>Leo</em>, <em>Nina</em>, … — shown as its header title. Use it to address the thread in Hivemind commands: <em>“Hivemind, run the tests in Leo”</em> or <em>“Hivemind, tell Leo to fix the login bug”</em>. Double-click the name to rename a thread.</li>
+              <li>Just below the header, the chat view's top bar shows a <strong>caption</strong> built from the last prompt you send the thread (to the left of <strong>🕘 History</strong>), so you can see what every thread is working on at a glance. Short replies like <em>yes</em>, <em>no</em> or a menu number don't replace the caption, so answering a prompt keeps the real task on show.</li>
               <li>Each thread can run a different <strong>agent</strong> — pick <em>Claude</em>, <em>ChatGPT</em>, or <em>Gemini</em> from the dropdown in the thread header. One hive can mix them (e.g. three Claude threads and one ChatGPT thread). Switching a running thread restarts it with the new agent. ChatGPT needs OpenAI's Codex CLI (<code>npm install -g @openai/codex</code>) and Gemini needs Google's Gemini CLI (<code>npm install -g @google/gemini-cli</code>) installed and signed in.</li>
               <li>Claude and ChatGPT threads each have a <strong>model</strong> dropdown in the header. On a Claude thread, switching a running thread changes the model live (via <code>/model</code>); on a ChatGPT thread the model is a Codex startup flag, so switching a running thread <strong>restarts it</strong> with a fresh conversation. The last choice is remembered as the default for new threads of that agent (also settable in <strong>⚙ Settings → General</strong>). Gemini threads have no model dropdown.</li>
               <li>Each Claude thread has a <strong>permission mode</strong> dropdown in its header — <em>Default</em>, <em>Accept&nbsp;Edits</em>, <em>Plan</em>, or <em>Bypass&nbsp;⚠</em> — so you can see and set the mode without hunting for it in Claude's own display. It's handed to Claude Code as a startup flag (<em>Bypass</em> skips the accept-permissions screen entirely). Since Claude has no command to change mode mid-session, switching a running thread restarts it (resuming the conversation when there is one). <em>Bypass</em> turns the dropdown amber as a reminder that permissions are being skipped. The choice is remembered as the default for new threads.</li>
@@ -427,14 +499,14 @@
             <div class="settings-group-title">Chat view</div>
             <ul class="help-list">
               <li>Claude and ChatGPT threads open in a <strong>chat view</strong>: a clean transcript of the conversation — your messages, the agent's replies as formatted markdown, and collapsible tool calls — instead of the raw terminal. The real terminal keeps running underneath, untouched; click <strong>&gt;_</strong> in the thread header to reveal it (find and scrollback live there) and <strong>💬</strong> to come back. The choice is remembered per thread. Gemini threads are terminal-only.</li>
-              <li>The bar at the top shows the <strong>conversation topic</strong> — on Claude threads it's Claude Code's own running summary of the session (once it has one); on ChatGPT threads it's the first message you sent the conversation.</li>
+              <li>The bar at the top shows the <strong>conversation topic</strong> on the left — on Claude threads it's Claude Code's own running summary of the session (once it has one); on ChatGPT threads it's the first message you sent the conversation — and the thread's <strong>caption</strong> (the last prompt you sent it) left-aligned right after it, with 🕘 History and the filter chips on the right.</li>
               <li>On Claude threads, click <strong>🕘 History</strong> in the top bar to browse this thread's <strong>past conversations</strong>. The menu lists earlier sessions in the project (newest first, titled by their topic or first message); pick one to view it over the live chat. To <strong>continue</strong> a past conversation, just type in the composer and send — the thread restarts on that conversation (<code>claude --resume</code>) with your message as the next turn. Click <strong>Back to live</strong> (or the <em>live</em> entry in the menu) to return to the running conversation instead, which keeps updating underneath the whole time.</li>
               <li>While the thread is working on a turn, a spinning <strong>🌀 swirl</strong> appears below the last message; it disappears when the turn finishes.</li>
               <li><strong>Hover any of the agent's replies</strong> to reveal a small <strong>⧉ Copy</strong> button at the end of the message — click it to copy that message's raw markdown to the clipboard (it flips to ✓ briefly to confirm). Each <strong>code block</strong> gets its own <strong>⧉</strong> button in its top-right corner (revealed on hover) that copies just that block's code.</li>
               <li>When Claude asks you a multiple-choice question, it appears as a <strong>question card</strong> in the chat — click an option to answer (it presses that option's number in the hidden terminal; multi-select options show a ☑ as you toggle them — click <em>Review ⇥</em>, and Claude Code's confirmation step appears as its own card where <em>Submit answers</em> sends your picks). The thread shows <strong>needs you</strong> until the question is answered. For a custom answer, click <strong>Open terminal</strong> on the card and type it there. Claude Code's plan-approval menu (<em>“Ready to code?”</em> / <em>“Would you like to proceed?”</em>) appears as the same kind of card — with the <strong>plan itself rendered right on the card</strong> (a collapsible 📋 section above the options, so you can read what you're approving without opening the terminal) — click an option to approve the plan or keep planning, or click the card's <strong>📋 Review plan</strong> button to open the full plan review window (comments and request-changes live there). <strong>ChatGPT approval prompts</strong> (run a command, make edits, grant permissions, network access) appear as the same kind of card too, showing what's being approved with clickable options.</li>
               <li><strong>Filter chips</strong> at the top right (<em>Tools</em>, <em>Thinking</em>, <em>Meta</em>, <em>Subagents</em>) control exactly what the chat shows. Tool calls appear as collapsed one-liners — click one to expand its input and result. Your choices persist per thread and become the default for new threads.</li>
               <li>The <strong>composer</strong> at the bottom sends to the thread: <kbd>Enter</kbd> sends, <kbd>Shift</kbd>+<kbd>Enter</kbd> adds a line — multi-line messages arrive as one message. Press <kbd>↑</kbd> in an empty composer (or on the first line) to <strong>recall</strong> messages you've sent before, <kbd>↓</kbd> to come back — editing keeps whatever you land on. Misspelled words get a red squiggle — <strong>right-click</strong> for suggestions or to add a word to the dictionary — and clear typos are <strong>autocorrected</strong> the moment you finish a word (<kbd>Ctrl</kbd>+<kbd>Z</kbd> undoes a fix; <em>Add to dictionary</em> protects a word; turn it off in <strong>⚙ Settings → General → Typing</strong>).</li>
-              <li>Click <strong>⏹ Interrupt</strong> next to the composer's Send button to stop whatever the thread is running — it sends the same <kbd>Ctrl</kbd>+<kbd>C</kbd> the terminal would, without you having to open the terminal view first. Handy for cutting off a long-running command or a turn that's gone down the wrong path.</li>
+              <li>Click <strong>⏹ Interrupt</strong> next to the composer's ➤ send button to stop whatever the thread is running — it sends the same <kbd>Ctrl</kbd>+<kbd>C</kbd> the terminal would, without you having to open the terminal view first. Handy for cutting off a long-running command or a turn that's gone down the wrong path.</li>
               <li><strong>Attachments</strong>: paste an image (including Win+Shift+S screenshots), drag files onto the chat, or click <strong>📎</strong> to pick files — each shows as a chip above the input (images get a thumbnail preview). Click a chip's <strong>✕</strong> to remove it; when you send, the attached files' paths go along with your message so the agent can read them. On <strong>ChatGPT threads</strong>, images are handed to Codex as real image input (they appear as <em>[Image #N]</em> in its composer, so the model can actually see them), and other files from outside the project are first copied into <code>.hivemind/attachments/</code> in the project (the Codex sandbox can only read files inside its workspace); the copies are git-ignored and swept after a week.</li>
               <li>The composer <strong>autocompletes</strong> as you type: start a message with <kbd>/</kbd> for slash-command suggestions (Claude Code built-ins plus your project's <code>.claude/commands</code> and <code>.claude/skills</code>), or type <kbd>@</kbd> anywhere for file paths from the project directory — completing a folder steps into it. <kbd>↑</kbd>/<kbd>↓</kbd> pick a suggestion, <kbd>Tab</kbd> or <kbd>Enter</kbd> accepts it, <kbd>Esc</kbd> dismisses the menu.</li>
               <li>When the hidden terminal needs something the chat can't show — a permission prompt, an approval menu, an error, or a turn that ended on a question — it appears as a <strong>card in the chat flow</strong> (right where the conversation is), with quick keys (<em>1</em>, <em>2</em>, <em>Enter</em>, <em>Esc</em>) and an <strong>Open terminal</strong> button showing the real prompt. While a prompt is waiting the <strong>composer is locked</strong> — a typed message wouldn't reach the terminal (it wants a menu keypress), so answer with the card's keys or open the terminal for a custom reply; the composer unlocks the moment the prompt is answered. This works on both Claude and ChatGPT threads (ChatGPT approvals appear while the thread still looks busy, and recognized ones render as full question cards instead).</li>
@@ -449,13 +521,34 @@
               <strong>“Hivemind”</strong> and the rest is a command Hivemind itself carries out instead of
               text sent to Claude — e.g. <em>“Hivemind, open a new thread and fix the failing login test”</em>
               or <em>“Hivemind, increase the font size”</em>. A toast at the bottom of the workspace confirms
-              what it did. Anything that <em>starts</em> with “Hivemind” is treated as a command — if it isn't
-              one Hivemind recognizes, the toast says so and nothing is sent to the thread. Mentioning
-              Hivemind mid-sentence is sent to the thread as normal.</p>
+              what it did. Anything that <em>starts</em> with “Hivemind” is treated as a command and is
+              never sent to the thread; mentioning Hivemind mid-sentence is sent to the thread as normal.</p>
+            <p class="help-note">You don't have to phrase commands exactly. Hivemind first matches your
+              words against the command list below (politeness like <em>“hey, could you please…”</em> is
+              ignored automatically), and anything it still doesn't recognize is handed to a quick
+              background Claude call that maps your phrasing onto the right command — so
+              <em>“this text is way too small”</em> becomes <strong>font bigger</strong>. That fallback
+              takes a few seconds (a “Let me figure out what you mean…” toast shows while it thinks) and
+              uses the same Claude Code CLI your threads run on; if even Claude can't map it, the toast
+              says so and nothing happens.</p>
+            <p class="help-note">Prefer a dedicated chat? The <strong>🐝 Chat with Hivemind</strong>
+              panel (the <svg class="help-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" /></svg> chat-bubble button at the bottom of the sidebar, <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>H</kbd>,
+              or say <em>“Hivemind, chat”</em>) docks into the sidebar — like Source Control or Todo —
+              and treats <em>every</em> message as a command — no “Hivemind” prefix needed (though it's
+              still fine to use one). While the panel is open, the <kbd>~</kbd> voice hotkey dictates
+              into it — <strong>stopping the mic sends the command automatically</strong>, no ➤ click
+              needed. It keeps a transcript of what you asked and what Hivemind answered, and can
+              <strong>speak the replies aloud</strong> — turn that on in
+              <strong>⚙ Settings → Voice</strong>.</p>
             <ul class="help-list" id="hm-cmd-list"><!-- generated from the command registry in renderer.js --></ul>
             <p class="help-note">“This thread” means the one whose composer you typed into (or the focused
-              one when dictating). If voice typing mishears the wake word (e.g. <em>“hive mine”</em>), add a
-              correction in <strong>⚙ Settings → Voice</strong>'s dictionary.</p>
+              one when dictating). Dictated commands <strong>tolerate misheard wake words</strong> — common
+              mistranscriptions like <em>“half mine”</em>, <em>“high mind”</em> or <em>“hive mine”</em> at the
+              start of an utterance are recognized as “Hivemind” automatically. If yours still isn't caught,
+              add a correction in <strong>⚙ Settings → Voice</strong>'s dictionary (or accept the offer
+              Hivemind makes after it sees you fix it yourself twice). To teach the dictionary your
+              project's vocabulary up-front, use <strong>🎓 Train dictionary</strong> there — read the
+              practice sentences aloud and accept the corrections it proposes.</p>
           </div>
 
           <div class="settings-group">
@@ -472,7 +565,7 @@
           <div class="settings-group">
             <div class="settings-group-title">Plan review</div>
             <ul class="help-list">
-              <li>When a Claude thread works in <strong>plan mode</strong> (the <em>Plan</em> permission mode, or whenever Claude plans on its own), Hivemind detects the plan automatically. While Claude drafts it the thread's header shows a <strong>📋 planning</strong> chip; the moment Claude finishes and asks for approval (<em>“Ready to code?”</em> / <em>“Would you like to proceed?”</em>), the plan pops up as a <strong>full document</strong> — rendered markdown in an editor-style window that live-updates as the plan is written. If the thread isn't focused, nothing pops up: the header shows a <strong>📋 plan ready</strong> chip instead — click it (or the sidebar's Plan button) to open the review. The auto-popup can be turned off in <strong>⚙ Settings → General → Plan review</strong>.</li>
+              <li>When a Claude thread works in <strong>plan mode</strong> (the <em>Plan</em> permission mode, or whenever Claude plans on its own), Hivemind detects the plan automatically. While Claude drafts it the thread's header shows a <strong>📋 planning</strong> chip; the moment Claude finishes and asks for approval (<em>“Ready to code?”</em> / <em>“Would you like to proceed?”</em>), the plan pops up as a <strong>full document</strong> — rendered markdown in an editor-style window that live-updates as the plan is written. If the thread isn't focused, nothing pops up: the header shows a <strong>📋 plan ready</strong> chip instead — click it (or the chat's plan card's <strong>📋 Review plan</strong> button) to open the review. To reopen a plan later — say, after it's been approved — use the <em>“Hivemind, show the plan”</em> command in the thread's composer. The auto-popup can be turned off in <strong>⚙ Settings → General → Plan review</strong>.</li>
               <li><strong>Approve · auto-accept</strong> and <strong>Approve · manual edits</strong> answer Claude Code's own approval menu in the hidden terminal — exactly like picking <em>“Yes, auto-accept edits”</em> (or its equivalent in the thread's permission mode, e.g. <em>“Yes, and bypass permissions”</em> — hover the button to see which) or <em>“Yes, manually approve edits”</em> there. The status chip flips to <em>Approved</em> once Claude confirms, and the thread starts implementing. The same approval menu also shows up as a clickable <strong>card in the thread's chat view</strong> — with the plan rendered on the card and a <strong>📋 Review plan</strong> button that opens this review window — so you can read the plan and answer right there.</li>
               <li><strong>Inline feedback</strong>: highlight any text in the plan and click <strong>＋ Comment</strong> to attach a note to it — like review comments on a document. Comments are saved with the project (in <code>.hivemind/plans/</code>, kept out of Git), so they survive restarts.</li>
               <li><strong>Request changes</strong> picks <em>“No, keep planning”</em> in the thread and sends your comments (each with the text it refers to, plus the optional overall-feedback line) as the revision request. Claude revises, the document updates live, and comments you already sent show collapsed with a <em>sent</em> tag. Comments whose text no longer appears in the revised plan are marked <em>(not found in current plan)</em>.</li>
@@ -485,7 +578,7 @@
           <div class="settings-group">
             <div class="settings-group-title">Todo</div>
             <ul class="help-list">
-              <li>The <strong>Todo</strong> panel is a simple checklist for the hive. Unlike the Plan panel it's shared across every thread in the hive, not tied to the focused one.</li>
+              <li>The <strong>Todo</strong> panel is a simple checklist for the hive. Unlike a thread's plan review it's shared across every thread in the hive, not tied to the focused one.</li>
               <li>Type in the box at the top and press <strong>Enter</strong> (or <strong>＋</strong>) to add an item. <strong>Tick the checkbox</strong> to mark it done, <strong>double-click</strong> an item to rename it, and hover to reveal a <strong>✕</strong> to delete it. Spelling is checked as you type — typos get the same red squiggles, right-click suggestions, and autocorrect as the chat composer.</li>
               <li><strong>Push a todo to a new thread</strong>: hover an item and click the <strong>▶</strong> to open a fresh thread that starts working on it right away — the item's text (plus any unfinished sub-items) becomes the new Claude's first prompt. The todo stays unticked until you mark it done yourself.</li>
               <li><strong>Quick add from anywhere</strong>: start a composer message (or a dictated sentence) with <strong>todo</strong> — e.g. <em>“todo make the repo public”</em> — and it's added to the panel instead of being sent to Claude (<em>TODO:</em> and <em>to-do</em> work too; a bare <em>todo</em> just opens the panel). <em>“Hivemind, add a todo …”</em> does the same. If dictation hears it as two words (“to do”), add a <strong>Settings → Voice</strong> dictionary correction mapping it to “todo”.</li>
@@ -499,6 +592,7 @@
             <div class="settings-group-title">Shortcuts</div>
             <ul class="help-list">
               <li><kbd>~</kbd> — start / stop voice typing</li>
+              <li><kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>H</kbd> — open / close the Chat with Hivemind panel in the sidebar (<kbd>Esc</kbd> inside it closes it)</li>
               <li><kbd>Ctrl</kbd>+<kbd>F</kbd> — find in the focused thread</li>
               <li><kbd>Ctrl</kbd>+<kbd>Enter</kbd> — maximize / restore the focused thread</li>
               <li><kbd>Ctrl</kbd>+<kbd>1</kbd>…<kbd>9</kbd> — focus the 1st–9th thread on the hive</li>

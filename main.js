@@ -744,6 +744,9 @@ app.whenReady().then(() => {
   ipcMain.handle('gh:check', () => git.ghCheck());
   ipcMain.handle('gh:createRepo', (_e, { cwd, name, visibility, push }) => git.ghCreateRepo(cwd, { name, visibility, push }));
   ipcMain.handle('git:aiCommit', (_e, { cwd }) => git.aiCommit(cwd));
+  // Conversational Hivemind commands: map free-form phrasing onto the command
+  // registry with a one-shot `claude -p` (fast model, scratch dir).
+  ipcMain.handle('hm:interpret', (_e, { payload }) => git.hmInterpret(payload));
 
   // -- IPC: filesystem watcher ----------------------------------------------
   // Watch the active board's project directory so the Source Control and File

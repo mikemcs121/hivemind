@@ -424,11 +424,14 @@ function setPanePerm(pane, mode) {
   // apply a change to a running Claude thread by restarting it. Resume this
   // pane's own session (`--resume <id>`) so a mid-session mode switch doesn't
   // throw the work away — and doesn't `--continue` into another thread's more
-  // recent conversation. A thread that never bound a session but has been used
-  // (it has a caption) still falls back to --continue; a fresh, unused thread
-  // restarts clean (there's nothing to resume).
+  // recent conversation. Resume only once the session file provably exists
+  // (sessionBound): fresh threads pre-generate their id for --session-id, but
+  // claude doesn't create the conversation until the first message, so
+  // `--resume` on an unused thread dies with "No conversation found" and
+  // strands the pane in the bare shell. A used thread that never bound (has a
+  // caption) falls back to --continue; a fresh, unused thread restarts clean.
   if (changed && pane.agent === 'claude' && pane.state !== 'dead') {
-    respawnPane(pane, { resume: pane.sessionId || !!pane.captionText });
+    respawnPane(pane, { resume: (pane.sessionBound && pane.sessionId) || !!pane.captionText });
   }
 }
 
@@ -1089,20 +1092,7 @@ function setPaneCaption(pane, text, { persist = true } = {}) {
     pane.caption.textContent = full.length > 80 ? full.slice(0, 79) + '…' : full;
     pane.caption.title = full;
   }
-  updateTitleVisibility(pane);
-  refreshZoomTabs(pane.board.id);
   if (persist) persistLayout(pane.board.id);
-}
-
-// Once an auto-named thread ("claude 1") has a caption, the caption becomes the
-// title: hide the "claude #" name and promote the caption's styling. A manually
-// renamed thread keeps its name on show.
-function updateTitleVisibility(pane) {
-  if (!pane || !pane.title) return;
-  const titled = pane.autoName && !!(pane.captionText || '').trim();
-  pane.title.classList.toggle('is-hidden', titled);
-  const wrap = pane.title.parentElement;
-  if (wrap) wrap.classList.toggle('titled', titled);
 }
 
 // Send keystrokes/text to a pane.
@@ -1155,17 +1145,75 @@ function deliverPrompt(pane, text, images = []) {
 // ---------------------------------------------------------------------------
 const HM_WAKE_RE = /^(?:hey\s+|ok\s+|okay\s+)?hive\s*mind\b[\s,:.!?-]*/i;
 
+// Wake-word mishearings speech models actually produce for "Hivemind",
+// normalized to lowercase letters only. Checked against the first one or two
+// words of a dictated utterance; an edit distance ≤ 2 from "hivemind" catches
+// near-misses that aren't listed.
+const HM_WAKE_MISHEARD = new Set([
+  'halfmine', 'halfmind', 'halfmined', 'highmind', 'himind', 'hivemine',
+  'hivemined', 'hiveman', 'hivemen', 'havemind', 'hymind', 'ivemind',
+]);
+
+function hmEditDistance(a, b) {
+  const n = a.length, m = b.length;
+  let prev = Array.from({ length: m + 1 }, (_, j) => j);
+  for (let i = 1; i <= n; i++) {
+    const cur = [i];
+    for (let j = 1; j <= m; j++) {
+      cur[j] = Math.min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1));
+    }
+    prev = cur;
+  }
+  return prev[m];
+}
+
+// Does a normalized (lowercase, letters-only) word look like a mangled
+// "hivemind"? Membership in the known set always counts. The edit-distance
+// net is only cast over single words (`joined` false): two-word joins like
+// "his mind" → "hismind" sit within distance 2 of "hivemind" and would
+// swallow ordinary dictated prose, so joins must be explicitly listed.
+function hmLooksLikeWake(s, joined) {
+  if (!s) return false;
+  if (HM_WAKE_MISHEARD.has(s)) return true;
+  if (joined) return false;
+  return s[0] === 'h' && s.length >= 6 && s.length <= 10 && hmEditDistance(s, 'hivemind') <= 2;
+}
+
 // The command text after the wake word ('' if the wake word stood alone), or
-// null when the text isn't addressed to Hivemind at all.
-function matchHivemindCommand(text) {
+// null when the text isn't addressed to Hivemind at all. With `fuzzy` (the
+// dictation paths), the first word or two is also tried as a mishearing of
+// "Hivemind" — so "half mine, open a thread" still runs as a command instead
+// of being typed into the thread. Typed text keeps the strict match: "half
+// mine" at the start of a written sentence shouldn't be swallowed.
+function matchHivemindCommand(text, fuzzy) {
   const t = String(text || '').trim();
   const m = HM_WAKE_RE.exec(t);
-  return m ? t.slice(m[0].length).trim() : null;
+  if (m) return t.slice(m[0].length).trim();
+  if (!fuzzy) return null;
+  const lead = /^(?:hey|ok|okay)[\s,]+/i.exec(t);
+  const rest = lead ? t.slice(lead[0].length) : t;
+  const words = /^(\S+)(?:\s+(\S+))?/.exec(rest);
+  if (!words) return null;
+  const norm = (s) => String(s || '').toLowerCase().replace(/[^a-z]/g, '');
+  const w1 = norm(words[1]);
+  if (hmLooksLikeWake(w1)) {
+    return rest.slice(words[1].length).replace(/^[\s,:.!?-]+/, '').trim();
+  }
+  if (words[2] && hmLooksLikeWake(w1 + norm(words[2]), true)) {
+    return rest.slice(words[0].length).replace(/^[\s,:.!?-]+/, '').trim();
+  }
+  return null;
 }
 
 // Feedback for commands: a transient toast over the workspace, view-agnostic.
+// When the Chat with Hivemind dialog is open, every response is also mirrored
+// into its transcript; for commands issued *from* the dialog the bubble is the
+// feedback, so the toast is suppressed. (Commands that toast after an internal
+// await miss the capture window and both toast and mirror — acceptable.)
 let hmToastTimer = null;
 function hmToast(msg, kind) {
+  if (hmChatIsOpen()) hmChatAppend('bee', msg, kind);
+  if (hmChatCaptureActive) { hmChatCapture++; return; }
   const el = document.getElementById('hm-toast');
   if (!el) return;
   el.textContent = '🐝 ' + msg;
@@ -1195,8 +1243,35 @@ function findPaneByName(board, name) {
       || null;
 }
 
+// A command's run() may return HM_PASS to decline its match (e.g. "in Leo"
+// didn't name a real thread) and let the rest of the registry have a go.
+const HM_PASS = Symbol('hm-pass');
+
+// Route "<task> in <name>" / "in <name>, <task>" to the named thread. Only an
+// exact thread-name match claims the text — anything else returns HM_PASS so
+// ordinary phrasing ("find foo in bar.js") keeps reaching other commands.
+function hmRouteTaskTo(board, who, task) {
+  const q = String(who || '').trim().toLowerCase();
+  const target = q && boardPanes(board).find((p) => (p.name || '').trim().toLowerCase() === q);
+  if (!target) return HM_PASS;
+  if (target.state === 'dead') { hmToast(paneLabel(target) + ' has exited — open a new thread.', 'err'); return; }
+  const t = hmExtractTask(task);
+  if (!t) { hmToast('What should ' + paneLabel(target) + ' do?', 'err'); return; }
+  deliverPrompt(target, t);
+  hmToast('Sent to ' + paneLabel(target) + ': ' + t);
+}
+
 // Strip the connective tissue between "open a new thread" and the task itself:
 // "and have it fix the bug" → "fix the bug".
+// "2" / "two" / "three"… → a thread count for "open N threads". Anything
+// unrecognized (or missing) means 1.
+const HM_NUM_WORDS = { one: 1, two: 2, three: 3, four: 4, five: 5, six: 6, seven: 7, eight: 8, nine: 9, ten: 10 };
+function hmParseCount(word) {
+  if (!word) return 1;
+  const n = HM_NUM_WORDS[word.toLowerCase()] || parseInt(word, 10);
+  return Number.isFinite(n) && n > 0 ? n : 1;
+}
+
 function hmExtractTask(rest) {
   let task = String(rest || '').trim();
   task = task.replace(/^(?:,|\.|and|then)\s+/i, '');
@@ -1250,6 +1325,18 @@ const HM_COMMANDS = [
     run() { closeHelp(); },
   },
   {
+    name: 'open-chat',
+    patterns: [/^(?:open\s+(?:the\s+)?)?chat$/i, /^talk\s+to\s+me$/i],
+    help: '<strong>chat</strong> / <strong>talk to me</strong> — opens the Chat with Hivemind panel in the sidebar (commands without the wake word).',
+    run() { hmChatOpen(); },
+  },
+  {
+    name: 'close-chat',
+    patterns: [/^close\s+(?:the\s+)?chat$/i],
+    help: null,
+    run() { hmChatClose(); },
+  },
+  {
     // "add a todo (item) [to] <text>" — append to this hive's Todo panel. The
     // bare "todo <text>" composer prefix is the shortcut for the same thing.
     name: 'add-todo',
@@ -1260,18 +1347,31 @@ const HM_COMMANDS = [
   {
     // "open (up) a new thread [and/to <task>]" — the task rides along as the
     // new Claude's initial prompt, so it starts working the moment it boots.
+    // "open 2 threads" / "open three new threads" opens that many (capped at
+    // 8); a task goes to every one of them.
     name: 'new-thread',
     patterns: [
-      /^(?:open(?:\s+up)?|start|create|add|make|spawn)\s+(?:a\s+|another\s+)?(?:new\s+)?(?:thread|terminal|pane|tab|claude)\b\s*(.*)$/i,
-      /^new\s+(?:thread|terminal|pane|tab)\b\s*(.*)$/i,
+      /^(?:open(?:\s+up)?|start|create|add|make|spawn)\s+(?:(?:a|another)\s+)?(?:(\d+|one|two|three|four|five|six|seven|eight|nine|ten)\s+)?(?:new\s+)?(?:more\s+)?(?:threads?|terminals?|panes?|tabs?|claudes?)\b\s*(.*)$/i,
+      /^new\s+(?:(\d+|one|two|three|four|five|six|seven|eight|nine|ten)\s+)?(?:threads?|terminals?|panes?|tabs?)\b\s*(.*)$/i,
     ],
-    help: '<strong>open a new thread</strong> <em>[and/to &lt;task&gt;]</em> — opens a thread on this hive; with a task, the new Claude starts working on it the moment it boots.',
+    help: '<strong>open a new thread</strong> / <strong>open &lt;N&gt; threads</strong> <em>[and/to &lt;task&gt;]</em> — opens one or more threads on this hive; with a task, each new Claude starts working on it the moment it boots.',
     run(m, { board }) {
       if (!board) { hmToast('No hive is open — create one first.', 'err'); return; }
-      const task = hmExtractTask(m[1]);
-      const p = addTerminal(board, task ? { initialPrompt: task } : {});
-      if (p && task) setPaneCaption(p, task);
-      hmToast(task ? 'Opened a new thread — starting on: ' + task : 'Opened a new thread.');
+      const wanted = hmParseCount(m[1]);
+      const count = Math.min(wanted, 8);
+      const task = hmExtractTask(m[2]);
+      const names = [];
+      for (let i = 0; i < count; i++) {
+        const p = addTerminal(board, task ? { initialPrompt: task } : {});
+        if (!p) break;
+        if (task) setPaneCaption(p, task);
+        names.push(p.name);
+      }
+      if (!names.length) { hmToast('Could not open a thread here.', 'err'); return; }
+      const label = names.length === 1 ? names[0] : names.length + ' threads (' + names.join(', ') + ')';
+      let msg = task ? 'Opened ' + label + ' — starting on: ' + task : 'Opened ' + label + '.';
+      if (wanted > 8) msg += ' (8 at a time is the max.)';
+      hmToast(msg);
     },
   },
   {
@@ -1284,7 +1384,7 @@ const HM_COMMANDS = [
     // "tell <thread> to <task>" — route a task to another thread by name/caption.
     name: 'tell',
     patterns: [/^(?:tell|ask)\s+(?:thread\s+)?(.+?)\s+to\s+(.+)$/i],
-    help: '<strong>tell &lt;thread&gt; to &lt;task&gt;</strong> — sends the task to the named thread (names and captions both match, so “tell claude 2 to…” or “tell the login thread to…” work).',
+    help: '<strong>tell &lt;thread&gt; to &lt;task&gt;</strong> — sends the task to the named thread (names and captions both match, so “tell Leo to…” or “tell the login thread to…” work).',
     run(m, { board, pane }) {
       const who = m[1].trim();
       const target = /^(?:it|this|this thread|the current thread)$/i.test(who)
@@ -1319,7 +1419,6 @@ const HM_COMMANDS = [
       pane.name = m[1].trim();
       pane.autoName = false;
       pane.title.textContent = pane.name;
-      updateTitleVisibility(pane);
       refreshZoomTabs(pane.board.id);
       persistLayout(pane.board.id);
       hmToast('Renamed this thread to "' + pane.name + '".');
@@ -1368,6 +1467,15 @@ const HM_COMMANDS = [
     patterns: [/^toggle\s+(?:voice(?:\s+typing)?|dictation)$/i],
     help: null,
     run() { toggleVoice(); },
+  },
+  {
+    name: 'voice-train',
+    patterns: [
+      /^(?:train|practice)\s+(?:the\s+)?(?:voice\s+)?dictionary$/i,
+      /^(?:open\s+|start\s+)?voice\s+training$/i,
+    ],
+    help: '<strong>train dictionary</strong> — read short practice sentences built from your own prompts; Hivemind proposes voice-dictionary fixes for whatever it misheard.',
+    run() { openVoiceTraining(); },
   },
   {
     // "stop / interrupt [thread <name>]" — same Ctrl+C the ⏹ button sends.
@@ -1696,6 +1804,24 @@ const HM_COMMANDS = [
     },
   },
   {
+    // "<task> in <thread>" — "Hivemind, fix the failing test in Leo". Guarded:
+    // only an exact thread-name match routes; otherwise hmRouteTaskTo returns
+    // HM_PASS and the text falls through to the rest of the registry. Sits
+    // below the specific commands so "make the font bigger in Leo" still means
+    // the font command, but above the find catch-all.
+    name: 'task-in-thread',
+    patterns: [/^(.+?)\s+in\s+(?:thread\s+)?([A-Za-z][\w'-]*)$/i],
+    help: '<strong>&lt;task&gt; in &lt;thread&gt;</strong> — “fix the failing test in Leo” sends the task to that thread (every new thread gets a short name like <em>Leo</em> or <em>Nina</em>; exact names only).',
+    run(m, { board }) { return hmRouteTaskTo(board, m[2], m[1]); },
+  },
+  {
+    // "in <thread>, <task>" — same routing, name-first.
+    name: 'in-thread-task',
+    patterns: [/^in\s+(?:thread\s+)?([A-Za-z][\w'-]*)[,:]?\s+(.+)$/i],
+    help: null, // documented on the task-in-thread entry
+    run(m, { board }) { return hmRouteTaskTo(board, m[1], m[2]); },
+  },
+  {
     // Greediest pattern — keep it last so "find <anything>" can't shadow
     // other commands.
     name: 'find',
@@ -1723,11 +1849,104 @@ const HM_COMMANDS = [
   ul.innerHTML = HM_COMMANDS.filter((c) => c.help).map((c) => '<li>' + c.help + '</li>').join('');
 })();
 
+// Walk the registry with a command string. Returns true when an entry claimed
+// it (even if the entry then failed, e.g. an unknown thread name — that's an
+// answered command), false when nothing matched.
+function hmDispatch(c, board, pane) {
+  entries: for (const entry of HM_COMMANDS) {
+    for (const re of entry.patterns) {
+      const m = re.exec(c);
+      if (!m) continue;
+      // HM_PASS: the entry declined the match — keep scanning the registry.
+      if (entry.run(m, { board, pane }) === HM_PASS) continue entries;
+      return true;
+    }
+  }
+  return false;
+}
+
+// Conversational tolerance, tier 1 (instant, local): peel politeness and
+// filler off the edges so "hey, could you please make the font bigger for me?"
+// reaches the registry as "make the font bigger". Applied only after the raw
+// text fails to match, so no existing phrasing changes meaning.
+const HM_NORM_PREFIXES = [
+  /^(?:hey|hi|hello|ok|okay|so|um+|uh+|well|now|also|and)[,!\s]+/i,
+  /^(?:please|kindly|just|go\s+ahead\s+and)[,\s]+/i,
+  /^(?:can|could|would|will)\s+(?:you|u)\s+(?:please\s+)?/i,
+  /^(?:i|we)\s+(?:want|need|would\s+like|'?d\s+like)\s+(?:you\s+)?to\s+/i,
+  /^(?:let'?s|lets)\s+/i,
+];
+const HM_NORM_SUFFIXES = [
+  /[\s,]+(?:please|thanks|thank\s+you|for\s+me|now|ok(?:ay)?)$/i,
+];
+function hmNormalize(c) {
+  let t = String(c || '').trim().replace(/[\s.!?]+$/, '');
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (const re of [...HM_NORM_PREFIXES, ...HM_NORM_SUFFIXES]) {
+      const next = t.replace(re, '').trim().replace(/[\s.!?]+$/, '');
+      if (next !== t) { t = next; changed = true; }
+    }
+  }
+  return t.trim();
+}
+
+// Conversational tolerance, tier 2 (AI fallback): when the registry can't
+// match even the normalized text, hand the request to a one-shot `claude -p`
+// on the fast model along with the command catalog and the live context
+// (thread/hive/theme/model names). It answers with one canonical command line
+// (re-dispatched through the registry — never a second AI pass) or NONE.
+let hmInterpretBusy = false;
+async function hmInterpretRequest(c, ctxPane) {
+  if (!(window.api.hm && window.api.hm.interpret)) {
+    hmToast('Didn\'t recognize "' + c + '" — say "help" for the command list.', 'err');
+    return;
+  }
+  if (hmInterpretBusy) {
+    hmToast('Still working out the previous request — give me a second.', 'err');
+    return;
+  }
+  hmInterpretBusy = true;
+  hmToast('Let me figure out what you mean…');
+  try {
+    const board = activeBoard();
+    const payload = {
+      request: c,
+      commands: HM_COMMANDS.filter((x) => x.help)
+        .map((x) => x.help.replace(/<[^>]+>/g, '').replace(/\s+/g, ' ').trim()),
+      threads: boardPanes(board).map((p) => p.name).filter(Boolean),
+      hives: boards.map((b) => b.name).filter(Boolean),
+      themes: Object.keys(THEMES),
+      models: MODELS.map((x) => x.label).concat(CODEX_MODELS.map((x) => x.label)),
+    };
+    const res = await window.api.hm.interpret(payload);
+    if (!res || res.code !== 0) {
+      hmToast('Didn\'t recognize "' + c + '"' +
+        (res && res.message ? ' (' + res.message + ')' : '') +
+        ' — say "help" for the command list.', 'err');
+      return;
+    }
+    const line = hmNormalize(res.message.replace(HM_WAKE_RE, ''));
+    // The context pane may have closed while Claude was thinking — fall back
+    // to whatever is focused now, same as a fresh command would.
+    const pane = (ctxPane && !ctxPane.disposed) ? ctxPane : focusedPane;
+    if (!line || /^(?:NONE|PASS)\.?$/i.test(line) || !hmDispatch(line, activeBoard(), pane)) {
+      hmToast('Didn\'t recognize "' + c + '" — say "help" for the command list.', 'err');
+    }
+  } finally {
+    hmInterpretBusy = false;
+  }
+}
+
 // Execute a command addressed to Hivemind. Anything that starts with the wake
 // word is consumed as a command — recognized ones run (even when they fail,
 // e.g. an unknown thread name), unrecognized ones get an error toast — and is
 // never sent to the thread. Mentioning Hivemind mid-sentence doesn't match the
 // wake regex at all, so ordinary messages still pass through untouched.
+// Matching is tiered: exact registry patterns, then locally normalized text
+// (politeness stripped), then the AI interpreter — so phrasing doesn't have to
+// be exact, and only genuinely unrecognized requests pay the AI round-trip.
 function runHivemindCommand(cmd, ctxPane) {
   const board = activeBoard();
   const pane = (ctxPane && !ctxPane.disposed) ? ctxPane : focusedPane;
@@ -1736,15 +1955,192 @@ function runHivemindCommand(cmd, ctxPane) {
     hmToast('Say a command after "Hivemind" — e.g. "Hivemind, open a new thread and fix the failing test". Say "Hivemind help" for the list.', 'err');
     return true;
   }
-  for (const entry of HM_COMMANDS) {
-    for (const re of entry.patterns) {
-      const m = re.exec(c);
-      if (m) { entry.run(m, { board, pane }); return true; }
-    }
-  }
-  hmToast('Didn\'t recognize "' + c + '" — say "Hivemind help" for the command list.', 'err');
+  if (hmDispatch(c, board, pane)) return true;
+  const n = hmNormalize(c);
+  if (n && n !== c && hmDispatch(n, board, pane)) return true;
+  // Async on purpose: the command is consumed now; the answer toasts (and
+  // mirrors into the chat, if open) when the interpreter comes back.
+  hmInterpretRequest(n || c, pane);
   return true;
 }
+
+// ---------------------------------------------------------------------------
+// Chat with Hivemind — command console docked in the sidebar (#hm-chat), like
+// the Source Control / Todo / Prompt History panels. Every message is a
+// command (the wake word is tolerated but not required); responses arrive by
+// hmToast mirroring into the transcript. The workspace stays visible so
+// commands like "focus alpha" can be watched taking effect.
+// ---------------------------------------------------------------------------
+const hmChatLog = [];            // { role: 'user'|'bee', text, kind } — session-only
+const HM_CHAT_MAX = 200;         // same cap as composer history
+let hmChatCaptureActive = false; // a dialog-issued command is dispatching
+let hmChatCapture = 0;           // responses captured during that dispatch
+let hmChatSeeded = false;        // greeter shown once per session
+let hmChatSendOnStop = false;    // mic stopped mid-transcription — send when the result lands
+
+function hmChatIsOpen() {
+  const root = document.getElementById('hm-chat');
+  return !!root && !root.classList.contains('hidden');
+}
+
+function hmChatRenderMsg(m) {
+  const log = document.getElementById('hm-chat-log');
+  if (!log) return;
+  const div = document.createElement('div');
+  div.className = 'hm-msg ' + m.role + (m.kind === 'err' ? ' err' : '');
+  div.textContent = m.text;   // command echoes contain user text — never innerHTML
+  log.appendChild(div);
+  log.scrollTop = log.scrollHeight;
+}
+
+function hmChatAppend(role, text, kind) {
+  const entry = { role, text, kind };
+  hmChatLog.push(entry);
+  if (hmChatLog.length > HM_CHAT_MAX) hmChatLog.shift();
+  hmChatRenderMsg(entry);
+  if (role === 'bee' && hmChatCaptureActive) hmSpeak(text);
+}
+
+function hmChatOpen() {
+  const root = document.getElementById('hm-chat');
+  if (!root) return;
+  // Docked in the sidebar — one panel at a time, like its siblings.
+  if (typeof setGitOpen === 'function') setGitOpen(false);
+  if (typeof setFilesOpen === 'function') setFilesOpen(false);
+  if (typeof setTodoOpen === 'function') setTodoOpen(false);
+  if (typeof setHistoryOpen === 'function') setHistoryOpen(false);
+  if (!hmChatSeeded) {
+    hmChatSeeded = true;
+    hmChatLog.push({ role: 'bee', text: 'Tell me what you need — plain English is fine, no "Hivemind" prefix needed. Try "help" for the full command list.' });
+  }
+  // Rebuild the transcript from the log so close/clear/reopen stay consistent.
+  const log = document.getElementById('hm-chat-log');
+  if (log) { log.innerHTML = ''; for (const m of hmChatLog) hmChatRenderMsg(m); }
+  root.classList.remove('hidden');
+  const toggle = document.getElementById('hm-chat-toggle');
+  if (toggle) toggle.classList.add('active');
+  const sb = document.getElementById('sidebar');
+  if (sb) sb.classList.add('hm-open'); // board list yields its space
+  const input = document.getElementById('hm-chat-input');
+  if (input) input.focus();
+}
+
+function hmChatClose() {
+  const root = document.getElementById('hm-chat');
+  if (!root || root.classList.contains('hidden')) return;
+  root.classList.add('hidden');
+  const toggle = document.getElementById('hm-chat-toggle');
+  if (toggle) toggle.classList.remove('active');
+  const sb = document.getElementById('sidebar');
+  if (sb) sb.classList.remove('hm-open');
+  hmChatSendOnStop = false;
+  if (window.speechSynthesis) speechSynthesis.cancel();
+  // Closing the panel is a dismissal, not a "send it" — drop the auto-send.
+  if (voiceTargetHmChat) { stopVoice({ send: false }); voiceTargetHmChat = false; }
+  if (focusedPane && !focusedPane.disposed) focusPane(focusedPane);
+}
+
+function hmChatToggle() { if (hmChatIsOpen()) hmChatClose(); else hmChatOpen(); }
+
+// Panel-style setter so the sibling panels' "one at a time" logic can close
+// the chat the same way it closes the others.
+function setHmChatOpen(open) { if (open) hmChatOpen(); else hmChatClose(); }
+
+function hmChatClearLog() {
+  hmChatLog.length = 0;
+  const log = document.getElementById('hm-chat-log');
+  if (log) log.innerHTML = '';
+}
+
+function hmChatSubmit() {
+  const input = document.getElementById('hm-chat-input');
+  if (!input) return;
+  const text = input.value.trim();
+  if (!text) return;
+  // Learn from fixes made to dictated text before this command was sent.
+  voiceLearnHarvest(input, text);
+  hmChatAppend('user', text);
+  input.value = '';
+  // The wake word is tolerated ("hivemind help" works) but not required —
+  // fuzzily, so a dictated "half mine help" doesn't leave a stray prefix.
+  const stripped = matchHivemindCommand(text, true);
+  const cmd = stripped !== null ? stripped : text;
+  hmChatCaptureActive = true;
+  hmChatCapture = 0;
+  try {
+    runHivemindCommand(cmd, null);  // null ctx → live focusedPane, so "focus alpha" then "bigger font" chains
+    if (hmChatCapture === 0) hmChatAppend('bee', 'Done.');  // silent commands still get an answer
+  } finally {
+    hmChatCaptureActive = false;
+  }
+}
+
+// Dictation routed here while the dialog is the voice target (see
+// commitVoiceText). Same dictionary/auto-enter/auto-space treatment as thread
+// dictation; the wake word isn't stripped here — hmChatSubmit tolerates it.
+function hmChatVoiceCommit(trimmed) {
+  const input = document.getElementById('hm-chat-input');
+  if (!input) return;
+  if (voiceAutoEnter && VOICE_ENTER_RE.test(trimmed)) { hmChatSubmit(); return; }
+  let text = applyVoiceDict(trimmed);
+  if (!text) return;
+  if (voiceAutoSpace) text += ' ';
+  const start = input.selectionStart != null ? input.selectionStart : input.value.length;
+  const end = input.selectionEnd != null ? input.selectionEnd : start;
+  input.value = input.value.slice(0, start) + text + input.value.slice(end);
+  input.selectionStart = input.selectionEnd = start + text.length;
+  // Remembered for correction learning, harvested in hmChatSubmit.
+  voiceLearnRecord(input, text.trim());
+}
+
+// Stopping the mic sends the dictated command — no Send click needed. Called
+// straight from stopVoice when nothing is transcribing, or deferred (via
+// hmChatSendOnStop) until the last in-flight transcription has been committed
+// so the tail of what was said isn't cut off.
+function hmChatVoiceSend() {
+  hmChatSendOnStop = false;
+  const input = document.getElementById('hm-chat-input');
+  if (!hmChatIsOpen() || !input || !input.value.trim()) return;
+  hmChatSubmit();
+}
+
+// Spoken replies (Settings → Voice, default off). Only dialog-issued replies
+// are spoken — composer commands that merely mirror stay silent. An open mic
+// can pick the speech back up; accepted for now.
+function hmSpeak(text) {
+  if (!voiceReplyEnabled || !window.speechSynthesis) return;
+  speechSynthesis.cancel();   // a new reply interrupts the previous one
+  speechSynthesis.speak(new SpeechSynthesisUtterance(text));
+}
+
+(function wireHmChat() {
+  const btn = document.getElementById('hm-chat-toggle');
+  if (btn) btn.onclick = hmChatToggle;
+  const send = document.getElementById('hm-chat-send');
+  if (send) send.onclick = hmChatSubmit;
+  const clear = document.getElementById('hm-chat-clear');
+  if (clear) clear.onclick = hmChatClearLog;
+  const close = document.getElementById('hm-chat-close');
+  if (close) close.onclick = hmChatClose;
+  const input = document.getElementById('hm-chat-input');
+  if (input) input.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); hmChatSubmit(); }
+  });
+  const root = document.getElementById('hm-chat');
+  // Non-modal, so Esc is handled on the dialog itself (not the global modal
+  // chain): it only closes when focus is inside the dialog.
+  if (root) root.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') { e.stopPropagation(); hmChatClose(); }
+  });
+})();
+
+// Ctrl+Shift+H toggles the dialog from anywhere, terminals included.
+document.addEventListener('keydown', (e) => {
+  if (!(e.ctrlKey && e.shiftKey && !e.altKey && !e.metaKey && e.code === 'KeyH')) return;
+  e.preventDefault();
+  e.stopImmediatePropagation();
+  hmChatToggle();
+}, true);
 
 // ---------------------------------------------------------------------------
 // Image drop / paste helpers
@@ -1859,6 +2255,11 @@ function initChatUI(pane, body) {
   const topic = document.createElement('div');
   topic.className = 'chat-topic';
   filters.appendChild(topic);
+
+  // The thread's caption (last real prompt sent) sits left-aligned after the
+  // topic — the element is created in createPane so setPaneCaption can run
+  // before this bar exists.
+  filters.appendChild(pane.caption);
 
   // History picker: a dropdown of this thread's past conversations. The button
   // toggles a menu (populated on open via api.transcript.listSessions); picking
@@ -3220,6 +3621,9 @@ function sendChatMessage(pane) {
   const raw = c.input.value.replace(/\r\n?/g, '\n');
   let text = raw.trim();
   if (!text && !c.attachments.length) return;
+  // Learn from fixes the user made to dictated text before sending (covers
+  // both the command path below and ordinary messages).
+  voiceLearnHarvest(c.input, text);
   // A message addressed to Hivemind itself ("Hivemind, open a new thread…")
   // is an app command — run it instead of sending it to the thread. Anything
   // starting with the wake word is consumed (unrecognized commands toast an
@@ -3457,7 +3861,7 @@ const $ = (id) => document.getElementById(id);
 
 // -- Sidebar resizing -------------------------------------------------------
 // Drag the divider between the sidebar and the workspace to set the sidebar
-// width; the docked Explorer/Git/Plan panels resize with it. Width is clamped
+// width; the docked Explorer/Git/Todo panels resize with it. Width is clamped
 // to the CSS min/max and remembered across restarts. Double-click resets it.
 const SIDEBAR_W_MIN = 180;
 const SIDEBAR_W_MAX = 600;
@@ -3536,7 +3940,10 @@ function serializeLayout(boardId) {
       planId: p.planId || undefined, // stable per-thread key for ⟳-requested plans
       planFile: (p.plan && p.plan.file) || undefined,     // last known plan file (plan review)
       planSource: (p.plan && p.plan.source) || undefined, // 'native' | 'hivemind'
-      sessionId: p.sessionId || undefined, // this thread's Claude session (resume-on-start)
+      // This thread's Claude session (resume-on-start). Only once the session
+      // file exists — fresh threads pre-generate an id for --session-id, and
+      // resuming an id claude never wrote dies with "No conversation found".
+      sessionId: (p.sessionBound && p.sessionId) || undefined,
       view: p.view, chatFilters: p.chatFilters,
     })),
   })).filter((c) => c.panes.length);
@@ -3726,7 +4133,6 @@ function selectBoard(id) {
   if (typeof gitOnBoardChange === 'function') gitOnBoardChange();
   if (typeof filesToggle !== 'undefined' && filesToggle) filesToggle.disabled = false;
   if (typeof filesOnBoardChange === 'function') filesOnBoardChange();
-  if (typeof planToggle !== 'undefined' && planToggle) planToggle.disabled = false;
   if (typeof todoToggle !== 'undefined' && todoToggle) todoToggle.disabled = false;
   if (typeof todoOnBoardChange === 'function') todoOnBoardChange();
   if (typeof historyToggle !== 'undefined' && historyToggle) historyToggle.disabled = false;
@@ -3802,12 +4208,10 @@ function toggleZoom(pane) {
   focusPane(pane);
 }
 
-// The short label a thread shows in its header: the caption once an auto-named
-// thread has one, otherwise its (possibly manual) name.
+// The short label a thread shows in its header, tabs, and command toasts: its
+// name ("Leo") — the caption lives in the chat top bar, not the label.
 function paneLabel(pane) {
-  const cap = (pane.captionText || '').trim();
-  if (pane.autoName && cap) return cap;
-  return pane.name || 'thread';
+  return pane.name || (pane.captionText || '').trim() || 'thread';
 }
 
 // Build the tab strip shown above a maximized thread. One tab per thread on the
@@ -3913,6 +4317,24 @@ function startDrag(e, kind, boardId, index, subIndex) {
 // ---------------------------------------------------------------------------
 // Panes / terminals
 // ---------------------------------------------------------------------------
+
+// Every new thread gets a short random name ("Leo", "Nina") so Hivemind
+// commands can address it — "tell Leo to…", "run the tests in Leo". Names are
+// unique per hive; if the pool ever runs dry the old "<cmd> N" numbering
+// takes over.
+const PANE_NAMES = [
+  'Leo', 'Nina', 'Ivy', 'Max', 'Ruby', 'Finn', 'Cleo', 'Zoe', 'Ace', 'Juno',
+  'Milo', 'Kai', 'Nova', 'Remy', 'Sage', 'Otis', 'Wren', 'Enzo', 'Lila', 'Theo',
+  'Gus', 'Iris', 'Jax', 'Luna', 'Moss', 'Nico', 'Opal', 'Pax', 'Rio', 'Skye',
+  'Tess', 'Uma', 'Vera', 'Ash', 'Beau', 'Cora', 'Dax', 'Elle', 'Faye', 'Gwen',
+  'Hugo', 'Kit', 'Mara', 'Nell', 'Pip', 'Quin', 'Rex', 'Suki', 'Tobi', 'Yara',
+];
+function pickPaneName(board) {
+  const used = new Set(boardPanes(board).map((p) => (p.name || '').trim().toLowerCase()));
+  const free = PANE_NAMES.filter((n) => !used.has(n.toLowerCase()));
+  return free.length ? free[Math.floor(Math.random() * free.length)] : null;
+}
+
 function addTerminal(board, opts = {}) {
   const g = grids.get(board.id);
   if (!g) return;
@@ -3932,11 +4354,18 @@ function addTerminal(board, opts = {}) {
   }
 
   if (!opts.name) {
-    board._seq = (board._seq || 0) + 1;
-    const baseCmd = (opts.agent && opts.agent !== 'claude')
-      ? agentFor(opts.agent).command
-      : (board.startupCommand || 'claude');
-    opts = Object.assign({ name: `${baseCmd} ${board._seq}`, autoName: true }, opts);
+    const nick = pickPaneName(board);
+    if (nick) {
+      // Not autoName: the name is how you address the thread, so it stays put
+      // across agent switches and never gives way to the caption.
+      opts = Object.assign({ name: nick }, opts);
+    } else {
+      board._seq = (board._seq || 0) + 1;
+      const baseCmd = (opts.agent && opts.agent !== 'claude')
+        ? agentFor(opts.agent).command
+        : (board.startupCommand || 'claude');
+      opts = Object.assign({ name: `${baseCmd} ${board._seq}`, autoName: true }, opts);
+    }
   }
   const pane = createPane(board, col, opts);
   col.panes.push(pane);
@@ -3968,6 +4397,10 @@ function spawnPanePty(pane, { resume, initialPrompt } = {}) {
   if (pane.agent === 'claude') {
     if (isSessionId(resume)) pane.sessionId = resume;
     else pane.sessionId = resume ? null : newSessionId();
+    // Resuming a known id means the session file exists on disk; a fresh (or
+    // --continue) spawn hasn't created one yet — transcript entries arriving
+    // (onEntries) flip this on once claude writes it.
+    pane.sessionBound = isSessionId(resume);
   }
   window.api.spawnPty({
     id: pane.id,
@@ -4031,15 +4464,16 @@ function createPane(board, col, opts = {}) {
   title.textContent = startName;
   title.title = 'Double-click to rename this thread';
 
-  // Caption — a short summary of the last prompt sent to this thread, so the
-  // header tells you at a glance what the thread is working on.
+  // Caption — a short summary of the last prompt sent to this thread, so you
+  // can see what it's working on at a glance. Lives in the chat view's top
+  // bar (left of 🕘 History, appended there in initChatUI), not the header —
+  // the header title is the thread's name.
   const caption = document.createElement('span');
-  caption.className = 'caption';
+  caption.className = 'chat-caption';
 
-  // Name + caption share the left of the header; the caption ellipsizes.
   const titleWrap = document.createElement('span');
   titleWrap.className = 'title-wrap';
-  titleWrap.append(title, caption);
+  titleWrap.append(title);
 
   const fontDownBtn = document.createElement('button');
   fontDownBtn.className = 'font-btn';
@@ -4193,7 +4627,11 @@ function createPane(board, col, opts = {}) {
     // get a generated UUID passed as --session-id; resumes reuse the old id)
     // and updated whenever the transcript binder reports the bound file — so
     // it survives /clear rollovers and app restarts (it's saved in the layout).
+    // sessionBound: the session file has been seen on disk (bound, or spawned
+    // as a resume of it) — claude only creates it on the first message, so an
+    // unbound sessionId must not be `--resume`d.
     sessionId: isSessionId(opts.sessionId) ? opts.sessionId : null,
+    sessionBound: false,
 
     // Chat wrapper: which layer is on top ('chat' | 'term'), what the chat view
     // shows, and its live render state (built in initChatUI).
@@ -4203,13 +4641,13 @@ function createPane(board, col, opts = {}) {
     chatFilters: Object.assign(globalChatFilters(), opts.chatFilters || {}),
     chat: null,
 
-    // Auto names ("claude 1") give way to the caption once the thread has one;
-    // a manual rename (autoName=false) always stays visible.
+    // Legacy flag: pre-nickname layouts auto-named threads "claude 1" and let
+    // the running command rename them on agent switches. New threads always
+    // arrive with a name (random nickname), so this is false for them.
     autoName: opts.autoName !== undefined ? !!opts.autoName : !opts.name,
   };
 
   if (opts.caption) setPaneCaption(pane, opts.caption, { persist: false });
-  updateTitleVisibility(pane);
   paintPermSelect(pane);
   initChatUI(pane, body);
 
@@ -4218,9 +4656,7 @@ function createPane(board, col, opts = {}) {
   el.addEventListener('mousedown', (e) => focusPane(pane, e));
 
   // Double-click the title to rename the thread (single click still focuses).
-  // The caption is wired too, since it replaces the name once the thread is titled.
   title.addEventListener('dblclick', (e) => { e.stopPropagation(); beginRename(pane); });
-  caption.addEventListener('dblclick', (e) => { e.stopPropagation(); beginRename(pane); });
 
   // Zoom / maximize.
   zoomBtn.addEventListener('mousedown', (e) => e.stopPropagation());
@@ -4386,7 +4822,7 @@ function beginRename(pane) {
     if (v) { pane.name = v; pane.autoName = false; }
     span.textContent = pane.name;
     input.replaceWith(span);
-    updateTitleVisibility(pane);
+    refreshZoomTabs(pane.board.id);
     persistLayout(pane.board.id);
   };
   input.addEventListener('keydown', (e) => {
@@ -4588,6 +5024,11 @@ function renderPaneCost(pane) {
 window.api.transcript.onEntries(({ paneId, entries, backfill }) => {
   const pane = findPane(paneId);
   if (!pane || pane.disposed) return;
+  // Entries can only come from a session file that exists on disk — the
+  // 'bound' status alone doesn't prove that (a deterministic bind claims the
+  // file before claude creates it), and `--resume` of a never-written session
+  // dies with "No conversation found".
+  if (pane.agent === 'claude' && entries && entries.length) pane.sessionBound = true;
   try { planScanEntries(pane, entries || [], !!backfill); } catch (_) { /* never block the chat */ }
   chatIngest(pane, entries || [], !!backfill);
   if (pane.agent === 'claude') {
@@ -4605,6 +5046,9 @@ window.api.transcript.onStatus(({ paneId, status, file }) => {
   // session in the directory happens to be the most recent. Claude only:
   // codex rollout filenames also end in a uuid, but it isn't resumable here.
   if (pane.agent === 'claude' && status === 'bound' && typeof file === 'string') {
+    // NOTE: 'bound' does NOT mean the file exists — a deterministic bind
+    // claims it before claude creates it. sessionBound is set by onEntries
+    // (entries prove the file is real) instead.
     const sid = (/([0-9a-f-]{36})\.jsonl$/i.exec(file) || [])[1];
     if (isSessionId(sid) && sid !== pane.sessionId) {
       pane.sessionId = sid;
@@ -4747,10 +5191,6 @@ function showEmpty() {
     filesToggle.classList.remove('active');
   }
   if (typeof filesPanel !== 'undefined' && filesPanel) filesPanel.classList.add('hidden');
-  if (typeof planToggle !== 'undefined' && planToggle) {
-    planToggle.disabled = true;
-    planToggle.classList.remove('active');
-  }
   if (typeof planOpen === 'function' && planOpen()) closePlanReview();
   if (typeof todoToggle !== 'undefined' && todoToggle) {
     todoToggle.disabled = true;
@@ -4991,6 +5431,7 @@ function setGitOpen(open) {
   if (open && typeof setFilesOpen === 'function') setFilesOpen(false); // one panel at a time
   if (open && typeof setTodoOpen === 'function') setTodoOpen(false);
   if (open && typeof setHistoryOpen === 'function') setHistoryOpen(false);
+  if (open && typeof setHmChatOpen === 'function') setHmChatOpen(false);
   gitPanel.classList.toggle('hidden', !open);
   gitToggle.classList.toggle('active', open);
   sidebarEl.classList.toggle('git-open', open); // board list yields its space
@@ -5479,6 +5920,7 @@ function setFilesOpen(open) {
   if (open) setGitOpen(false); // one panel at a time
   if (open && typeof setTodoOpen === 'function') setTodoOpen(false);
   if (open && typeof setHistoryOpen === 'function') setHistoryOpen(false);
+  if (open && typeof setHmChatOpen === 'function') setHmChatOpen(false);
   filesPanel.classList.toggle('hidden', !open);
   filesToggle.classList.toggle('active', open);
   sidebarEl.classList.toggle('files-open', open); // board list yields its space
@@ -5720,6 +6162,7 @@ function setTodoOpen(open) {
     setGitOpen(false);
     setFilesOpen(false);
     if (typeof setHistoryOpen === 'function') setHistoryOpen(false);
+    if (typeof setHmChatOpen === 'function') setHmChatOpen(false);
   }
   todoPanel.classList.toggle('hidden', !open);
   todoToggle.classList.toggle('active', open);
@@ -6103,6 +6546,7 @@ function setHistoryOpen(open) {
     setGitOpen(false);
     setFilesOpen(false);
     setTodoOpen(false);
+    setHmChatOpen(false);
   }
   historyPanel.classList.toggle('hidden', !open);
   historyToggle.classList.toggle('active', open);
@@ -6302,7 +6746,6 @@ async function recordPromptHistory(text, agent) {
 // keyed to the quoted text so they re-anchor on every re-render), and
 // "Request changes" sends the comments back so the thread can revise.
 // ---------------------------------------------------------------------------
-const planToggle = $('plan-toggle');
 const planBackdrop = $('plan-backdrop');
 const planModal = $('plan-modal');
 const planDocStatus = $('plan-doc-status');
@@ -6596,7 +7039,6 @@ function closePlanReview() {
   planPendingSel = null;
 }
 
-planToggle.onclick = () => openPlanReview(focusedPane);
 $('plan-doc-close').onclick = () => closePlanReview();
 $('plan-doc-request').onclick = () => requestPlanFromThread();
 $('plan-doc-copy').onclick = async () => {
@@ -7291,6 +7733,8 @@ branchBackdrop.addEventListener('mousedown', (e) => { if (e.target === branchBac
 
 document.addEventListener('keydown', (e) => {
   if (e.key !== 'Escape') return;
+  // Training stacks above Settings — close it first.
+  if (voiceTrainIsOpen()) { closeVoiceTraining(); return; }
   if (!planBackdrop.classList.contains('hidden')) closePlanReview();
   else if (!diffBackdrop.classList.contains('hidden')) diffBackdrop.classList.add('hidden');
   else if (!branchBackdrop.classList.contains('hidden')) branchBackdrop.classList.add('hidden');
@@ -7601,6 +8045,7 @@ let voiceDict = loadVoiceDict();
 let voiceHotkeyEnabled = localStorage.getItem('hm.voiceHotkey') !== '0';   // default on
 let voiceAutoEnter = localStorage.getItem('hm.voiceAutoEnter') === '1';    // default off
 let voiceAutoSpace = localStorage.getItem('hm.voiceAutoSpace') !== '0';    // default on
+let voiceReplyEnabled = localStorage.getItem('hm.voiceReply') === '1';     // spoken replies in Chat with Hivemind — default off
 
 // Speech-to-text model registry. Each entry is a transformers.js ASR model
 // served offline over hm://models (see voice-worker.js). The first is bundled;
@@ -7628,6 +8073,7 @@ const VOICE_ENTER_RE = /^\s*(new ?line|press enter|hit enter|submit|send it)\s*[
 // -- Engine state ------------------------------------------------------------
 let voiceActive = false;        // the user wants to be listening
 let voiceTargetPane = null;     // pane that receives this dictation session
+let voiceTargetHmChat = false;  // dictation goes to the Chat with Hivemind dialog instead of a pane
 
 // Speech (Moonshine) worker + its load lifecycle. The worker is created lazily on first
 // use and kept alive after that, so the model only loads once per app run.
@@ -7689,6 +8135,173 @@ function applyVoiceDict(text) {
   return out.replace(/ {2,}/g, ' ').trim();
 }
 
+// -- Correction learning -----------------------------------------------------
+// When dictation lands in a composer and the user fixes it up before sending,
+// the fix is better dictionary material than anything they'd think to add by
+// hand. Each dictated utterance is remembered per input element; on send the
+// dictated words are diffed against what was actually sent, and a substitution
+// seen VOICE_LEARN_MIN_SEEN times triggers a one-click "add to dictionary?"
+// offer above the command toast. Candidate counts persist in localStorage so
+// the repeat occurrence can be days later. Terminal-bound dictation is typed
+// straight into the TUI with no edit window, so only the chat composer and the
+// Chat with Hivemind input feed this.
+const VOICE_LEARN_KEY = 'hm.voiceLearn';
+const VOICE_LEARN_MIN_SEEN = 2;    // offer once the same fix is seen this often
+const VOICE_LEARN_MAX_PAIRS = 100; // stored candidates (oldest pruned beyond this)
+const VOICE_LEARN_MAX_UTTER = 8;   // dictated utterances remembered per composer
+const VOICE_LEARN_MAX_RUN = 3;     // longest phrase (words) either side of a fix
+
+const voiceLearnBuffers = new WeakMap(); // input element → dictated strings awaiting send
+
+function loadVoiceLearn() {
+  try {
+    const raw = JSON.parse(localStorage.getItem(VOICE_LEARN_KEY) || '{}');
+    if (raw && typeof raw === 'object' && !Array.isArray(raw)) return raw;
+  } catch (_) { /* corrupt/absent — start fresh */ }
+  return {};
+}
+let voiceLearn = loadVoiceLearn();
+
+function saveVoiceLearn() {
+  // Insertion order ≈ age; drop the oldest candidates once over the cap.
+  const keys = Object.keys(voiceLearn);
+  for (let i = 0; i < keys.length - VOICE_LEARN_MAX_PAIRS; i++) delete voiceLearn[keys[i]];
+  try { localStorage.setItem(VOICE_LEARN_KEY, JSON.stringify(voiceLearn)); } catch (_) { /* quota */ }
+}
+
+function vlPairKey(from, to) { return from.toLowerCase() + '\u0000' + to.toLowerCase(); }
+
+function voiceLearnRecord(inputEl, text) {
+  if (!inputEl || !text) return;
+  let buf = voiceLearnBuffers.get(inputEl);
+  if (!buf) voiceLearnBuffers.set(inputEl, (buf = []));
+  buf.push(text);
+  if (buf.length > VOICE_LEARN_MAX_UTTER) buf.shift();
+}
+
+// Tokens compare case-insensitively with edge punctuation stripped, so adding
+// a comma or capitalizing a word doesn't read as a correction.
+function vlTokens(text) {
+  return String(text).split(/\s+/).filter(Boolean).map((w) => ({
+    raw: w.replace(/^[^a-zA-Z0-9]+|[^a-zA-Z0-9]+$/g, ''),
+    norm: w.toLowerCase().replace(/^[^a-z0-9]+|[^a-z0-9]+$/g, ''),
+  }));
+}
+
+// Word-level diff (LCS): matched-token anchors plus runs where tokens on one
+// side were *replaced* by tokens on the other. Pure insertions and deletions
+// are ignored — only swaps are dictionary material. The anchor count doubles
+// as a similarity measure (used by dictionary training).
+function vlAlign(A, B) {
+  const n = A.length, m = B.length;
+  if (!n || !m || n > 200 || m > 200) return { anchors: [], subs: [] };
+  const dp = Array.from({ length: n + 1 }, () => new Uint16Array(m + 1));
+  for (let i = n - 1; i >= 0; i--) {
+    for (let j = m - 1; j >= 0; j--) {
+      dp[i][j] = A[i].norm && A[i].norm === B[j].norm
+        ? dp[i + 1][j + 1] + 1
+        : Math.max(dp[i + 1][j], dp[i][j + 1]);
+    }
+  }
+  // Walk the LCS path collecting matched pairs; a virtual end anchor closes a
+  // trailing gap so a fix at the end of the message still counts.
+  const anchors = [];
+  let i = 0, j = 0;
+  while (i < n && j < m) {
+    if (A[i].norm && A[i].norm === B[j].norm) { anchors.push([i, j]); i++; j++; }
+    else if (dp[i + 1][j] >= dp[i][j + 1]) i++;
+    else j++;
+  }
+  const subs = [];
+  let pi = 0, pj = 0;
+  for (const [ai, aj] of anchors.concat([[n, m]])) {
+    if (ai > pi && aj > pj) subs.push({ from: A.slice(pi, ai), to: B.slice(pj, aj) });
+    pi = ai + 1; pj = aj + 1;
+  }
+  return { anchors, subs };
+}
+
+function vlSubstitutions(A, B) { return vlAlign(A, B).subs; }
+
+// Called on send with the input the dictation went into and the text that was
+// actually sent. Diffs, counts, and maybe raises the suggestion popup.
+function voiceLearnHarvest(inputEl, sentText) {
+  const buf = inputEl && voiceLearnBuffers.get(inputEl);
+  if (buf) voiceLearnBuffers.delete(inputEl);
+  if (!buf || !buf.length) return;
+  const dictated = buf.join(' ').trim();
+  const sent = String(sentText || '').trim();
+  if (!dictated || !sent || dictated === sent) return;
+  const subs = vlSubstitutions(vlTokens(dictated), vlTokens(sent));
+  let offer = null;
+  let changed = false;
+  for (const s of subs) {
+    if (s.from.length > VOICE_LEARN_MAX_RUN || s.to.length > VOICE_LEARN_MAX_RUN) continue;
+    const from = s.from.map((t) => t.norm).join(' ').trim();
+    const to = s.to.map((t) => t.raw).join(' ').trim();
+    // Too short/empty to be a phrase, no letters, or a case-only change —
+    // not worth a dictionary entry.
+    if (from.length < 3 || !to || !/[a-z]/.test(from)) continue;
+    if (from === to.toLowerCase()) continue;
+    const key = vlPairKey(from, to);
+    const entry = voiceLearn[key] || (voiceLearn[key] = { from, to, n: 0 });
+    entry.n++;
+    changed = true;
+    if (!offer && !entry.dismissed && entry.n >= VOICE_LEARN_MIN_SEEN
+        && !voiceDict.some((e) => e.from.toLowerCase() === from)) {
+      offer = entry;
+    }
+  }
+  if (changed) saveVoiceLearn();
+  if (offer) voiceSuggestShow(offer);
+}
+
+// -- Suggestion popup --------------------------------------------------------
+let voiceSuggestTimer = null;
+let voiceSuggestPair = null;
+
+function voiceSuggestShow(pair) {
+  const box = $('voice-suggest');
+  const label = $('voice-suggest-text');
+  if (!box || !label) return;
+  voiceSuggestPair = pair;
+  label.textContent = `You keep fixing “${pair.from}” to “${pair.to}” — add it to the voice dictionary?`;
+  box.classList.remove('hidden');
+  clearTimeout(voiceSuggestTimer);
+  // Auto-hide without dismissing: the pair stays pending and offers again on
+  // the next occurrence.
+  voiceSuggestTimer = setTimeout(voiceSuggestHide, 15000);
+}
+
+function voiceSuggestHide() {
+  clearTimeout(voiceSuggestTimer);
+  voiceSuggestTimer = null;
+  voiceSuggestPair = null;
+  const box = $('voice-suggest');
+  if (box) box.classList.add('hidden');
+}
+
+(function wireVoiceSuggest() {
+  const add = $('voice-suggest-add');
+  const no = $('voice-suggest-no');
+  if (add) add.onclick = () => {
+    const p = voiceSuggestPair;
+    if (!p) return;
+    upsertVoiceDict(p.from, p.to);
+    delete voiceLearn[vlPairKey(p.from, p.to)];
+    saveVoiceLearn();
+    voiceSuggestHide();
+    hmToast(`Added “${p.from} → ${p.to}” to the voice dictionary (⚙ Settings → Voice).`);
+  };
+  if (no) no.onclick = () => {
+    const p = voiceSuggestPair;
+    if (!p) return;
+    const entry = voiceLearn[vlPairKey(p.from, p.to)];
+    if (entry) { entry.dismissed = true; saveVoiceLearn(); }
+    voiceSuggestHide();
+  };
+})();
+
 // The pane dictation flows into: the one focused when voice started, falling
 // back to whatever is focused now if that one has gone away.
 function currentVoicePane() {
@@ -7703,6 +8316,18 @@ function currentVoicePane() {
 function commitVoiceText(raw) {
   const trimmed = (raw || '').trim();
   if (!trimmed) return;
+
+  // Training-bound dictation: while the training modal is open, raw
+  // transcripts feed the trainer. It must see the *pre-dictionary* text —
+  // what the model actually heard — so this runs before applyVoiceDict and
+  // every other routing rule. Live check, like the hmChat branch below.
+  if (voiceTrainIsOpen()) { voiceTrainCommit(trimmed); return; }
+
+  // Dialog-bound dictation: while the Chat with Hivemind dialog is the voice
+  // target, phrases land in its input instead of a thread. The check stays
+  // live (not snapshotted) so speech still buffered when voice toggles off is
+  // routed correctly as long as the dialog remains open.
+  if (voiceTargetHmChat && hmChatIsOpen()) { hmChatVoiceCommit(trimmed); return; }
 
   const pane = currentVoicePane();
   if (!pane) { flagVoiceError('No live thread to type into — click a thread and try again.'); return; }
@@ -7723,8 +8348,9 @@ function commitVoiceText(raw) {
   // A dictated utterance addressed to Hivemind ("Hivemind, open a new thread…")
   // runs as an app command instead of being typed into the thread. Anything
   // starting with the wake word is consumed (unrecognized phrasing toasts an
-  // error); mentioning Hivemind mid-sentence types as normal.
-  const hmCmd = matchHivemindCommand(text);
+  // error); mentioning Hivemind mid-sentence types as normal. Fuzzy matching
+  // covers misheard wake words ("half mine, open a thread").
+  const hmCmd = matchHivemindCommand(text, true);
   if (hmCmd !== null) { runHivemindCommand(hmCmd, pane); return; }
 
   // A dictated utterance starting with "todo" becomes a Todo-panel item
@@ -7741,6 +8367,9 @@ function commitVoiceText(raw) {
     chatInput.selectionStart = chatInput.selectionEnd = start + text.length;
     // Fire the composer's input handler (autosize + autocomplete refresh).
     chatInput.dispatchEvent(new Event('input', { bubbles: true }));
+    // Remember what was dictated so edits made before sending can be learned
+    // as dictionary corrections (harvested in sendChatMessage).
+    voiceLearnRecord(chatInput, text.trim());
   } else {
     sendToPane(pane, text);
   }
@@ -7826,6 +8455,10 @@ function bootSttWorker(entry) {
         // segment but made nothing of it. Say so briefly — silence here is
         // indistinguishable from the feature being broken.
         else if (!msg.error && voiceActive) flashVoiceNotice('Didn’t catch that — try again');
+        // A mic stop with this segment still transcribing deferred the chat
+        // send to here — fire it once the last in-flight result is committed.
+        if (hmChatSendOnStop && sttInFlight === 0) hmChatVoiceSend();
+        if (voiceTrainCheckOnStop && sttInFlight === 0) { voiceTrainCheckOnStop = false; voiceTrainCheck(); }
         renderVoiceListening();
       }
     };
@@ -8000,12 +8633,18 @@ function stopCapture() {
 // -- Public controls ---------------------------------------------------------
 async function startVoice() {
   if (voiceActive) return;
+  // The training modal takes dictation over everything; otherwise an open
+  // Chat with Hivemind dialog takes it in preference to a thread — the ~
+  // hotkey lands here while either is open.
+  const training = voiceTrainIsOpen();
+  voiceTargetHmChat = !training && hmChatIsOpen();
   const pane = focusedPane && !focusedPane.disposed && focusedPane.state !== 'dead' ? focusedPane : null;
-  if (!pane) { flagVoiceError('Open or click a thread first, then start voice typing.'); return; }
+  if (!pane && !voiceTargetHmChat && !training) { flagVoiceError('Open or click a thread first, then start voice typing.'); return; }
   voiceTargetPane = pane;
   voiceActive = true;
   sttInFlight = 0;
   sttPending = [];
+  hmChatSendOnStop = false;   // a fresh session voids any armed auto-send
   clearVoiceError();
   renderVoiceState();
   setVoiceHudText(sttReady ? 'Listening…' : 'Loading speech model… (you can start speaking)');
@@ -8024,11 +8663,13 @@ async function startVoice() {
     renderVoiceListening();
   } catch (err) {
     flagVoiceError(voiceErrMessage(err));
-    stopVoice();
+    // A mic/model failure shouldn't fire off whatever sits in the chat input.
+    stopVoice({ send: false });
   }
 }
 
-function stopVoice() {
+function stopVoice({ send = true } = {}) {
+  const wasActive = voiceActive;
   // Speech still buffered when the user toggles off is speech they said —
   // transcribe and type it rather than throw it away.
   if (vadInSpeech && sttReady && vadSpeechMs >= VAD_MIN_SPEECH_MS) flushSegment();
@@ -8037,6 +8678,18 @@ function stopVoice() {
   stopCapture();
   setVoiceHudText('');
   renderVoiceState();
+  // Chat dictation: stopping the mic sends the command. If a transcription is
+  // still in flight, arm the send and let the worker's result handler fire it.
+  if (send && wasActive && voiceTargetHmChat && hmChatIsOpen()) {
+    if (sttInFlight > 0) hmChatSendOnStop = true;
+    else hmChatVoiceSend();
+  }
+  // Training: stopping the mic checks the sentence, deferred the same way so
+  // the tail of what was read isn't cut off.
+  if (send && wasActive && voiceTrainIsOpen()) {
+    if (sttInFlight > 0) voiceTrainCheckOnStop = true;
+    else voiceTrainCheck();
+  }
 }
 
 function toggleVoice() { if (voiceActive) stopVoice(); else startVoice(); }
@@ -8066,12 +8719,15 @@ function voiceErrMessage(err) {
 // -- HUD / button state ------------------------------------------------------
 function renderVoiceState() {
   if (voiceToggleBtn) voiceToggleBtn.classList.toggle('listening', voiceActive);
+  voiceTrainSyncMic();
   if (!voiceHud) return;
   voiceHud.classList.toggle('hidden', !voiceActive);
   if (voiceActive) updateVoiceHudTarget();
 }
 function updateVoiceHudTarget() {
   if (!voiceHudTarget) return;
+  if (voiceTrainIsOpen()) { voiceHudTarget.textContent = '→ training'; return; }
+  if (voiceTargetHmChat) { voiceHudTarget.textContent = '→ Hivemind chat'; return; }
   const pane = currentVoicePane();
   voiceHudTarget.textContent = pane ? '→ ' + (pane.name || 'thread') : '→ (no thread)';
 }
@@ -8100,6 +8756,7 @@ function flashVoiceNotice(text) {
 function flagVoiceError(msg) {
   if (voiceToggleBtn) { voiceToggleBtn.classList.add('error'); voiceToggleBtn.title = msg; }
   setVoiceModalMsg(msg, 'err');
+  if (voiceTrainIsOpen()) voiceTrainSetMsg(msg, 'err');
   console.warn('[voice]', msg);
 }
 function clearVoiceError() {
@@ -8117,7 +8774,8 @@ document.addEventListener('keydown', (e) => {
   if (e.code !== 'Backquote' || e.ctrlKey || e.altKey || e.metaKey) return;
   const t = e.target;
   const isThreadInput = t && t.classList && (
-    t.classList.contains('xterm-helper-textarea') || t.classList.contains('chat-input')
+    t.classList.contains('xterm-helper-textarea') || t.classList.contains('chat-input') ||
+    t.classList.contains('hm-chat-input')   // dialog input: ~ toggles dictation there too
   );
   const editable = t && !isThreadInput && (
     t.isContentEditable ||
@@ -8135,6 +8793,7 @@ const voiceModalMsg = $('voice-modal-msg');
 const vHotkey = $('voice-hotkey-enabled');
 const vAutoEnter = $('voice-auto-enter');
 const vAutoSpace = $('voice-auto-space');
+const vReply = $('voice-reply-enabled');
 const vModel = $('voice-model');
 const vFrom = $('voice-dict-from');
 const vTo = $('voice-dict-to');
@@ -8168,15 +8827,21 @@ function renderVoiceDict() {
   });
 }
 
-function addVoiceDictEntry() {
-  const from = vFrom.value.trim();
-  const to = vTo.value.trim();
-  if (!from) { setVoiceModalMsg('Type the word or phrase voice keeps mishearing.', 'err'); vFrom.focus(); return; }
+// Add or replace a correction — shared by the Settings form and the learned-
+// correction suggestion popup.
+function upsertVoiceDict(from, to) {
   const idx = voiceDict.findIndex((e) => e.from.toLowerCase() === from.toLowerCase());
   if (idx >= 0) voiceDict[idx] = { from, to };
   else voiceDict.push({ from, to });
   saveVoiceDict();
   renderVoiceDict();
+}
+
+function addVoiceDictEntry() {
+  const from = vFrom.value.trim();
+  const to = vTo.value.trim();
+  if (!from) { setVoiceModalMsg('Type the word or phrase voice keeps mishearing.', 'err'); vFrom.focus(); return; }
+  upsertVoiceDict(from, to);
   vFrom.value = '';
   vTo.value = '';
   vFrom.focus();
@@ -8199,6 +8864,13 @@ function syncVoiceFields() {
   vHotkey.checked = voiceHotkeyEnabled;
   vAutoEnter.checked = voiceAutoEnter;
   vAutoSpace.checked = voiceAutoSpace;
+  if (vReply) {
+    vReply.checked = voiceReplyEnabled;
+    if (!window.speechSynthesis) {
+      vReply.disabled = true;
+      vReply.parentElement.title = 'Speech synthesis is not available in this build.';
+    }
+  }
   if (vModel) {
     if (!vModel.options.length) {
       for (const m of STT_MODELS) {
@@ -8270,6 +8942,372 @@ if (voiceToggleBtn) voiceToggleBtn.onclick = toggleVoice;
 const settingsBtn = $('settings-btn');
 if (settingsBtn) settingsBtn.onclick = () => openSettings('general');
 $('settings-close').onclick = closeSettings;
+
+// -- Voice dictionary training -----------------------------------------------
+// "Train dictionary" (Settings → Voice): short practice sentences built from
+// this hive's own prompt history are read aloud; the raw transcript — what the
+// model heard *before* the dictionary ran — is diffed against the target and
+// mismatched runs become proposed corrections the user accepts or skips one by
+// one. Routing lives in commitVoiceText; the deferred check mirrors
+// hmChatSendOnStop so the tail of a reading isn't cut off.
+
+const vtBackdrop = $('voice-train-backdrop');
+const vtSentenceEl = $('voice-train-sentence');
+const vtHeardEl = $('voice-train-heard');
+const vtCandsEl = $('voice-train-cands');
+const vtProgressEl = $('voice-train-progress');
+const vtMsgEl = $('voice-train-msg');
+const vtDoneEl = $('voice-train-done');
+const vtMicBtn = $('voice-train-mic');
+
+let voiceTrainState = null;        // { sentences, idx, added, heardSegs, phase: 'listen'|'review'|'done' }
+let voiceTrainCheckOnStop = false; // mic stopped mid-transcription — check when the result lands
+
+// Everyday words that don't mark a prompt as project vocabulary. Anything the
+// speech model handles fine already — the point is to surface the unusual.
+const VT_COMMON_WORDS = new Set(('the a an and or but of in on at to for with from into onto over under about after before ' +
+  'again more most some any all each every no not only just also very too so than then when where while which what who whom ' +
+  'whose why how this that these those there here it its it\'s is are was were be been being am do does did done doing have ' +
+  'has had having will would shall should can could may might must let lets get gets got getting go goes going gone come ' +
+  'comes came make makes made making take takes took taken use uses used using see sees saw seen look looks looked looking ' +
+  'want wants wanted need needs needed like likes liked work works worked working try tries tried trying keep keeps kept ' +
+  'put puts say says said tell tells told know knows knew think thinks thought find finds found give gives gave show shows ' +
+  'showed add adds added remove removes removed delete deletes deleted change changes changed fix fixes fixed update updates ' +
+  'updated create creates created open opens opened close closes closed move moves moved run runs ran running start starts ' +
+  'started stop stops stopped check checks checked test tests tested build builds built write writes wrote read reads new ' +
+  'old good bad big small long short high low first last next same other another back down up out off please thanks yes ' +
+  'now never always often sometimes right left top bottom side both few many much little own able sure still yet ever ' +
+  'instead rather really actually maybe perhaps around between through during without within across behind above below ' +
+  'if else because since until unless once twice one two three four five six seven eight nine ten they them their we us ' +
+  'our you your i me my he him his she her mine yours something anything nothing everything someone anyone everyone ' +
+  'thing things way ways time times day days part parts number list item items text line lines word words name names ' +
+  'file files code page user users button click clicks type types set sets end top bit lot kind sort case point').split(/\s+/));
+
+const VT_STOPWORDS = new Set(['the', 'a', 'an', 'to', 'and', 'or', 'of', 'in', 'on', 'at', 'it', 'is', 'are', 'was', 'be',
+  'i', 'you', 'we', 'that', 'this', 'for', 'with', 'as', 'by', 'do', 'my', 'me', 'so', 'no', 'not']);
+
+function voiceTrainIsOpen() {
+  return !!(vtBackdrop && !vtBackdrop.classList.contains('hidden'));
+}
+
+function voiceTrainSetMsg(text, kind) {
+  if (!vtMsgEl) return;
+  vtMsgEl.textContent = text || '';
+  vtMsgEl.className = 'voice-msg' + (kind ? ' ' + kind : '');
+  vtMsgEl.classList.toggle('hidden', !text);
+}
+
+// Mirror the mic state on the modal's big toggle (called from renderVoiceState).
+function voiceTrainSyncMic() {
+  if (!vtMicBtn || !voiceTrainIsOpen()) return;
+  vtMicBtn.classList.toggle('listening', voiceActive);
+  vtMicBtn.textContent = voiceActive ? '🎤 Listening — click (or ~) to stop & check' : '🎤 Start reading';
+  voiceTrainRenderHeard();
+}
+
+// Distinctive-term mining: project vocabulary the speech model likely trips
+// on — identifiers, filenames, product names, uncommon words. Ranked by how
+// often (then how recently) they appear across the history.
+function vtExtractTerms(entries) {
+  const stats = new Map(); // lowercased term -> { forms: Map, count, last }
+  const bump = (surface, weight, last) => {
+    const lower = surface.toLowerCase();
+    let s = stats.get(lower);
+    if (!s) stats.set(lower, (s = { forms: new Map(), count: 0, last: -1 }));
+    s.count += weight;
+    s.last = Math.max(s.last, last);
+    s.forms.set(surface, (s.forms.get(surface) || 0) + weight);
+  };
+  entries.forEach((en, idx) => {
+    for (let w of String(en && en.text || '').split(/\s+/)) {
+      w = w.replace(/^[^A-Za-z0-9]+|[^A-Za-z0-9]+$/g, '');
+      if (w.length < 2 || w.length > 24) continue;
+      if (/:\/\//.test(w) || /[/\\]/.test(w) || /^\d+$/.test(w)) continue;
+      const lower = w.toLowerCase();
+      const distinctive =
+        /[a-z][A-Z]/.test(w) ||                        // camelCase / mixed case
+        /[A-Za-z0-9][_-][A-Za-z0-9]/.test(w) ||        // snake_case / kebab-case
+        /^[\w-]+\.[A-Za-z0-9]{1,5}$/.test(w) ||        // dotted filename (renderer.js)
+        /^[A-Z]{2,5}$/.test(w) ||                      // acronym (STT, VAD)
+        (/^[A-Z][a-z]+$/.test(w) && !VT_COMMON_WORDS.has(lower)) ||   // product name
+        (/^[a-z]+$/.test(w) && w.length >= 4 && /[aeiouy]/.test(w) && !VT_COMMON_WORDS.has(lower));
+      if (distinctive) bump(w, 1, idx);
+    }
+  });
+  // Dictionary targets are proven trouble words — always worth practicing.
+  for (const e of voiceDict) {
+    if (e.to && e.to.trim()) bump(e.to.trim(), 3, entries.length);
+  }
+  if (!stats.size) for (const t of ['Hivemind', 'Claude Code', 'GitHub']) bump(t, 1, 0);
+  return [...stats.values()]
+    .sort((a, b) => b.count - a.count || b.last - a.last)
+    .map((s) => [...s.forms.entries()].sort((a, b) => b[1] - a[1])[0][0]);
+}
+
+// Short template sentences packed with the ranked terms, consuming the list
+// without reuse until it runs dry.
+function vtGenerateSentences(terms, n) {
+  const templates = [
+    (a, b) => `Open ${a} and check ${b}.`,
+    (a, b) => `Update ${a} in ${b}.`,
+    (a, b) => `Add a test for ${a} in ${b}.`,
+    (a, b) => `Fix the bug in ${a} near ${b}.`,
+    (a, b, c) => `Rename ${a} to ${b} and run ${c}.`,
+    (a, b) => `Search ${a} for ${b}.`,
+    (a, b) => `Show me ${a} before changing ${b}.`,
+  ];
+  const out = [];
+  let i = 0;
+  const next = () => terms.length ? terms[i++ % terms.length] : null;
+  for (let t = 0; out.length < n && terms.length; t++) {
+    const tpl = templates[t % templates.length];
+    const slots = Array.from({ length: tpl.length }, next);
+    if (slots.some((s) => !s)) break;
+    out.push(tpl(...slots));
+    if (i >= terms.length && out.length >= Math.min(n, Math.ceil(terms.length / 2))) break;
+  }
+  return out;
+}
+
+// Past prompts that read naturally aloud: short, single-line, prose-like.
+// Longer prompts contribute their first sentence when that alone qualifies.
+function vtPickPrompts(entries, n, terms) {
+  const termSet = new Set(terms.map((t) => t.toLowerCase()));
+  const readable = (text) => {
+    if (!text || /\n/.test(text) || /[`]/.test(text) || /:\/\//.test(text)) return false;
+    const words = text.split(/\s+/).filter(Boolean);
+    if (words.length < 4 || words.length > 14 || text.length > 90) return false;
+    const alpha = words.filter((w) => /^[A-Za-z][A-Za-z'’]*[.,!?]?$/.test(w)).length;
+    if (alpha / words.length < 0.7) return false;
+    if (words.filter((w) => /[/\\]|[^\x20-\x7E]/.test(w)).length > 1) return false;
+    return true;
+  };
+  const seen = new Set();
+  const withTerm = [], plain = [];
+  for (const en of entries.slice().reverse()) {   // newest first
+    let text = String(en && en.text || '').trim();
+    if (!readable(text)) {
+      const first = text.split(/(?<=[.!?])\s+/)[0];
+      if (first && first !== text && readable(first)) text = first;
+      else continue;
+    }
+    const key = text.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    const hasTerm = text.split(/\s+/).some((w) => termSet.has(w.replace(/^[^A-Za-z0-9]+|[^A-Za-z0-9]+$/g, '').toLowerCase()));
+    (hasTerm ? withTerm : plain).push(text);
+  }
+  return withTerm.concat(plain).slice(0, n);
+}
+
+// A session: ~10 sentences alternating generated / verbatim, from whatever
+// material the hive's history offers (fallback seed terms guarantee at least one).
+async function vtBuildSession() {
+  const TARGET = 10;
+  let entries = [];
+  const dir = activeDir();
+  if (dir && window.api.promptHistory) {
+    try {
+      const res = await window.api.promptHistory.read(dir);
+      entries = (res && res.ok && Array.isArray(res.entries)) ? res.entries : [];
+    } catch (_) { entries = []; }
+  }
+  const terms = vtExtractTerms(entries);
+  const gen = vtGenerateSentences(terms, Math.ceil(TARGET / 2));
+  const verb = vtPickPrompts(entries, TARGET, terms);
+  const sentences = [];
+  for (let i = 0; sentences.length < TARGET && (i < gen.length || i < verb.length); i++) {
+    if (i < gen.length) sentences.push(gen[i]);
+    if (sentences.length < TARGET && i < verb.length) sentences.push(verb[i]);
+  }
+  return {
+    sentences,
+    idx: 0,
+    added: 0,
+    heardSegs: [],
+    phase: 'listen',
+  };
+}
+
+function voiceTrainRenderHeard() {
+  if (!vtHeardEl || !voiceTrainState) return;
+  const heard = voiceTrainState.heardSegs.join(' ');
+  vtHeardEl.classList.toggle('vt-heard-empty', !heard);
+  vtHeardEl.textContent = heard
+    || (voiceActive ? 'Listening — read the sentence aloud…' : 'Mic is off — click Start reading.');
+}
+
+function voiceTrainRender() {
+  const st = voiceTrainState;
+  if (!st || !vtBackdrop) return;
+  const done = st.phase === 'done';
+  if (vtProgressEl) vtProgressEl.textContent = done ? '' : `Sentence ${st.idx + 1} / ${st.sentences.length}`;
+  if (vtSentenceEl) vtSentenceEl.textContent = done ? '' : st.sentences[st.idx];
+  $('voice-train-read').classList.toggle('hidden', done);
+  vtDoneEl.classList.toggle('hidden', !done);
+  if (done) $('voice-train-done-text').textContent = st.added
+    ? `Added ${st.added} correction${st.added === 1 ? '' : 's'} to the voice dictionary.`
+    : 'No new corrections needed — the dictionary already covers how you speak.';
+  $('voice-train-check').classList.toggle('hidden', st.phase !== 'listen');
+  $('voice-train-next').classList.toggle('hidden', st.phase !== 'review');
+  $('voice-train-retry').classList.toggle('hidden', done);
+  $('voice-train-skip').classList.toggle('hidden', done);
+  if (st.phase === 'listen' && vtCandsEl) vtCandsEl.innerHTML = '';
+  voiceTrainSyncMic();
+  voiceTrainRenderHeard();
+}
+
+// A VAD segment's transcript landed while the modal is open (see commitVoiceText).
+function voiceTrainCommit(trimmed) {
+  const st = voiceTrainState;
+  if (!st || st.phase !== 'listen') return;   // ignore chatter during review/done
+  st.heardSegs.push(trimmed);
+  voiceTrainRenderHeard();
+}
+
+// Diff what was heard against the target sentence and propose corrections.
+function voiceTrainCheck() {
+  const st = voiceTrainState;
+  if (!st || st.phase !== 'listen' || !voiceTrainIsOpen()) return;
+  const target = st.sentences[st.idx];
+  const heard = st.heardSegs.join(' ').trim();
+  if (!heard) { voiceTrainSetMsg('Didn’t catch anything — read the sentence, then press Check.', 'err'); return; }
+
+  const A = vlTokens(heard), B = vlTokens(target);
+  const { anchors, subs } = vlAlign(A, B);
+  const sim = (2 * anchors.length) / (A.length + B.length);
+  if (sim < 0.45) {
+    voiceTrainSetMsg('That didn’t sound like the sentence — press Retry and read it again, or Skip it.', 'err');
+    return;
+  }
+
+  const normEq = (x, y) => x.map((t) => t.norm).join(' ') === y.map((t) => t.norm).join(' ');
+  if (normEq(A, B) || normEq(vlTokens(applyVoiceDict(heard)), B)) {
+    st.phase = 'review';
+    voiceTrainSetMsg('Perfect — your dictionary already handles this one.', 'ok');
+    voiceTrainRender();
+    return;
+  }
+
+  // Substitution runs → candidate entries, filtered like voiceLearnHarvest.
+  const cands = [];
+  for (const s of subs) {
+    if (s.from.length > VOICE_LEARN_MAX_RUN || s.to.length > VOICE_LEARN_MAX_RUN) continue;
+    const from = s.from.map((t) => t.norm).join(' ').trim();
+    const to = s.to.map((t) => t.raw).join(' ').trim();
+    if (from.length < 3 || !to || !/[a-z]/.test(from)) continue;
+    if (VT_STOPWORDS.has(from)) continue;               // a rule on a bare stopword would corrupt dictation
+    // Case-only differences only matter when the target has an internal
+    // capital (github → GitHub); anything else is sentence-position noise.
+    if (from === to.toLowerCase() && !/[A-Z]/.test(to.slice(1))) continue;
+    // Already fixed by an existing rule, or an exact duplicate entry.
+    if (applyVoiceDict(from).trim().toLowerCase() === to.toLowerCase()) continue;
+    if (voiceDict.some((e) => e.from.toLowerCase() === from && (e.to || '').toLowerCase() === to.toLowerCase())) continue;
+    if (cands.some((c) => c.from === from)) continue;
+    cands.push({ from, to });
+  }
+
+  st.phase = 'review';
+  if (!cands.length) {
+    voiceTrainSetMsg('Close enough — nothing worth adding.', 'ok');
+    voiceTrainRender();
+    return;
+  }
+  voiceTrainSetMsg(`Heard ${cands.length} difference${cands.length === 1 ? '' : 's'} — add the ones worth fixing.`, '');
+  voiceTrainRender();
+  for (const c of cands) {
+    const li = document.createElement('li');
+    const mkSpan = (cls, text) => { const s = document.createElement('span'); s.className = cls; s.textContent = text; return s; };
+    li.appendChild(mkSpan('vd-from', c.from));
+    li.appendChild(mkSpan('vd-arrow', '→'));
+    li.appendChild(mkSpan('vd-to', c.to));
+    const add = document.createElement('button');
+    add.className = 'primary';
+    add.textContent = 'Add';
+    const skip = document.createElement('button');
+    skip.textContent = 'Skip';
+    const settle = (accepted) => {
+      add.remove(); skip.remove();
+      li.classList.add(accepted ? 'vt-added' : 'vt-skipped');
+      li.appendChild(mkSpan('vt-cand-state', accepted ? '✓ Added' : 'Skipped'));
+    };
+    add.onclick = () => { upsertVoiceDict(c.from, c.to); voiceTrainState.added++; settle(true); };
+    skip.onclick = () => settle(false);
+    li.appendChild(add);
+    li.appendChild(skip);
+    vtCandsEl.appendChild(li);
+  }
+}
+
+function voiceTrainAdvance() {
+  const st = voiceTrainState;
+  if (!st) return;
+  st.idx++;
+  st.heardSegs = [];
+  st.phase = st.idx >= st.sentences.length ? 'done' : 'listen';
+  voiceTrainSetMsg('');
+  if (st.phase === 'done' && voiceActive) stopVoice({ send: false });
+  voiceTrainRender();
+}
+
+function voiceTrainRetry() {
+  const st = voiceTrainState;
+  if (!st || st.phase === 'done') return;
+  st.heardSegs = [];
+  st.phase = 'listen';
+  voiceTrainSetMsg('');
+  voiceTrainRender();
+}
+
+async function openVoiceTraining() {
+  if (voiceTrainIsOpen()) return;
+  voiceTrainState = await vtBuildSession();
+  voiceTrainCheckOnStop = false;
+  vtBackdrop.classList.remove('hidden');
+  voiceTrainSetMsg('');
+  voiceTrainRender();
+  // Mic on for the whole session; a failure surfaces in the modal via
+  // flagVoiceError. Already-running dictation just reroutes here.
+  if (!voiceActive) startVoice();
+  updateVoiceHudTarget();
+}
+
+function closeVoiceTraining() {
+  if (!vtBackdrop) return;
+  vtBackdrop.classList.add('hidden');   // hide first so stopVoice doesn't fire a check
+  voiceTrainCheckOnStop = false;
+  if (voiceActive) stopVoice({ send: false });
+  voiceTrainState = null;
+}
+
+if (vtBackdrop) {
+  $('voice-train-open').onclick = () => openVoiceTraining();
+  $('voice-train-close').onclick = closeVoiceTraining;
+  $('voice-train-finish').onclick = closeVoiceTraining;
+  $('voice-train-again').onclick = async () => {
+    voiceTrainState = await vtBuildSession();
+    voiceTrainSetMsg('');
+    voiceTrainRender();
+    if (!voiceActive) startVoice();
+  };
+  vtMicBtn.onclick = toggleVoice;
+  $('voice-train-check').onclick = () => { if (voiceActive) stopVoice(); else voiceTrainCheck(); };
+  $('voice-train-next').onclick = voiceTrainAdvance;
+  $('voice-train-skip').onclick = voiceTrainAdvance;
+  $('voice-train-retry').onclick = voiceTrainRetry;
+  vtBackdrop.addEventListener('mousedown', (e) => { if (e.target === vtBackdrop) closeVoiceTraining(); });
+  // Enter advances the flow (Check while listening, Next in review) unless a
+  // button inside the modal is focused — the button's own click wins then.
+  document.addEventListener('keydown', (e) => {
+    if (e.key !== 'Enter' || !voiceTrainIsOpen() || !voiceTrainState) return;
+    if (e.target && e.target.tagName === 'BUTTON' && vtBackdrop.contains(e.target)) return;
+    e.preventDefault();
+    const ph = voiceTrainState.phase;
+    if (ph === 'listen') $('voice-train-check').click();
+    else if (ph === 'review') voiceTrainAdvance();
+    else closeVoiceTraining();
+  });
+}
 
 // -- Claude usage (toolbar pill + modal) --------------------------------------
 // The pill shows the most-constrained plan limit (the one closest to running
@@ -8501,6 +9539,11 @@ vAutoEnter.addEventListener('change', () => {
 vAutoSpace.addEventListener('change', () => {
   voiceAutoSpace = vAutoSpace.checked;
   localStorage.setItem('hm.voiceAutoSpace', voiceAutoSpace ? '1' : '0');
+});
+if (vReply) vReply.addEventListener('change', () => {
+  voiceReplyEnabled = vReply.checked;
+  localStorage.setItem('hm.voiceReply', voiceReplyEnabled ? '1' : '0');
+  if (!voiceReplyEnabled && window.speechSynthesis) speechSynthesis.cancel();
 });
 if (vModel) vModel.addEventListener('change', () => {
   if (!isValidSttModel(vModel.value) || vModel.value === sttModelId) return;

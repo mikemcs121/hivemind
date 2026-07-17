@@ -347,14 +347,15 @@ function scratchDir() {
   return fs.existsSync(dir) ? dir : os.tmpdir();
 }
 
-function runClaudePrompt(instruction, stdinText, timeout = 120000) {
+function runClaudePrompt(instruction, stdinText, timeout = 120000, model = null) {
   return new Promise((resolve) => {
     let child;
     try {
       // shell:true lets Windows resolve `claude.cmd`/`claude` from PATH the same
       // way the terminal panes do. instruction is a constant; embed it quoted.
       const safe = instruction.replace(/"/g, '');
-      child = spawn(`claude -p "${safe}"`, {
+      const modelFlag = model && /^[a-z0-9.-]+$/i.test(model) ? ` --model ${model}` : '';
+      child = spawn(`claude -p${modelFlag} "${safe}"`, {
         cwd: scratchDir(),
         shell: true,
         windowsHide: true,
@@ -401,8 +402,43 @@ async function aiCommit(cwd) {
   return { code: 0, message };
 }
 
+// ---------------------------------------------------------------------------
+// Conversational command interpreter: map a free-form request onto one of
+// Hivemind's canonical commands via a one-shot `claude -p` on the fast model.
+// The instruction is a fixed constant (safe to embed in the shell command);
+// everything user-controlled — the request, the command catalog, thread and
+// hive names — travels on stdin as JSON.
+// ---------------------------------------------------------------------------
+const HM_INTERPRET_INSTRUCTION =
+  'You translate a user request into one command for Hivemind, a multi-terminal app. ' +
+  'stdin is JSON: `request` (what the user said), `commands` (the command catalog: canonical ' +
+  'syntax in bold-ish plain text, with a dash and a description), plus context lists such as ' +
+  '`threads` (open thread names), `hives`, `themes`, and `models`. ' +
+  'Reply with EXACTLY ONE line: the command to run, written in the canonical syntax with any ' +
+  '<placeholders> filled in using the request and the context lists (e.g. "tell Leo to run the tests", ' +
+  '"theme forest", "open 2 new threads and fix the login bug"). ' +
+  'Match the user\'s intent, not their wording. If the request names a thread/hive/theme/model ' +
+  'imprecisely, pick the closest one from the context lists. ' +
+  'If no command fits, or the request is ordinary conversation or a question you cannot map, ' +
+  'reply with exactly NONE. Never explain, never quote, never output more than one line.';
+
+async function hmInterpret(payload) {
+  let json = '';
+  try { json = JSON.stringify(payload); } catch (_) { /* fall through */ }
+  if (!json || json.length > 100000) return { code: 1, message: 'Bad interpret payload.' };
+  const res = await runClaudePrompt(HM_INTERPRET_INSTRUCTION, json, 60000, 'haiku');
+  if (res.code !== 0) {
+    return { code: res.code, message: (res.stderr || 'Claude could not interpret that.').trim() };
+  }
+  // One line only — take the first non-empty line and strip stray quoting.
+  const line = (res.stdout || '').split(/\r?\n/).map((s) => s.trim()).filter(Boolean)[0] || '';
+  const message = line.replace(/^["'`]+|["'`]+$/g, '').trim();
+  if (!message) return { code: 1, message: 'Claude returned nothing.' };
+  return { code: 0, message };
+}
+
 module.exports = {
   status, diff, stage, stageAll, unstage, unstageAll, discard,
   commit, branches, checkout, createBranch, init, fetch, pull, push, resetToRemote,
-  getRemoteUrl, setRemoteOrigin, ghCheck, ghCreateRepo, aiCommit,
+  getRemoteUrl, setRemoteOrigin, ghCheck, ghCreateRepo, aiCommit, hmInterpret,
 };
