@@ -225,8 +225,11 @@ async function publishRelease(cwd, version, onProgress) {
   }
 
   log(`Committing version bump to ${version}…`);
-  await run('git', ['add', 'package.json'], cwd, null);
-  const commit = await run('git', ['commit', '-m', `Bump version to ${version}`], cwd, null);
+  // Commit ONLY package.json's content — pathspec-limited so whatever another
+  // concurrent Hivemind thread happens to have staged is not swept into the
+  // "Bump version" commit and pushed. (A pathspec commit ignores the rest of
+  // the index, so no separate `git add` is needed.)
+  const commit = await run('git', ['commit', '-m', `Bump version to ${version}`, '--', 'package.json'], cwd, null);
   if (commit.code !== 0) {
     log(`Could not commit the version bump (continuing): ${lastLine(commit.output)}`);
   } else {

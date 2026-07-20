@@ -5,7 +5,11 @@
 // renderer captures microphone audio, slices it into utterance-sized segments,
 // and posts each segment here as 16 kHz mono Float32 PCM; we transcribe it and
 // post the text back. The renderer is responsible for the user dictionary /
-// auto-space / pane routing, so this worker only does audio -> text.
+// auto-space / pane routing, so this worker does audio -> text plus one more
+// job: per-frame speech probabilities from the Silero VAD model ('vad'
+// messages), which the renderer's segmenter uses to decide where an utterance
+// starts and ends. Silero shares the ONNX runtime already loaded here, so the
+// extra cost is just its ~2 MB of weights.
 //
 // Moonshine replaced the earlier Whisper checkpoints because it is both more
 // accurate than whisper-base.en and far lower-latency: Whisper zero-pads every
@@ -26,7 +30,7 @@
 // `import 'onnxruntime-common'` specifier, which a browser worker can't resolve
 // without an import map, so the whole module fails to evaluate. transformers.js
 // inlines onnxruntime, so it loads over hm:// with no extra resolution.
-import { pipeline, env } from 'hm://vendor/transformers.js';
+import { pipeline, env, AutoModel, Tensor } from 'hm://vendor/transformers.js';
 
 // Load only the bundled model; never reach out to the Hugging Face Hub.
 env.allowRemoteModels = false;
@@ -57,9 +61,83 @@ const DEFAULT_DTYPE = { encoder_model: 'q8', decoder_model_merged: 'q8' };
 
 let transcriber = null;
 
+// -- Silero VAD --------------------------------------------------------------
+// A tiny recurrent model (bundled, see scripts/fetch-model.mjs) that scores
+// each 512-sample chunk of 16 kHz audio with a speech probability. It replaced
+// the renderer's pure loudness gate for deciding utterance boundaries: a
+// loudness gate clips soft word onsets and mistakes keyboard clatter for
+// speech, and every such mis-cut segment becomes a mistranscription. Loading
+// or inference failures are non-fatal — the renderer keeps its energy-gate
+// fallback for any frame we can't score.
+const VAD_MODEL = 'onnx-community/silero-vad';
+const VAD_CHUNK = 512;              // samples per Silero step at 16 kHz
+let vadModel = null;
+let vadSrTensor = null;             // constant sample-rate input
+let vadState = null;                // recurrent state, carried chunk to chunk
+let vadStateGen = null;             // capture session the state belongs to
+let vadQueue = Promise.resolve();   // serializes inference so state stays ordered
+
+async function loadVad() {
+  if (vadModel) return;
+  try {
+    vadModel = await AutoModel.from_pretrained(VAD_MODEL, {
+      config: { model_type: 'custom' },
+      dtype: 'fp32',
+      device: 'wasm',
+    });
+    vadSrTensor = new Tensor('int64', new BigInt64Array([16000n]), []);
+    self.postMessage({ type: 'vadstatus', ok: true });
+  } catch (err) {
+    vadModel = null;
+    self.postMessage({
+      type: 'vadstatus', ok: false,
+      message: (err && (err.message || String(err))) || 'failed to load VAD model',
+    });
+  }
+}
+
+// Speech probability for one chunk; the state threading makes order matter,
+// which is why callers go through vadQueue.
+async function vadProb(chunk) {
+  const input = new Tensor('float32', chunk, [1, chunk.length]);
+  const out = await vadModel({ input, sr: vadSrTensor, state: vadState });
+  vadState = out.stateN;
+  return out.output.data[0];
+}
+
+// One renderer frame (a multiple of VAD_CHUNK): score every chunk, reply with
+// the max — onset sensitivity matters more than a smoothed average at 64 ms
+// granularity. `gen` identifies the capture session; a new session gets a
+// fresh recurrent state. Always replies (prob: null on any failure) so the
+// renderer's frame/verdict pairing never desyncs.
+function handleVad(msg) {
+  vadQueue = vadQueue.then(async () => {
+    let prob = null;
+    if (vadModel && msg.audio && msg.audio.length >= VAD_CHUNK) {
+      try {
+        if (msg.gen !== vadStateGen) {
+          vadStateGen = msg.gen;
+          vadState = new Tensor('float32', new Float32Array(2 * 128), [2, 1, 128]);
+        }
+        for (let i = 0; i + VAD_CHUNK <= msg.audio.length; i += VAD_CHUNK) {
+          const p = await vadProb(msg.audio.subarray(i, i + VAD_CHUNK));
+          prob = (prob == null) ? p : Math.max(prob, p);
+        }
+      } catch (_) { prob = null; }
+    }
+    self.postMessage({ type: 'vad', gen: msg.gen, prob });
+  });
+}
+
 async function load(msg) {
   const model = (msg && msg.model) || DEFAULT_MODEL;
   const dtype = (msg && msg.dtype) || DEFAULT_DTYPE;
+  // VAD first: it is small and fast, so utterance boundaries work almost
+  // immediately even while the (much larger) speech model is still loading.
+  await loadVad();
+  // vadOnly: transcription happens elsewhere (a native model in the main
+  // process); this worker exists just to score VAD frames.
+  if (msg && msg.vadOnly) { self.postMessage({ type: 'ready', device: 'wasm' }); return; }
   if (transcriber) { self.postMessage({ type: 'ready', device: 'wasm' }); return; }
   try {
     // English-only, q8-quantized; the model's files are served over hm://models
@@ -102,4 +180,5 @@ self.onmessage = (ev) => {
   const msg = ev.data || {};
   if (msg.type === 'load') return void load(msg);
   if (msg.type === 'transcribe') return void transcribe(msg.id, msg.audio);
+  if (msg.type === 'vad') return void handleVad(msg);
 };

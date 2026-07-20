@@ -52,6 +52,23 @@ function runGit(cwd, args, opts = {}) {
 
 const ok = (cwd) => typeof cwd === 'string' && cwd.length > 0;
 
+// A ref/branch name is safe to pass positionally only if it can't be read as an
+// option. Git ref names cannot legitimately begin with '-' anyway, so rejecting
+// that costs nothing and stops `-f`/`--force`-style argument injection (e.g. a
+// branch box holding "-f" turning `git checkout <name>` into `git checkout -f`,
+// which would silently discard unstaged changes).
+const safeRef = (name) => typeof name === 'string' && name.length > 0 && !name.startsWith('-');
+
+// True only if the project-relative `rel` resolves to a path inside `cwd`.
+// Guards the two places git file paths are used directly on the filesystem
+// (untracked-file read in diff(), untracked-file delete in discard()) so a
+// path that escaped the project tree can't read or delete outside it.
+function insideCwd(cwd, rel) {
+  const base = path.resolve(cwd);
+  const full = path.resolve(base, rel);
+  return full === base || full.startsWith(base + path.sep);
+}
+
 // ---------------------------------------------------------------------------
 // Status: branch, upstream, ahead/behind, and the working-tree change list.
 // Parsed from `git status --porcelain=v2 --branch`.
@@ -132,7 +149,37 @@ function webUrlFromRemote(url) {
   return u;
 }
 
+// Reverse git's C-style path quoting. With core.quotePath on (the default),
+// `git status` wraps any path containing "unusual" bytes (non-ASCII, control
+// chars, quotes) in double quotes and escapes them — e.g. `résumé.txt` becomes
+// `"r\303\251sum\303\251.txt"`. The octal escapes are raw UTF-8 bytes, so decode
+// escapes to bytes first and then interpret the whole thing as UTF-8. Passing
+// the quoted form straight to `git add -- <path>` / reading it from disk fails
+// ("pathspec did not match"), so every parsed path is unquoted here.
+function unquotePath(s) {
+  if (typeof s !== 'string' || s.length < 2 || s[0] !== '"' || s[s.length - 1] !== '"') return s;
+  const body = s.slice(1, -1);
+  const bytes = [];
+  const simple = { n: 10, t: 9, r: 13, b: 8, f: 12, a: 7, v: 11, '"': 34, '\\': 92 };
+  for (let i = 0; i < body.length; i++) {
+    const c = body[i];
+    if (c !== '\\') { bytes.push(c.charCodeAt(0) & 0xff); continue; }
+    const n = body[i + 1];
+    if (n >= '0' && n <= '7') {
+      let oct = n; i++;
+      while (oct.length < 3 && body[i + 1] >= '0' && body[i + 1] <= '7') { oct += body[i + 1]; i++; }
+      bytes.push(parseInt(oct, 8) & 0xff);
+    } else if (n in simple) {
+      bytes.push(simple[n]); i++;
+    } else {
+      bytes.push(c.charCodeAt(0) & 0xff); // stray backslash — keep it literal
+    }
+  }
+  return Buffer.from(bytes).toString('utf8');
+}
+
 function mkFile(p, xy, extra = {}) {
+  p = unquotePath(p);
   const x = xy[0];
   const y = xy[1];
   return {
@@ -155,6 +202,7 @@ async function diff(cwd, file, staged, untracked) {
   if (!ok(cwd)) return { code: 1, text: '' };
   if (untracked) {
     try {
+      if (!insideCwd(cwd, file)) return { code: 1, text: 'refused: path outside project' };
       const full = path.join(cwd, file);
       const buf = fs.readFileSync(full);
       if (buf.includes(0)) return { code: 0, text: '(binary file)' };
@@ -188,6 +236,7 @@ async function discard(cwd, files) {
     last = await runGit(cwd, ['restore', '--source=HEAD', '--staged', '--worktree', '--', ...tracked]);
   }
   for (const f of untracked) {
+    if (!insideCwd(cwd, f)) { last = { code: 1, stdout: '', stderr: `refused: path outside project (${f})` }; continue; }
     try { fs.rmSync(path.join(cwd, f), { force: true }); }
     catch (e) { last = { code: 1, stdout: '', stderr: String(e.message || e) }; }
   }
@@ -202,14 +251,21 @@ async function branches(cwd) {
   return res.stdout.split('\n').map((s) => s.trim()).filter(Boolean);
 }
 
-const checkout = (cwd, name) => runGit(cwd, ['checkout', name]);
-const createBranch = (cwd, name) => runGit(cwd, ['checkout', '-b', name]);
+const checkout = (cwd, name) =>
+  safeRef(name) ? runGit(cwd, ['checkout', name])
+                : Promise.resolve({ code: 1, stdout: '', stderr: `invalid branch name: ${name}` });
+const createBranch = (cwd, name) =>
+  safeRef(name) ? runGit(cwd, ['checkout', '-b', name])
+                : Promise.resolve({ code: 1, stdout: '', stderr: `invalid branch name: ${name}` });
 const init = (cwd) => runGit(cwd, ['init', '-b', 'main']);
 
 const fetch = (cwd) => runGit(cwd, ['fetch', '--all', '--prune'], { timeout: 120000 });
 const pull = (cwd) => runGit(cwd, ['pull'], { timeout: 120000 });
 
 function push(cwd, { branch, setUpstream } = {}) {
+  if (setUpstream && branch && !safeRef(branch)) {
+    return Promise.resolve({ code: 1, stdout: '', stderr: `invalid branch name: ${branch}` });
+  }
   const args = setUpstream && branch
     ? ['push', '-u', 'origin', branch]
     : ['push'];
@@ -377,6 +433,11 @@ function runClaudePrompt(instruction, stdinText, timeout = 120000, model = null)
       clearTimeout(timer);
       resolve({ code: code === null ? 1 : code, stdout: out, stderr: err });
     });
+    // A write to a process that already exited (e.g. `claude` missing) emits an
+    // async 'error' (EPIPE) on the stdin stream; without this listener that
+    // would surface as an uncaughtException and could crash the main process.
+    // The child's own 'error'/'close' handlers above resolve the promise.
+    child.stdin.on('error', () => { /* handled via child 'error'/'close' */ });
     try { child.stdin.write(stdinText); child.stdin.end(); } catch (_) { /* ignore */ }
   });
 }

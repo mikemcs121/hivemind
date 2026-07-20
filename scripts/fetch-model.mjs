@@ -1,4 +1,6 @@
-// Download the speech-to-text model so it can be bundled with the app.
+// Download the speech models so they can be bundled with the app: the
+// Moonshine speech-to-text model plus the Silero voice-activity-detection
+// model that decides where each spoken utterance starts and ends.
 //
 // Runs automatically after `npm install` (postinstall, in --soft mode) and
 // before `npm run dist` (predist), so the model is always present without
@@ -50,6 +52,16 @@ const MODELS = {
       'merges.txt',
     ],
   },
+  // Silero VAD: segments the mic stream by speech probability (see the VAD in
+  // renderer.js + voice-worker.js). Tiny (~2 MB) and always bundled — without
+  // it the app falls back to a crude loudness gate.
+  'onnx-community/silero-vad': {
+    required: ['onnx/model.onnx'],
+    optional: [],
+    // The HF repo ships no config.json, but transformers.js probes for one
+    // when loading; generate the minimal config locally instead of fetching.
+    generate: { 'config.json': JSON.stringify({ model_type: 'custom' }) + '\n' },
+  },
 };
 
 async function exists(p) {
@@ -77,6 +89,13 @@ try {
     console.log(`Fetching ${model} into ${join(MODELS_ROOT, model)}`);
     for (const f of files.required) await download(model, f, true);
     for (const f of files.optional) await download(model, f, false);
+    for (const [f, content] of Object.entries(files.generate || {})) {
+      const dest = join(MODELS_ROOT, model, f);
+      if (await exists(dest)) { console.log(`  ✓ ${f} (already present)`); continue; }
+      await mkdir(dirname(dest), { recursive: true });
+      await writeFile(dest, content);
+      console.log(`  ✓ ${f} (generated)`);
+    }
   }
   console.log('\nDone. Restart Hivemind and toggle voice typing with the ~ key.');
 } catch (err) {

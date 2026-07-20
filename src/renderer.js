@@ -1474,7 +1474,7 @@ const HM_COMMANDS = [
       /^(?:train|practice)\s+(?:the\s+)?(?:voice\s+)?dictionary$/i,
       /^(?:open\s+|start\s+)?voice\s+training$/i,
     ],
-    help: '<strong>train dictionary</strong> — read short practice sentences built from your own prompts; Hivemind proposes voice-dictionary fixes for whatever it misheard.',
+    help: '<strong>train dictionary</strong> — read practice sentences built from your own prompts; Hivemind proposes voice-dictionary fixes for whatever it misheard and re-drills the misses.',
     run() { openVoiceTraining(); },
   },
   {
@@ -1989,8 +1989,66 @@ function hmChatRenderMsg(m) {
   const div = document.createElement('div');
   div.className = 'hm-msg ' + m.role + (m.kind === 'err' ? ' err' : '');
   div.textContent = m.text;   // command echoes contain user text — never innerHTML
+  if (m.role === 'user') {
+    const edit = document.createElement('button');
+    edit.className = 'hm-msg-edit';
+    edit.title = 'Edit & re-apply — corrections teach the voice dictionary';
+    edit.setAttribute('aria-label', 'Edit and re-apply this command');
+    edit.textContent = '✏';
+    edit.onclick = () => hmChatEditStart(div, m);
+    div.appendChild(edit);
+  }
   log.appendChild(div);
   log.scrollTop = log.scrollHeight;
+}
+
+// Rebuild the transcript from the log — used after an in-place edit is applied
+// or cancelled to restore normal bubbles.
+function hmChatRerender() {
+  const log = document.getElementById('hm-chat-log');
+  if (!log) return;
+  log.innerHTML = '';
+  for (const m of hmChatLog) hmChatRenderMsg(m);
+}
+
+// Swap a sent-command bubble into an inline editor. Re-apply runs the edited
+// command as a new message; if words changed, the diff feeds the voice
+// dictionary's correction learning (an explicit edit is a strong signal, so
+// the "add to dictionary?" offer comes up immediately, not after two sightings).
+function hmChatEditStart(bubble, m) {
+  if (bubble.classList.contains('editing')) return;
+  bubble.classList.add('editing');
+  bubble.textContent = '';
+  const ta = document.createElement('textarea');
+  ta.className = 'hm-edit-ta';
+  ta.value = m.text;
+  ta.rows = Math.min(5, Math.max(2, Math.ceil(m.text.length / 30)));
+  const row = document.createElement('div');
+  row.className = 'hm-edit-actions';
+  const cancel = document.createElement('button');
+  cancel.textContent = 'Cancel';
+  const apply = document.createElement('button');
+  apply.className = 'primary';
+  apply.textContent = 'Re-apply';
+  const finish = () => hmChatRerender();
+  cancel.onclick = finish;
+  apply.onclick = () => {
+    const edited = ta.value.trim();
+    finish();
+    if (!edited) return;
+    if (edited !== m.text) voiceLearnFromTexts(m.text, edited, VOICE_LEARN_MIN_SEEN);
+    hmChatDispatch(edited);
+  };
+  ta.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); apply.onclick(); }
+    else if (e.key === 'Escape') { e.stopPropagation(); finish(); }  // don't close the panel
+  });
+  row.appendChild(cancel);
+  row.appendChild(apply);
+  bubble.appendChild(ta);
+  bubble.appendChild(row);
+  ta.focus();
+  ta.setSelectionRange(ta.value.length, ta.value.length);
 }
 
 function hmChatAppend(role, text, kind) {
@@ -2014,8 +2072,7 @@ function hmChatOpen() {
     hmChatLog.push({ role: 'bee', text: 'Tell me what you need — plain English is fine, no "Hivemind" prefix needed. Try "help" for the full command list.' });
   }
   // Rebuild the transcript from the log so close/clear/reopen stay consistent.
-  const log = document.getElementById('hm-chat-log');
-  if (log) { log.innerHTML = ''; for (const m of hmChatLog) hmChatRenderMsg(m); }
+  hmChatRerender();
   root.classList.remove('hidden');
   const toggle = document.getElementById('hm-chat-toggle');
   if (toggle) toggle.classList.add('active');
@@ -2059,8 +2116,14 @@ function hmChatSubmit() {
   if (!text) return;
   // Learn from fixes made to dictated text before this command was sent.
   voiceLearnHarvest(input, text);
-  hmChatAppend('user', text);
   input.value = '';
+  hmChatDispatch(text);
+}
+
+// Echo a command into the transcript and run it — shared by the composer
+// (hmChatSubmit) and the bubble editor's Re-apply (hmChatEditStart).
+function hmChatDispatch(text) {
+  hmChatAppend('user', text);
   // The wake word is tolerated ("hivemind help" works) but not required —
   // fuzzily, so a dictated "half mine help" doesn't leave a stray prefix.
   const stripped = matchHivemindCommand(text, true);
@@ -3400,9 +3463,10 @@ function addQuestionRow(pane, key, part) {
       text.textContent = String(q.question || '');
       head.appendChild(text);
       card.appendChild(head);
-      // A plan-approval card carries the plan itself — render it as markdown
-      // in a collapsible fold above the options, so the plan can be read (and
-      // approved) without opening the terminal or the review window.
+      // A plan-approval card carries the plan itself — rendered as markdown
+      // in a collapsible fold above the options, with the whole review
+      // experience embedded: comment highlights, highlight-to-comment, the
+      // comment rail, and Request changes (see "Chat-card plan review").
       if (typeof q.planMd === 'string' && q.planMd.trim()) {
         const fold = document.createElement('details');
         fold.className = 'chat-plan-fold';
@@ -3410,13 +3474,8 @@ function addQuestionRow(pane, key, part) {
         const sum = document.createElement('summary');
         const heading = /^#{1,3}\s+(.+)$/m.exec(q.planMd);
         sum.textContent = '📋 ' + (heading ? heading[1].trim() : 'The plan');
-        const body = document.createElement('div');
-        body.className = 'chat-md chat-plan-body';
-        body.innerHTML = markdownToHtml(q.planMd);
-        // Native plan-mode files belong to Claude Code while it plans —
-        // checkboxes render read-only here, same as the review window.
-        body.querySelectorAll('input.plan-check').forEach((cb) => { cb.disabled = true; });
-        fold.append(sum, body);
+        fold.appendChild(sum);
+        buildCardPlanReview(pane, fold, q.planMd);
         card.appendChild(fold);
       }
       const opts = document.createElement('div');
@@ -3497,12 +3556,12 @@ function addQuestionRow(pane, key, part) {
       foot.appendChild(review);
     }
     if (questions.some((q) => q.planReview)) {
-      // The plan-approval card links to the full review window — comments and
-      // request-changes live there.
+      // Comments and request-changes live on the card itself now — this just
+      // offers the same review as a full window for reading room.
       const planBtn = document.createElement('button');
       planBtn.className = 'chat-question-key';
-      planBtn.textContent = '📋 Review plan';
-      planBtn.title = 'Open the plan review window — comment on the plan or request changes there';
+      planBtn.textContent = '📋 Open as window';
+      planBtn.title = 'Open this plan review in its own window — same plan, comments, and actions';
       planBtn.onclick = (e) => { e.stopPropagation(); openPlanReview(pane); };
       foot.appendChild(planBtn);
     }
@@ -3646,6 +3705,14 @@ function sendChatMessage(pane) {
     if (c.ac) c.ac.hide();
     return;
   }
+  // The thread's process has exited — there's no live PTY to receive a message,
+  // so delivering it would silently drop the text (and leave a fake "pending"
+  // echo). Keep the composer contents and tell the user to restart. (Sends from
+  // the history view are allowed: they respawn the thread via --resume.)
+  if (pane.state === 'dead' && !c.viewingHistory) {
+    hmToast('This thread has exited — restart it before sending a message.', 'err');
+    return;
+  }
   const typed = text; // the user's typed text, recallable later with ↑
   // Attachments ride along as quoted paths appended to the message — except
   // images on codex threads, which are handed to typePrompt to paste as real
@@ -3743,7 +3810,8 @@ const PROMPT_LOCK_PLACEHOLDER =
 // The text shown in the inline prompt card: the process-exit note, the last
 // error lines, or the prompt scraped from the visible screen (starting at the
 // line the attention scan matched, so a menu/approval's options follow the
-// header rather than trailing the spinner line above them).
+// header rather than trailing the spinner line above them — unless that line
+// is the select-menu footer itself, where the content sits above it).
 function promptCardText(pane, state) {
   if (state === 'dead') return 'The process behind this thread exited.';
   if (state === 'error') {
@@ -3754,7 +3822,19 @@ function promptCardText(pane, state) {
   const lines = screenText(pane).split('\n').map((s) => s.trim()).filter(Boolean);
   const i = lines.findIndex((l) =>
     MENU_PATTERNS.some((re) => re.test(l)) || QUESTION_PATTERNS.some((re) => re.test(l)));
-  const block = i >= 0 ? lines.slice(i, i + 6) : lines.slice(-3);
+  let block;
+  if (i < 0) {
+    block = lines.slice(-3);
+  } else if (SELECT_FOOTER_RE.test(lines[i])) {
+    // Only the footer chrome matched — a menu the structured parsers couldn't
+    // handle (e.g. codex's usage menu numbers only its enabled option) sits
+    // *above* that line; slicing downward would show nothing but the chrome.
+    // The footer's own keys are already the card's buttons.
+    block = lines.slice(Math.max(0, i - 8), i);
+    if (!block.length) block = [lines[i]];
+  } else {
+    block = lines.slice(i, i + 6);
+  }
   return block.join('\n') || 'The thread needs your input.';
 }
 
@@ -4622,6 +4702,7 @@ function createPane(board, col, opts = {}) {
       state: 'none', file: opts.planFile || null, source: opts.planSource || null,
       menu: null, menuMiss: 0, exitIds: new Set(), exitPlanText: null,
       cardText: null, cardFetch: null,
+      cardComments: null, cardCmtFetch: null, cardDraft: null, cardNote: '',
     },
     // Claude Code session id this pane owns. Set before spawn (fresh threads
     // get a generated UUID passed as --session-id; resumes reuse the old id)
@@ -5154,7 +5235,13 @@ async function deleteBoard(board) {
     for (const col of g.columns) {
       for (const pane of col.panes) {
         pane.disposed = true;
+        clearTimeout(pane.idleTimer);
+        stopAttentionProbe(pane);
         window.api.killPty(pane.id);
+        // Tell the main-process transcript binder to stop tailing this pane's
+        // session JSONL — otherwise deleting a hive with live threads leaks a
+        // watcher streaming entries to a pane id that no longer exists.
+        window.api.transcript.unbind(pane.id);
         try { pane.term.dispose(); } catch (_) { /* ignore */ }
       }
     }
@@ -5384,14 +5471,22 @@ if (buildBtn) {
     buildStart = Date.now();
     paintBuildBtn();
     buildTimer = setInterval(paintBuildBtn, 1000);
-    const res = await window.api.build.portable(dir);
-    clearInterval(buildTimer);
-    buildTimer = null;
-    delete buildBtn.dataset.busy;
-    buildBtn.disabled = false;
-    buildBtn.classList.remove('building');
-    buildBtn.textContent = BUILD_BTN_TEXT;
-    buildBtn.title = BUILD_BTN_TITLE;
+    let res;
+    try {
+      res = await window.api.build.portable(dir);
+    } catch (err) {
+      // An unexpected rejection (e.g. the main handler throwing) must not leave
+      // the button stuck disabled with the timer ticking forever.
+      res = { ok: false, message: (err && err.message) || String(err) };
+    } finally {
+      clearInterval(buildTimer);
+      buildTimer = null;
+      delete buildBtn.dataset.busy;
+      buildBtn.disabled = false;
+      buildBtn.classList.remove('building');
+      buildBtn.textContent = BUILD_BTN_TEXT;
+      buildBtn.title = BUILD_BTN_TITLE;
+    }
     if (res && res.ok && res.published) {
       window.api.notify({ title: 'Hivemind', body: `v${res.version} built and published to GitHub — opening the dist folder.` });
       window.api.files.reveal(dir, 'dist');
@@ -6147,6 +6242,7 @@ const todoMsgbar = $('todo-msgbar');
 const todoInput = $('todo-input');
 
 let todoItems = []; // tree of { id, text, done, collapsed, children: [...] }
+let todoLoadFailed = false; // last read hit a corrupt/locked file — don't overwrite it
 let todoPendingEdit = null; // { item, span } to focus once the tree is in the DOM
 
 function todoPanelOpen() { return todoPanel && !todoPanel.classList.contains('hidden'); }
@@ -6185,6 +6281,7 @@ async function refreshTodo() {
   const dir = activeDir();
   if (!dir) { todoItems = []; renderTodo({ ok: false, reason: 'no-dir' }); return; }
   const res = await window.api.todo.read(dir);
+  todoLoadFailed = !!(res && res.ok === false && (res.reason === 'corrupt' || res.reason === 'unreadable'));
   todoItems = (res && res.ok && Array.isArray(res.todos)) ? normalizeTodos(res.todos) : [];
   renderTodo(res);
 }
@@ -6194,6 +6291,10 @@ async function refreshTodo() {
 async function saveTodo() {
   const dir = activeDir();
   if (!dir) return;
+  if (todoLoadFailed) {
+    setTodoMsg('Todos file is unreadable — not overwriting it. Fix or remove .hivemind/todos.json, then reopen.', 'err');
+    return;
+  }
   window.api.todo.ensureIgnored(dir);
   const res = await window.api.todo.write(dir, todoItems);
   if (!res || !res.ok) setTodoMsg((res && res.message) || 'Could not save todos.', 'err');
@@ -6203,6 +6304,10 @@ async function saveTodo() {
 function addTodo(text) {
   const t = (text || '').trim();
   if (!t || !activeDir()) return;
+  if (todoLoadFailed) {
+    setTodoMsg('Todos file is unreadable — not overwriting it. Fix or remove .hivemind/todos.json, then reopen.', 'err');
+    return;
+  }
   todoItems.push({ id: nextId('todo'), text: t, done: false, children: [] });
   saveTodo();
   renderTodo({ ok: true });
@@ -6229,6 +6334,9 @@ async function addTodoItem(text) {
   if (!dir) return { ok: false, message: 'No hive is open.' };
   if (!t) return { ok: false, message: 'Nothing to add.' };
   const res = await window.api.todo.read(dir);
+  if (res && res.ok === false && (res.reason === 'corrupt' || res.reason === 'unreadable')) {
+    return { ok: false, message: 'Todos file is unreadable — not overwriting it.' };
+  }
   const list = (res && res.ok && Array.isArray(res.todos)) ? normalizeTodos(res.todos) : [];
   list.push({ id: nextId('todo'), text: t, done: false, children: [] });
   window.api.todo.ensureIgnored(dir);
@@ -6620,6 +6728,15 @@ function renderHistory() {
       repostPrompt(entry);
     };
 
+    const speak = document.createElement('button');
+    speak.className = 'history-row-speak';
+    speak.title = 'Re-speak this prompt in voice training — read it aloud and get dictionary fixes for anything misheard';
+    speak.textContent = '🎤';
+    speak.onclick = (e) => {
+      e.stopPropagation();
+      openVoiceTraining({ text: entry.text });
+    };
+
     const del = document.createElement('button');
     del.className = 'history-row-del';
     del.title = 'Remove from history';
@@ -6637,6 +6754,7 @@ function renderHistory() {
     };
 
     row.appendChild(main);
+    row.appendChild(speak);
     row.appendChild(send);
     row.appendChild(del);
     row.onclick = () => revealPrompt(entry);
@@ -6812,6 +6930,9 @@ function panePlan(pane) {
       exitIds: new Set(),                      // ExitPlanMode tool_use ids seen
       exitPlanText: null,                      // input.plan — content of last resort
       cardText: null, cardFetch: null,         // chat-card plan cache (planCardText)
+      cardComments: null, cardCmtFetch: null,  // chat-card comment cache
+      cardDraft: null,                         // in-progress card comment draft
+      cardNote: '',                            // card's overall-feedback input
     };
   }
   return pane.plan;
@@ -7011,7 +7132,9 @@ function planBecameReady(pane) {
   // notification (the menu matches MENU_PATTERNS); here we surface the doc.
   if (planModalPane === pane && planOpen()) { refreshPlanReview(); return; }
   if (localStorage.getItem('hm.planAutoOpen') === '0') return;
-  if (pane === focusedPane && !planOpen()) openPlanReview(pane);
+  // In the chat view the approval card embeds the whole review (plan,
+  // comments, request-changes) — popping the window over it would be noise.
+  if (pane === focusedPane && !planOpen() && pane.view !== 'chat') openPlanReview(pane);
 }
 
 // --- The review window -------------------------------------------------------
@@ -7577,6 +7700,8 @@ async function persistComments() {
   window.api.plan.ensureIgnored(dir); // sidecars live in `.hivemind/` — keep it out of Git
   const res = await window.api.plan.writeComments(dir, key, planComments);
   if (res && !res.ok) setPlanDocMsg(res.message || 'Could not save comments.', 'err');
+  // Keep the chat card's embedded rail in step with what the window changed.
+  if (pane) { panePlan(pane).cardComments = null; refreshCardPlan(pane); }
 }
 
 // --- Approve / Request changes ----------------------------------------------
@@ -7618,19 +7743,17 @@ async function planAwaitScreen(pane, re, timeoutMs) {
   return false;
 }
 
-planReqChangesBtn.onclick = async () => {
-  const pane = planModalPane;
-  if (!pane || pane.disposed || pane.state === 'dead') {
-    setPlanDocMsg('This thread is no longer running.', 'err');
-    return;
-  }
-  const pl = panePlan(pane);
-  const unsent = planComments.filter((c) => !c.resolved && !c.sent);
-  const note = planDocNote.value.trim();
-  if (!unsent.length && !note) { setPlanDocMsg('Add a comment (or overall feedback) first.', 'err'); return; }
+// Deliver review feedback to a thread — the shared core behind the review
+// window's Request changes button and the chat card's. When the approval menu
+// is up, pick "No, keep planning", wait for its inline feedback input, and
+// paste the comments; otherwise type the revision request directly. Marks the
+// comments sent — persisting them is the caller's job (the window and the
+// card each own their copy of the comment list).
+async function planSendFeedback(pane, unsent, note) {
   const parts = unsent.map((c, n) => `[${n + 1}] Re "${c.quote}": ${c.body}`);
   if (note) parts.push(`[${parts.length + 1}] ${note}`);
   const feedback = 'Please revise the plan. Comments:\n' + parts.join('\n');
+  const pl = panePlan(pane);
   const opts = (pl.menu && pl.menu.options) || [];
   const keepIdx = opts.findIndex((o) => PLAN_MENU_FEEDBACK_RE.test(o.label));
   if (pl.state === 'ready' && keepIdx >= 0) {
@@ -7641,7 +7764,6 @@ planReqChangesBtn.onclick = async () => {
     // racing the digit keypress that moves selection onto the input row.
     sendToPane(pane, String(keepIdx + 1));
     planSetState(pane, 'pending-result');
-    setPlanDocMsg('Sending your feedback…');
     await new Promise((r) => setTimeout(r, 200));
     await planAwaitScreen(pane, PLAN_FEEDBACK_INPUT_RE, 2500);
     typePrompt(pane, feedback);
@@ -7650,11 +7772,290 @@ planReqChangesBtn.onclick = async () => {
     typePrompt(pane, feedback + '\nThen rewrite the plan file at the same path.');
   }
   unsent.forEach((c) => { c.sent = true; });
+}
+
+planReqChangesBtn.onclick = async () => {
+  const pane = planModalPane;
+  if (!pane || pane.disposed || pane.state === 'dead') {
+    setPlanDocMsg('This thread is no longer running.', 'err');
+    return;
+  }
+  const unsent = planComments.filter((c) => !c.resolved && !c.sent);
+  const note = planDocNote.value.trim();
+  if (!unsent.length && !note) { setPlanDocMsg('Add a comment (or overall feedback) first.', 'err'); return; }
+  setPlanDocMsg('Sending your feedback…');
+  await planSendFeedback(pane, unsent, note);
   planDocNote.value = '';
   await persistComments();
   renderCommentList();
   setPlanDocMsg('Feedback sent — the thread will revise the plan.', 'ok');
 };
+
+// --- Chat-card plan review ---------------------------------------------------
+// The review window's whole experience, embedded in the chat's plan-approval
+// card: comment highlights, highlight-to-comment, the comment rail, and an
+// overall-feedback line with Request changes. Approve lives on the card
+// already — its menu options are the approval menu. The window and the card
+// share the same sidecar comments (each invalidates the other's cache after a
+// write), and everything mid-flight on the card (an unsaved draft, the
+// feedback line) is kept on panePlan so the screen probe's card re-renders
+// can't lose it.
+
+// The card's comment list, from a per-pane cache; a missing cache kicks a
+// background read that re-renders the card section when it lands.
+function cardPlanComments(pane) {
+  const pl = panePlan(pane);
+  if (pl.cardComments) return pl.cardComments;
+  if (!pl.cardCmtFetch) {
+    pl.cardCmtFetch = (async () => {
+      const dir = pane.board && pane.board.dir;
+      const key = planCommentsKey(pane);
+      const res = dir && key ? await window.api.plan.readComments(dir, key) : null;
+      if (pane.disposed) return;
+      pl.cardComments = (res && res.comments) || [];
+      refreshCardPlan(pane);
+    })().finally(() => { pl.cardCmtFetch = null; });
+  }
+  return null;
+}
+
+async function cardPersistComments(pane) {
+  const dir = pane.board && pane.board.dir;
+  const key = planCommentsKey(pane);
+  if (!dir || !key) return;
+  window.api.plan.ensureIgnored(dir); // sidecars live in `.hivemind/` — keep it out of Git
+  const res = await window.api.plan.writeComments(dir, key, panePlan(pane).cardComments || []);
+  if (res && !res.ok) hmToast(res.message || 'Could not save comments.', 'err');
+  // Keep an open review window on this thread in step with the card.
+  if (planModalPane === pane && planOpen()) refreshPlanReview();
+}
+
+// Rebuild the plan section of this pane's approval card in place (comments
+// changed under it) — a no-op when no card is showing.
+function refreshCardPlan(pane) {
+  const c = pane.chat;
+  if (!c) return;
+  const row = c.byKey.get(screenQuestionKey(pane));
+  const fold = row && row.querySelector('.chat-plan-fold');
+  if (fold && fold._hmRebuild) fold._hmRebuild();
+}
+
+// Build (or rebuild) everything under the fold's summary: the rendered plan
+// with comment highlights and a floating ＋ Comment button, the comment rail,
+// and the feedback row.
+function buildCardPlanReview(pane, fold, planMd) {
+  const pl = panePlan(pane);
+  fold._hmRebuild = () => {
+    while (fold.childElementCount > 1) fold.lastElementChild.remove(); // keep the <summary>
+    buildCardPlanReview(pane, fold, planMd);
+  };
+
+  const body = document.createElement('div');
+  body.className = 'chat-md chat-plan-body';
+  body.innerHTML = markdownToHtml(planMd);
+  // Native plan-mode files belong to Claude Code while it plans — their
+  // checkboxes render read-only; hivemind-written plans tick and write back,
+  // same as the review window.
+  if (pl.source !== 'hivemind') {
+    body.querySelectorAll('input.plan-check').forEach((cb) => { cb.disabled = true; });
+  } else {
+    body.addEventListener('change', async (e) => {
+      const cb = e.target;
+      if (!cb || !cb.classList || !cb.classList.contains('plan-check') || cb.disabled) return;
+      const ln = parseInt(cb.dataset.line, 10);
+      const dir = pane.board && pane.board.dir;
+      const key = planCommentsKey(pane);
+      if (!Number.isInteger(ln) || !dir || !key) return;
+      const lines = planMd.split('\n');
+      if (ln < 0 || ln >= lines.length) return;
+      const mark = cb.checked ? 'x' : ' ';
+      const next = lines[ln].replace(/^(\s*(?:[-*+]|\d+[.)])\s+)\[[ xX]\]/, `$1[${mark}]`);
+      if (next === lines[ln]) return;   // source line didn't match — leave it be
+      lines[ln] = next;
+      pl.cardText = lines.join('\n');
+      const res = await window.api.plan.write(dir, key, pl.cardText);
+      if (res && !res.ok) hmToast(res.message || 'Could not update the plan file.', 'err');
+      syncScreenQuestion(pane);         // planMd changed → the card re-renders
+    });
+  }
+
+  const comments = cardPlanComments(pane) || [];
+  for (const c of comments) {
+    if (c.resolved) continue;
+    c._anchored = highlightOccurrence(body, c.quote, c.occurrence || 0, c.id);
+  }
+
+  // Floating ＋ Comment over a text selection. It lives next to the body (not
+  // inside it — its label would pollute the body's textContent, which is what
+  // quotes anchor to), so it doesn't track the body's internal scroll: hide it
+  // when the body scrolls and let the next mouseup re-place it.
+  const wrap = document.createElement('div');
+  wrap.className = 'chat-plan-wrap';
+  const cmtBtn = document.createElement('button');
+  cmtBtn.className = 'plan-comment-btn hidden';
+  cmtBtn.textContent = '＋ Comment';
+  cmtBtn.title = 'Comment on the selected text';
+  wrap.append(body, cmtBtn);
+  body.addEventListener('scroll', () => cmtBtn.classList.add('hidden'));
+  body.addEventListener('mouseup', () => {
+    setTimeout(() => {
+      const sel = window.getSelection();
+      if (!sel || sel.isCollapsed || !sel.toString().trim()) { cmtBtn.classList.add('hidden'); return; }
+      const range = sel.getRangeAt(0);
+      if (!body.contains(range.commonAncestorContainer)) { cmtBtn.classList.add('hidden'); return; }
+      const rect = range.getBoundingClientRect();
+      const host = wrap.getBoundingClientRect();
+      cmtBtn.style.top = (rect.bottom - host.top + 4) + 'px';
+      cmtBtn.style.left = Math.max(4, rect.left - host.left) + 'px';
+      cmtBtn.classList.remove('hidden');
+    }, 0);
+  });
+  cmtBtn.onclick = (e) => {
+    e.stopPropagation();
+    const sel = window.getSelection();
+    if (!sel || sel.isCollapsed) { cmtBtn.classList.add('hidden'); return; }
+    const quote = sel.toString();
+    const range = sel.getRangeAt(0);
+    // Global offset of the selection start within the plan's plaintext.
+    const pre = document.createRange();
+    pre.setStart(body, 0);
+    pre.setEnd(range.startContainer, range.startOffset);
+    const startIndex = pre.toString().length;
+    const full = body.textContent;
+    let occ = 0, from = 0, at;
+    while ((at = full.indexOf(quote, from)) !== -1 && at < startIndex) { occ++; from = at + 1; }
+    sel.removeAllRanges();
+    pl.cardDraft = { quote, occurrence: occ, text: '', fresh: true };
+    fold._hmRebuild();
+  };
+
+  // Comment rail: the in-progress draft, then the unresolved comments.
+  const rail = document.createElement('div');
+  rail.className = 'chat-plan-cmts';
+  const unresolved = comments.filter((c) => !c.resolved);
+  const draft = pl.cardDraft;
+  rail.classList.toggle('hidden', !unresolved.length && !draft);
+  let focusTa = null;
+  if (draft) {
+    const box = document.createElement('div');
+    box.className = 'plan-cmt-draft';
+    const q = document.createElement('div');
+    q.className = 'plan-cmt-quote';
+    q.textContent = '“' + draft.quote + '”';
+    const ta = document.createElement('textarea');
+    ta.className = 'plan-cmt-input';
+    ta.placeholder = 'Add a comment…';
+    ta.value = draft.text || '';
+    ta.addEventListener('input', () => { draft.text = ta.value; });
+    const save = async () => {
+      const text = ta.value.trim();
+      pl.cardDraft = null;
+      if (text) {
+        (pl.cardComments || (pl.cardComments = [])).push({
+          id: nextId('cmt'), quote: draft.quote, occurrence: draft.occurrence,
+          body: text, resolved: false, sent: false,
+        });
+        await cardPersistComments(pane);
+      }
+      fold._hmRebuild();
+    };
+    ta.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); save(); }
+    });
+    const actions = document.createElement('div');
+    actions.className = 'plan-cmt-actions';
+    const saveBtn = document.createElement('button');
+    saveBtn.className = 'plan-send-btn';
+    saveBtn.textContent = 'Comment';
+    saveBtn.onclick = save;
+    const cancel = document.createElement('button');
+    cancel.className = 'plan-mini-btn';
+    cancel.textContent = 'Cancel';
+    cancel.onclick = () => { pl.cardDraft = null; fold._hmRebuild(); };
+    actions.append(saveBtn, cancel);
+    box.append(q, ta, actions);
+    rail.appendChild(box);
+    // Focus only on the rebuild the ＋ Comment click triggered — background
+    // re-renders (comments loading, plan updating) must not steal the caret.
+    if (draft.fresh) { delete draft.fresh; focusTa = ta; }
+  }
+  unresolved.forEach((c, n) => {
+    const item = document.createElement('div');
+    item.className = 'plan-cmt-item' +
+      (c._anchored === false ? ' orphaned' : '') + (c.sent ? ' sent' : '');
+    const num = document.createElement('span');
+    num.className = 'plan-cmt-num';
+    num.textContent = String(n + 1);
+    const main = document.createElement('div');
+    main.className = 'plan-cmt-main';
+    const q = document.createElement('div');
+    q.className = 'plan-cmt-quote';
+    q.textContent = '“' + c.quote + '”' + (c._anchored === false ? '  (not found in current plan)' : '');
+    q.onclick = () => {
+      const mark = body.querySelector('mark.plan-cmt[data-id="' + c.id + '"]');
+      if (mark) mark.scrollIntoView({ block: 'nearest' });
+    };
+    const text = document.createElement('div');
+    text.className = 'plan-cmt-text';
+    text.textContent = c.body;
+    main.append(q, text);
+    const act = document.createElement('div');
+    act.className = 'plan-cmt-act';
+    act.appendChild(mkMini('✓', 'Resolve (remove) this comment', async () => {
+      pl.cardComments = (pl.cardComments || []).filter((x) => x.id !== c.id);
+      await cardPersistComments(pane);
+      fold._hmRebuild();
+    }));
+    if (c.sent) {
+      const tag = document.createElement('span');
+      tag.className = 'plan-cmt-tag';
+      tag.textContent = 'sent';
+      tag.title = 'Already sent to the thread with a Request-changes round';
+      item.append(num, main, tag, act);
+    } else {
+      item.append(num, main, act);
+    }
+    rail.appendChild(item);
+  });
+
+  // Feedback row: overall note + Request changes (Approve is the card's own
+  // menu options right below).
+  const foot = document.createElement('div');
+  foot.className = 'chat-plan-feedback';
+  const note = document.createElement('input');
+  note.type = 'text';
+  note.placeholder = 'Overall feedback (optional)…';
+  note.spellcheck = true;
+  note.value = pl.cardNote || '';
+  const send = document.createElement('button');
+  send.className = 'plan-mini-btn';
+  send.textContent = 'Request changes';
+  send.title = 'Pick “No, keep planning” in the thread and send your comments as feedback';
+  const paintSend = () => {
+    const live = !pane.disposed && pane.state !== 'dead';
+    const hasFeedback = (pl.cardComments || []).some((c) => !c.resolved && !c.sent) || !!note.value.trim();
+    send.disabled = !live || !hasFeedback;
+  };
+  note.addEventListener('input', () => { pl.cardNote = note.value; paintSend(); });
+  paintSend();
+  send.onclick = async (e) => {
+    e.stopPropagation();
+    if (pane.disposed || pane.state === 'dead') { hmToast('This thread is no longer running.', 'err'); return; }
+    const unsent = (pl.cardComments || []).filter((c) => !c.resolved && !c.sent);
+    const noteText = note.value.trim();
+    if (!unsent.length && !noteText) { hmToast('Add a comment (or overall feedback) first.', 'err'); return; }
+    send.disabled = true;
+    await planSendFeedback(pane, unsent, noteText);
+    pl.cardNote = '';
+    await cardPersistComments(pane);
+    fold._hmRebuild();
+    hmToast('Feedback sent — the thread will revise the plan.');
+  };
+  foot.append(note, send);
+
+  fold.append(wrap, rail, foot);
+  if (focusTa) focusTa.focus();
+}
 
 // -- Diff viewer ------------------------------------------------------------
 const diffBackdrop = $('diff-backdrop');
@@ -7672,7 +8073,15 @@ async function showDiff(f, staged) {
 }
 
 function escapeHtml(s) {
-  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  // Escapes `"` and `'` as well as the angle brackets, so values interpolated
+  // into HTML attributes (e.g. the href in mdInline's link rendering) can't
+  // break out of the quoted attribute and inject new attributes/handlers.
+  return String(s)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
 }
 
 function renderDiff(text) {
@@ -8014,8 +8423,10 @@ function mkMini(text, title, onclick) { const b = document.createElement('button
 // offline by Moonshine running in a worker (see voice-worker.js) — the
 // browser's Web Speech API is unusable in Electron (it relies on a Google
 // speech key that ships only in Chrome). We capture the mic, detect utterance
-// boundaries with an adaptive energy gate, and hand each spoken segment to the
-// worker. Whatever text comes back is run through a user-editable dictionary
+// boundaries with the Silero VAD model (speech probability per frame, scored
+// in the same worker; an adaptive energy gate remains as the fallback), and
+// hand each spoken segment to the worker for transcription. Whatever text
+// comes back is run through a user-editable dictionary
 // (to fix words it keeps mishearing) and then written to the target pane's PTY
 // — so it lands at the terminal cursor exactly like typing. The ~ key toggles
 // listening from anywhere in the app.
@@ -8047,15 +8458,21 @@ let voiceAutoEnter = localStorage.getItem('hm.voiceAutoEnter') === '1';    // de
 let voiceAutoSpace = localStorage.getItem('hm.voiceAutoSpace') !== '0';    // default on
 let voiceReplyEnabled = localStorage.getItem('hm.voiceReply') === '1';     // spoken replies in Chat with Hivemind — default off
 
-// Speech-to-text model registry. Each entry is a transformers.js ASR model
-// served offline over hm://models (see voice-worker.js). The first is bundled;
-// the rest download into userData on first use via window.api.stt.ensureModel —
-// keep the repo ids in sync with STT_DOWNLOADS in main.js. `dtype` is passed
-// straight to the pipeline. Every entry must be English-only, so the worker's
-// audio-only transcribe path (no language/task) stays valid.
+// Speech-to-text model registry. The first is bundled; the rest download into
+// userData on first use via window.api.stt.ensureModel — keep the repo ids in
+// sync with STT_DOWNLOADS in main.js. Two kinds of entry:
+//  - transformers.js models, served offline over hm://models and run in the
+//    voice worker (`dtype` goes straight to the pipeline);
+//  - `native: true` models, decoded by sherpa-onnx in a main-process utility
+//    process (STT_NATIVE in main.js) — far more accurate, needs the one-time
+//    big download. The voice worker still runs, VAD-only, for Silero.
+// Every entry must be English-only, so the worker's audio-only transcribe
+// path (no language/task) stays valid.
 const STT_MODELS = [
-  { value: 'onnx-community/moonshine-base-ONNX', label: 'Moonshine Base — fast & accurate (default)',
+  { value: 'onnx-community/moonshine-base-ONNX', label: 'Moonshine Base — fast, bundled (default)',
     dtype: { encoder_model: 'q8', decoder_model_merged: 'q8' } },
+  { value: 'csukuangfj/sherpa-onnx-nemo-parakeet-tdt-0.6b-v2-int8',
+    label: 'Parakeet TDT 0.6B — best accuracy (~630 MB one-time download)', native: true },
   { value: 'onnx-community/whisper-base.en', label: 'Whisper Base (English) — downloads on first use',
     dtype: { encoder_model: 'q8', decoder_model_merged: 'q8' } },
 ];
@@ -8078,7 +8495,8 @@ let voiceTargetHmChat = false;  // dictation goes to the Chat with Hivemind dial
 // Speech (Moonshine) worker + its load lifecycle. The worker is created lazily on first
 // use and kept alive after that, so the model only loads once per app run.
 let sttWorker = null;
-let sttReady = false;           // model finished loading
+let sttReady = false;           // the active engine (worker or native) finished loading
+let sttNative = false;          // segments go to the main-process sherpa engine, not the worker
 let sttLoadPromise = null;      // in-flight load(), resolves on 'ready'
 let sttSegId = 0;               // ids correlate transcribe requests/results
 let sttInFlight = 0;            // segments currently being transcribed
@@ -8091,27 +8509,38 @@ let micSource = null;
 let micProcessor = null;
 let micSink = null;
 
-// Energy-gate VAD. We accumulate audio while you're speaking and flush a
+// VAD + segmentation. We accumulate audio while you're speaking and flush a
 // segment to the worker once you pause (or the segment gets long). 16 kHz mono
 // is what the model wants, so we run the AudioContext at that rate directly.
-// The speech threshold adapts to the room: it tracks a running estimate of the
-// background level during quiet and requires speech to clear it by a healthy
-// factor, so a noisy fan doesn't stream junk to the model and a quiet speaker
-// with a quiet mic still registers.
+// The speech/silence call for each frame comes from the Silero VAD model
+// running in the voice worker — a real speech detector, so soft word onsets
+// aren't clipped and keyboard clatter isn't mistaken for talking. Verdicts are
+// asynchronous: each frame is queued (vadAwait) until its probability comes
+// back, then run through the segmenter; sample counts, not wall clock, drive
+// all timing, so late verdicts (e.g. while the worker is busy transcribing)
+// only delay a flush, never mis-cut it. Frames the worker can't score (model
+// still loading, Silero unavailable) fall back to the old adaptive energy
+// gate, decided synchronously.
 const STT_SAMPLE_RATE = 16000;
 const VAD_FRAME_SAMPLES = 1024;    // 64 ms per VAD tick — fine-grained boundaries
-const VAD_RMS_FLOOR = 0.006;       // absolute minimum level that can count as speech
-const VAD_NOISE_FACTOR = 2.5;      // speech must exceed the noise estimate by this
+const VAD_RMS_FLOOR = 0.006;       // fallback gate: absolute minimum level that can count as speech
+const VAD_NOISE_FACTOR = 2.5;      // fallback gate: speech must exceed the noise estimate by this
+const VAD_SPEECH_PROB = 0.4;       // Silero probability that starts an utterance
+const VAD_EXIT_PROB = 0.15;        // lower keep-talking bar so soft trailing words aren't cut
 const VAD_SILENCE_MS = 550;        // trailing quiet that ends an utterance
 const VAD_MIN_SPEECH_MS = 250;     // ignore blips shorter than this
 const VAD_MAX_SEGMENT_MS = 15000;  // force a flush so long talk still lands
 const VAD_PREROLL_MS = 320;        // quiet audio kept before onset so the first word isn't clipped
+const VAD_AWAIT_MAX = 500;         // outstanding verdicts (~32 s) before declaring the worker wedged
 let vadFrames = [];                // Float32Array frames of the current segment
 let vadSpeechMs = 0;
 let vadSilenceMs = 0;
 let vadInSpeech = false;
 let vadPreroll = [];               // recent quiet frames (≤ VAD_PREROLL_MS total)
-let vadNoiseRms = 0.005;           // running background-level estimate (adapts during quiet)
+let vadNoiseRms = 0.005;           // fallback gate's background-level estimate (adapts during quiet)
+let vadGen = 0;                    // capture-session counter; verdicts from an old gen are stale
+let vadAwait = [];                 // frames sent for scoring, FIFO-paired with worker verdicts
+let vadDegraded = false;           // worker stopped answering — energy gate for the rest of the session
 
 const voiceToggleBtn = $('voice-toggle');
 const VOICE_BTN_TITLE = voiceToggleBtn ? voiceToggleBtn.title : '';
@@ -8229,10 +8658,16 @@ function voiceLearnHarvest(inputEl, sentText) {
   const buf = inputEl && voiceLearnBuffers.get(inputEl);
   if (buf) voiceLearnBuffers.delete(inputEl);
   if (!buf || !buf.length) return;
-  const dictated = buf.join(' ').trim();
-  const sent = String(sentText || '').trim();
-  if (!dictated || !sent || dictated === sent) return;
-  const subs = vlSubstitutions(vlTokens(dictated), vlTokens(sent));
+  voiceLearnFromTexts(buf.join(' ').trim(), String(sentText || '').trim(), 1);
+}
+
+// Diff a heard/corrected text pair, count each substitution `weight` times, and
+// maybe raise the "add to dictionary?" offer. Pre-send fixes count 1 apiece
+// (an offer needs VOICE_LEARN_MIN_SEEN sightings); an explicit edit-and-reapply
+// of an already-sent command passes the full threshold so it offers right away.
+function voiceLearnFromTexts(heard, corrected, weight) {
+  if (!heard || !corrected || heard === corrected) return;
+  const subs = vlSubstitutions(vlTokens(heard), vlTokens(corrected));
   let offer = null;
   let changed = false;
   for (const s of subs) {
@@ -8245,7 +8680,7 @@ function voiceLearnHarvest(inputEl, sentText) {
     if (from === to.toLowerCase()) continue;
     const key = vlPairKey(from, to);
     const entry = voiceLearn[key] || (voiceLearn[key] = { from, to, n: 0 });
-    entry.n++;
+    entry.n += weight;
     changed = true;
     if (!offer && !entry.dismissed && entry.n >= VOICE_LEARN_MIN_SEEN
         && !voiceDict.some((e) => e.from.toLowerCase() === from)) {
@@ -8392,6 +8827,9 @@ function resetSttWorker() {
   sttLoadPromise = null;
   sttInFlight = 0;
   sttPending = [];
+  vadGen++;          // verdicts from the dying worker must not pair with new frames
+  vadAwait = [];
+  if (sttNative) { sttNative = false; try { window.api.stt.nativeStop(); } catch (_) { /* main handles */ } }
 }
 
 function ensureSttWorker() {
@@ -8400,8 +8838,27 @@ function ensureSttWorker() {
   const entry = STT_MODELS.find((m) => m.value === sttModelId) || STT_MODELS[0];
 
   // Two async steps: make sure the model's files are on disk (a non-default one
-  // downloads on first use), then boot the worker and wait for it to load them.
+  // downloads on first use), then boot the engine and wait for it to load them.
+  // Native models load in the main process; the worker still boots (VAD-only)
+  // so Silero keeps scoring frames — its failure is non-fatal (energy gate).
   sttLoadPromise = (async () => {
+    if (entry.native) {
+      const vadBoot = bootSttWorker(entry, { vadOnly: true });
+      vadBoot.catch(() => {});
+      const ensured = await window.api.stt.ensureModel(entry.value);
+      if (!ensured || !ensured.ok) {
+        throw new Error((ensured && ensured.error) || 'could not fetch the speech model');
+      }
+      const loaded = await window.api.stt.nativeLoad(entry.value);
+      if (!loaded || !loaded.ok) {
+        throw new Error((loaded && loaded.error) || 'native speech engine failed to load');
+      }
+      sttNative = true;
+      sttReady = true;
+      clearVoiceError();
+      await vadBoot.catch(() => {});
+      return;
+    }
     const ensured = await window.api.stt.ensureModel(entry.value);
     if (!ensured || !ensured.ok) {
       throw new Error((ensured && ensured.error) || 'could not fetch the speech model');
@@ -8414,7 +8871,9 @@ function ensureSttWorker() {
 }
 
 // Spawn the module worker and resolve once it posts 'ready' for `entry`.
-function bootSttWorker(entry) {
+// With opts.vadOnly the worker loads just Silero (transcription is native);
+// its 'ready' then must NOT flip sttReady — the native engine decides that.
+function bootSttWorker(entry, opts = {}) {
   return new Promise((resolve, reject) => {
     let worker;
     try {
@@ -8429,8 +8888,10 @@ function bootSttWorker(entry) {
     worker.onmessage = (ev) => {
       const msg = ev.data || {};
       if (msg.type === 'ready') {
-        sttReady = true;
-        clearVoiceError();
+        if (!opts.vadOnly) {
+          sttReady = true;
+          clearVoiceError();
+        }
         resolve();
       } else if (msg.type === 'progress') {
         // Surface the one-time model download/warm-up so the HUD isn't silent.
@@ -8441,25 +8902,13 @@ function bootSttWorker(entry) {
       } else if (msg.type === 'error') {
         sttLoadPromise = null;
         reject(new Error(msg.message || 'speech model failed to load'));
+      } else if (msg.type === 'vad') {
+        onVadVerdict(msg);
+      } else if (msg.type === 'vadstatus') {
+        console.log('[voice] silero vad ' + (msg.ok ? 'ready'
+          : 'unavailable — using energy gate (' + (msg.message || 'unknown error') + ')'));
       } else if (msg.type === 'result') {
-        sttInFlight = Math.max(0, sttInFlight - 1);
-        console.log('[voice] result text=' + JSON.stringify(msg.text || '') +
-          ' pane=' + (currentVoicePane() ? (currentVoicePane().name || currentVoicePane().id) : 'NONE') +
-          (msg.error ? ' error=' + JSON.stringify(msg.error) : ''));
-        // A per-utterance inference failure comes back as an empty result with
-        // an error string. Surface it instead of silently typing nothing — an
-        // engine that fails every segment would otherwise look "stuck listening".
-        if (msg.error) flagVoiceError(voiceErrMessage(new Error(msg.error)));
-        if (msg.text) commitVoiceText(msg.text);
-        // An empty transcription with no error means the model heard the
-        // segment but made nothing of it. Say so briefly — silence here is
-        // indistinguishable from the feature being broken.
-        else if (!msg.error && voiceActive) flashVoiceNotice('Didn’t catch that — try again');
-        // A mic stop with this segment still transcribing deferred the chat
-        // send to here — fire it once the last in-flight result is committed.
-        if (hmChatSendOnStop && sttInFlight === 0) hmChatVoiceSend();
-        if (voiceTrainCheckOnStop && sttInFlight === 0) { voiceTrainCheckOnStop = false; voiceTrainCheck(); }
-        renderVoiceListening();
+        onSttResult(msg.text || '', msg.error);
       }
     };
     worker.onerror = (e) => {
@@ -8467,11 +8916,37 @@ function bootSttWorker(entry) {
     };
 
     sttWorker = worker;
-    worker.postMessage({ type: 'load', model: entry.value, dtype: entry.dtype });
+    worker.postMessage(opts.vadOnly
+      ? { type: 'load', vadOnly: true }
+      : { type: 'load', model: entry.value, dtype: entry.dtype });
   });
 }
 
-// -- Mic capture + energy-gate VAD ------------------------------------------
+// One finished transcription, from either engine (worker 'result' message or
+// the native IPC promise). Books the in-flight count, surfaces errors, types
+// the text, and fires anything that was deferred until transcription drained.
+function onSttResult(text, error) {
+  sttInFlight = Math.max(0, sttInFlight - 1);
+  console.log('[voice] result text=' + JSON.stringify(text || '') +
+    ' pane=' + (currentVoicePane() ? (currentVoicePane().name || currentVoicePane().id) : 'NONE') +
+    (error ? ' error=' + JSON.stringify(error) : ''));
+  // A per-utterance inference failure comes back as an empty result with
+  // an error string. Surface it instead of silently typing nothing — an
+  // engine that fails every segment would otherwise look "stuck listening".
+  if (error) flagVoiceError(voiceErrMessage(new Error(error)));
+  if (text) commitVoiceText(text);
+  // An empty transcription with no error means the model heard the
+  // segment but made nothing of it. Say so briefly — silence here is
+  // indistinguishable from the feature being broken.
+  else if (!error && voiceActive) flashVoiceNotice('Didn’t catch that — try again');
+  // A mic stop with this segment still transcribing deferred the chat
+  // send to here — fire it once the last in-flight result is committed.
+  if (hmChatSendOnStop && sttInFlight === 0) hmChatVoiceSend();
+  if (voiceTrainCheckOnStop && sttInFlight === 0) { voiceTrainCheckOnStop = false; voiceTrainCheck(); }
+  renderVoiceListening();
+}
+
+// -- Mic capture + VAD -------------------------------------------------------
 function resetVad() {
   vadFrames = [];
   vadSpeechMs = 0;
@@ -8520,17 +8995,68 @@ function flushSegment() {
 function postSegment(audio) {
   sttInFlight++;
   renderVoiceListening();
+  if (sttNative) {
+    // Native engine: the segment goes over IPC to the sherpa utility process.
+    // Same result funnel as the worker path, so stop/send bookkeeping holds.
+    window.api.stt.nativeTranscribe(audio).then(
+      (r) => onSttResult((r && r.text) || '', (r && (r.ok === false ? (r.error || 'speech engine failed') : r.error)) || undefined),
+      (err) => onSttResult('', (err && err.message) || String(err))
+    );
+    return;
+  }
   // Transfer the backing buffer so we don't copy the audio across threads.
   sttWorker.postMessage({ type: 'transcribe', id: ++sttSegId, audio }, [audio.buffer]);
 }
 
 // One VAD tick: `frame` is VAD_FRAME_SAMPLES of 16 kHz mono Float32 we own.
+// Ship it to the worker for a Silero speech probability; the segmenter runs
+// when the verdict returns. No worker (still booting) or a wedged one → decide
+// synchronously with the energy gate instead, so dictation never goes dark.
 function onAudioFrame(frame) {
   if (!voiceActive) return;
+  if (sttWorker && !vadDegraded) {
+    vadAwait.push(frame);
+    // Structured clone, deliberately no transfer: the frame must survive here
+    // to be accumulated once its verdict comes back.
+    sttWorker.postMessage({ type: 'vad', gen: vadGen, audio: frame });
+    if (vadAwait.length > VAD_AWAIT_MAX) {
+      // The worker stopped answering (crashed after load?). Don't lose the
+      // audio: push everything queued through the energy gate and stay there
+      // for the rest of this session.
+      console.warn('[voice] silero verdicts stopped arriving — energy-gate fallback');
+      vadDegraded = true;
+      vadGen++;                                  // straggler verdicts become stale
+      const backlog = vadAwait;
+      vadAwait = [];
+      for (const f of backlog) applyVadDecision(f, null);
+    }
+    return;
+  }
+  applyVadDecision(frame, null);
+}
+
+// A Silero verdict from the worker: pair it with its queued frame (FIFO — the
+// worker answers every 'vad' message, in order) and run the segmenter.
+function onVadVerdict(msg) {
+  if (msg.gen !== vadGen) return;                // stale: old session/worker
+  const frame = vadAwait.shift();
+  if (!frame || !voiceActive) return;
+  applyVadDecision(frame, msg.prob);
+}
+
+// The segmenter: one frame plus its speech verdict. `prob` is Silero's speech
+// probability, or null when unscored — then the adaptive energy gate decides.
+function applyVadDecision(frame, prob) {
   const frameMs = (frame.length / STT_SAMPLE_RATE) * 1000;
   const level = rms(frame);
-  const threshold = Math.max(VAD_RMS_FLOOR, vadNoiseRms * VAD_NOISE_FACTOR);
-  const speaking = level >= threshold;
+  let speaking;
+  if (prob != null) {
+    // Hysteresis: a confident onset opens the utterance, a much lower bar
+    // keeps it open so quiet word tails aren't chopped mid-sentence.
+    speaking = vadInSpeech ? prob >= VAD_EXIT_PROB : prob >= VAD_SPEECH_PROB;
+  } else {
+    speaking = level >= Math.max(VAD_RMS_FLOOR, vadNoiseRms * VAD_NOISE_FACTOR);
+  }
 
   if (speaking) {
     if (!vadInSpeech) {
@@ -8612,6 +9138,11 @@ async function startCapture() {
   micProcessor.connect(micSink);
   micSink.connect(audioCtx.destination);
   resetVad();
+  // Fresh scoring session: stale verdicts drop, and a worker that wedged last
+  // session gets another chance.
+  vadGen++;
+  vadAwait = [];
+  vadDegraded = false;
 }
 
 function stopCapture() {
@@ -8628,6 +9159,8 @@ function stopCapture() {
   if (audioCtx) { try { audioCtx.close(); } catch (_) {} }
   micProcessor = micSource = micSink = micStream = audioCtx = null;
   resetVad();
+  vadGen++;          // any verdicts still in flight are for a dead session
+  vadAwait = [];
 }
 
 // -- Public controls ---------------------------------------------------------
@@ -8671,7 +9204,13 @@ async function startVoice() {
 function stopVoice({ send = true } = {}) {
   const wasActive = voiceActive;
   // Speech still buffered when the user toggles off is speech they said —
-  // transcribe and type it rather than throw it away.
+  // transcribe and type it rather than throw it away. Frames still awaiting a
+  // Silero verdict are part of that speech too: drain them through the energy
+  // gate synchronously so the tail of the last sentence isn't dropped.
+  const vadBacklog = vadAwait;
+  vadAwait = [];
+  vadGen++;
+  for (const f of vadBacklog) { if (voiceActive) applyVadDecision(f, null); }
   if (vadInSpeech && sttReady && vadSpeechMs >= VAD_MIN_SPEECH_MS) flushSegment();
   sttPending = [];
   voiceActive = false;
@@ -8705,6 +9244,11 @@ function voiceErrMessage(err) {
   }
   if (/NotFoundError|NotReadable|audio/i.test(m)) {
     return 'No usable microphone was found.';
+  }
+  // The native (sherpa) engine failed to start or died — model files download
+  // in-app, so "run fetch-model" advice would be wrong here.
+  if (/speech engine|sherpa/i.test(m)) {
+    return 'Native speech engine problem (' + m + '). Toggle voice again to retry, or pick a different model in Settings → Voice.';
   }
   // An ONNX-runtime backend failure (e.g. WebGPU adapter missing) — the model
   // files are present; the engine just couldn't start. Don't send the user to
@@ -8944,12 +9488,14 @@ if (settingsBtn) settingsBtn.onclick = () => openSettings('general');
 $('settings-close').onclick = closeSettings;
 
 // -- Voice dictionary training -----------------------------------------------
-// "Train dictionary" (Settings → Voice): short practice sentences built from
-// this hive's own prompt history are read aloud; the raw transcript — what the
+// "Train dictionary" (Settings → Voice): practice sentences built from this
+// hive's own prompt history are read aloud; the raw transcript — what the
 // model heard *before* the dictionary ran — is diffed against the target and
 // mismatched runs become proposed corrections the user accepts or skips one by
-// one. Routing lives in commitVoiceText; the deferred check mirrors
-// hmChatSendOnStop so the tail of a reading isn't cut off.
+// one. Misheard terms are re-drilled: woven into extra sentences later in the
+// session, and seeded to the front of the next "Train again". Routing lives in
+// commitVoiceText; the deferred check mirrors hmChatSendOnStop so the tail of
+// a reading isn't cut off.
 
 const vtBackdrop = $('voice-train-backdrop');
 const vtSentenceEl = $('voice-train-sentence');
@@ -9008,7 +9554,7 @@ function voiceTrainSyncMic() {
 // Distinctive-term mining: project vocabulary the speech model likely trips
 // on — identifiers, filenames, product names, uncommon words. Ranked by how
 // often (then how recently) they appear across the history.
-function vtExtractTerms(entries) {
+function vtExtractTerms(entries, seedTerms) {
   const stats = new Map(); // lowercased term -> { forms: Map, count, last }
   const bump = (surface, weight, last) => {
     const lower = surface.toLowerCase();
@@ -9038,24 +9584,46 @@ function vtExtractTerms(entries) {
   for (const e of voiceDict) {
     if (e.to && e.to.trim()) bump(e.to.trim(), 3, entries.length);
   }
+  // Terms misheard last session outrank everything — re-drill them first.
+  for (const t of seedTerms || []) {
+    if (t && t.trim()) bump(t.trim(), 5, entries.length);
+  }
   if (!stats.size) for (const t of ['Hivemind', 'Claude Code', 'GitHub']) bump(t, 1, 0);
   return [...stats.values()]
     .sort((a, b) => b.count - a.count || b.last - a.last)
     .map((s) => [...s.forms.entries()].sort((a, b) => b[1] - a[1])[0][0]);
 }
 
-// Short template sentences packed with the ranked terms, consuming the list
-// without reuse until it runs dry.
+// Template sentences packed with the ranked terms, consuming the list without
+// reuse until it runs dry. A mix of short commands and longer prompt-shaped
+// requests — the kind actually dictated to a thread — so a session exercises
+// both clipped and conversational speech.
+const VT_TEMPLATES = [
+  (a, b) => `Open ${a} and check ${b}.`,
+  (a, b) => `Update ${a} in ${b}.`,
+  (a, b) => `Add a test for ${a} in ${b}.`,
+  (a, b) => `Fix the bug in ${a} near ${b}.`,
+  (a, b, c) => `Rename ${a} to ${b} and run ${c}.`,
+  (a, b) => `Search ${a} for ${b}.`,
+  (a, b) => `Show me ${a} before changing ${b}.`,
+  (a) => `Do a deep dive into the ${a} code and determine where the issue could be.`,
+  (a) => `Have ${a} redo the user interface and look for ways to improve it.`,
+  (a) => `Take a pass over ${a} and tell me what you would simplify.`,
+  (a, b) => `I want more tests added to ${a} to help cover ${b}.`,
+  (a, b) => `Take a closer look at ${a} and figure out why ${b} keeps breaking.`,
+  (a, b) => `Walk me through how ${a} works and explain where ${b} fits in.`,
+  (a, b) => `Refactor ${a} so it is easier to test, then double check ${b}.`,
+  (a, b) => `Before changing anything, summarize what ${a} and ${b} are responsible for.`,
+];
+
 function vtGenerateSentences(terms, n) {
-  const templates = [
-    (a, b) => `Open ${a} and check ${b}.`,
-    (a, b) => `Update ${a} in ${b}.`,
-    (a, b) => `Add a test for ${a} in ${b}.`,
-    (a, b) => `Fix the bug in ${a} near ${b}.`,
-    (a, b, c) => `Rename ${a} to ${b} and run ${c}.`,
-    (a, b) => `Search ${a} for ${b}.`,
-    (a, b) => `Show me ${a} before changing ${b}.`,
-  ];
+  // Shuffle so repeat sessions draw different templates — the pool is larger
+  // than one session consumes.
+  const templates = VT_TEMPLATES.slice();
+  for (let i = templates.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [templates[i], templates[j]] = [templates[j], templates[i]];
+  }
   const out = [];
   let i = 0;
   const next = () => terms.length ? terms[i++ % terms.length] : null;
@@ -9102,7 +9670,7 @@ function vtPickPrompts(entries, n, terms) {
 
 // A session: ~10 sentences alternating generated / verbatim, from whatever
 // material the hive's history offers (fallback seed terms guarantee at least one).
-async function vtBuildSession() {
+async function vtBuildSession(seedTerms) {
   const TARGET = 10;
   let entries = [];
   const dir = activeDir();
@@ -9112,7 +9680,7 @@ async function vtBuildSession() {
       entries = (res && res.ok && Array.isArray(res.entries)) ? res.entries : [];
     } catch (_) { entries = []; }
   }
-  const terms = vtExtractTerms(entries);
+  const terms = vtExtractTerms(entries, seedTerms);
   const gen = vtGenerateSentences(terms, Math.ceil(TARGET / 2));
   const verb = vtPickPrompts(entries, TARGET, terms);
   const sentences = [];
@@ -9126,7 +9694,22 @@ async function vtBuildSession() {
     added: 0,
     heardSegs: [],
     phase: 'listen',
+    missed: [],     // misheard terms awaiting a re-drill sentence this session
+    allMissed: [],  // every miss this session — seeds the next "Train again"
+    extra: 0,       // re-drill sentences appended so far (capped)
   };
+}
+
+// One extra sentence built from terms the model just misheard, appended to the
+// end of the session so the correction (or a freshly added rule) gets verified
+// in a different context a few sentences later.
+const VT_REDRILL_MAX = 3;
+
+function vtRedrillSentence(terms) {
+  const pool = VT_TEMPLATES.filter((t) => t.length <= terms.length);
+  const tpl = pool[Math.floor(Math.random() * pool.length)];
+  const slots = Array.from({ length: tpl.length }, (_, i) => terms[i % terms.length]);
+  return tpl(...slots);
 }
 
 function voiceTrainRenderHeard() {
@@ -9207,6 +9790,13 @@ function voiceTrainCheck() {
     cands.push({ from, to });
   }
 
+  // Every miss is re-drill material, whether or not a rule gets added — the
+  // point is verifying the term survives a second reading.
+  for (const c of cands) {
+    if (!st.missed.includes(c.to)) st.missed.push(c.to);
+    if (!st.allMissed.includes(c.to)) st.allMissed.push(c.to);
+  }
+
   st.phase = 'review';
   if (!cands.length) {
     voiceTrainSetMsg('Close enough — nothing worth adding.', 'ok');
@@ -9242,6 +9832,12 @@ function voiceTrainCheck() {
 function voiceTrainAdvance() {
   const st = voiceTrainState;
   if (!st) return;
+  // Weave pending misses back in: append one re-drill sentence to the end of
+  // the queue so the trouble terms come around again in a fresh context.
+  if (st.missed.length && st.extra < VT_REDRILL_MAX) {
+    st.sentences.push(vtRedrillSentence(st.missed.splice(0, 2)));
+    st.extra++;
+  }
   st.idx++;
   st.heardSegs = [];
   st.phase = st.idx >= st.sentences.length ? 'done' : 'listen';
@@ -9259,9 +9855,33 @@ function voiceTrainRetry() {
   voiceTrainRender();
 }
 
-async function openVoiceTraining() {
+// A session built from one specific prompt (Prompt History → 🎤): the prompt
+// is split into spoken-size sentence chunks and read back verbatim, so a
+// prompt the model garbled can be re-drilled directly. Miss re-drills and
+// "Train again" then behave exactly like a normal session.
+function vtSessionFromText(text) {
+  const whole = String(text || '').trim();
+  const parts = whole
+    .split(/\n+/)
+    .flatMap((line) => line.split(/(?<=[.!?])\s+/))
+    .map((s) => s.trim())
+    .filter(Boolean)
+    .slice(0, 8);
+  return {
+    sentences: parts.length ? parts : [whole],
+    idx: 0,
+    added: 0,
+    heardSegs: [],
+    phase: 'listen',
+    missed: [],
+    allMissed: [],
+    extra: 0,
+  };
+}
+
+async function openVoiceTraining(opts) {
   if (voiceTrainIsOpen()) return;
-  voiceTrainState = await vtBuildSession();
+  voiceTrainState = (opts && opts.text) ? vtSessionFromText(opts.text) : await vtBuildSession();
   voiceTrainCheckOnStop = false;
   vtBackdrop.classList.remove('hidden');
   voiceTrainSetMsg('');
@@ -9285,7 +9905,8 @@ if (vtBackdrop) {
   $('voice-train-close').onclick = closeVoiceTraining;
   $('voice-train-finish').onclick = closeVoiceTraining;
   $('voice-train-again').onclick = async () => {
-    voiceTrainState = await vtBuildSession();
+    // Seed the fresh session with this session's misses so they lead it.
+    voiceTrainState = await vtBuildSession(voiceTrainState ? voiceTrainState.allMissed : []);
     voiceTrainSetMsg('');
     voiceTrainRender();
     if (!voiceActive) startVoice();
@@ -9557,9 +10178,16 @@ if (vModel) vModel.addEventListener('change', () => {
   resetSttWorker();
   if (wasActive) startVoice();
 });
-// Model download progress (first use of a non-bundled model) → HUD.
+// Model download progress (first use of a non-bundled model) → HUD. Big files
+// (the native Parakeet encoder is ~620 MB) report byte progress so the HUD
+// isn't stuck on a file count for minutes.
 if (window.api.onSttDownloadProgress) window.api.onSttDownloadProgress((p) => {
-  if (!sttReady && p && p.total) {
+  if (sttReady || !p || !p.total) return;
+  if (p.totalBytes > 20e6) {
+    setVoiceHudText('Downloading speech model… ' + Math.round((p.bytes || 0) / 1e6) + ' / '
+      + Math.round(p.totalBytes / 1e6) + ' MB'
+      + (p.total > 1 ? ' (file ' + Math.min(p.done + 1, p.total) + ' of ' + p.total + ')' : ''));
+  } else {
     setVoiceHudText('Downloading speech model… ' + p.done + '/' + p.total + ' files');
   }
 });

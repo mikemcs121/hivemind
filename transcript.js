@@ -547,8 +547,16 @@ function scanDir(dir) {
       if (!fresh.length) continue;
       const text = firstUserText(file, st.size, agent);
       const byText = fresh.filter((p) => text && p.lastSent.includes(text));
-      const target =
-        byText.length === 1 ? byText[0] : fresh.length === 1 ? fresh[0] : null;
+      let target = byText.length === 1 ? byText[0] : null;
+      // Lone-pane fallback (no text match): only when the file's first user
+      // message can't be read at all (null) — a genuinely ambiguous rollover,
+      // e.g. /clear followed by a message typed straight into the TUI. If the
+      // first message IS readable and matches none of our panes' sent text,
+      // that's positive evidence the file belongs to an unrelated run (a
+      // `claude -p "…"` in the same directory), so we must NOT hijack the pane
+      // onto it — doing so would swap the chat view to the wrong conversation
+      // and, on restart, --resume the wrong session.
+      if (!target && fresh.length === 1 && !text) target = fresh[0];
       if (target) {
         releaseFile(target);
         claimFile(target, file);

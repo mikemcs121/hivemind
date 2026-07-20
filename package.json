@@ -19,7 +19,8 @@
     "@xterm/addon-search": "^0.15.0",
     "@xterm/xterm": "^5.5.0",
     "dictionary-en": "^4.0.0",
-    "nspell": "^2.1.5"
+    "nspell": "^2.1.5",
+    "sherpa-onnx-node": "^1.13.4"
   },
   "devDependencies": {
     "@electron/rebuild": "^3.6.0",
@@ -36,7 +37,9 @@
     ],
     "asarUnpack": [
       "models/**",
-      "node_modules/@huggingface/transformers/dist/**"
+      "node_modules/@huggingface/transformers/dist/**",
+      "node_modules/sherpa-onnx-node/**",
+      "node_modules/sherpa-onnx-win-x64/**"
     ],
     "win": {
       "target": [

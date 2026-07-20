@@ -19,6 +19,22 @@ const path = require('path');
 
 const PLANS_REL = '.hivemind/plans';
 
+let tmpSeq = 0;
+// Atomic write: fully write a sibling temp file, then rename over the target so
+// a reader (or a concurrent Hivemind thread) never sees a half-written file and
+// a crash mid-write can't truncate it. Node maps rename to
+// MoveFileEx(REPLACE_EXISTING) on Windows and rename(2) elsewhere.
+async function writeAtomic(p, data) {
+  const tmp = `${p}.${process.pid}.${tmpSeq++}.tmp`;
+  try {
+    await fs.promises.writeFile(tmp, data, 'utf8');
+    await fs.promises.rename(tmp, p);
+  } catch (err) {
+    try { await fs.promises.unlink(tmp); } catch { /* nothing to clean up */ }
+    throw err;
+  }
+}
+
 // Resolve `.hivemind/plans/<file>` against the project root and reject anything
 // that escapes it (or a planId carrying path separators / traversal). Returns
 // the absolute path, or null.
@@ -92,7 +108,7 @@ async function writeComments(root, planId, comments) {
   try {
     await fs.promises.mkdir(path.dirname(p), { recursive: true });
     const list = Array.isArray(comments) ? comments : [];
-    await fs.promises.writeFile(p, JSON.stringify(list, null, 2), 'utf8');
+    await writeAtomic(p, JSON.stringify(list, null, 2));
     return { ok: true };
   } catch (err) {
     return { ok: false, message: err.message };
@@ -106,7 +122,7 @@ async function writePlan(root, planId, content) {
   if (!p) return { ok: false, message: 'Invalid plan path.' };
   try {
     await fs.promises.mkdir(path.dirname(p), { recursive: true });
-    await fs.promises.writeFile(p, String(content == null ? '' : content), 'utf8');
+    await writeAtomic(p, String(content == null ? '' : content));
     const { mtimeMs } = await fs.promises.stat(p);
     return { ok: true, mtime: mtimeMs };
   } catch (err) {
@@ -152,7 +168,7 @@ async function ensureIgnored(root) {
     });
     if (already) return { ok: true, added: false };
     const sep = existing.length && !/\n$/.test(existing) ? '\n' : '';
-    await fs.promises.writeFile(gi, existing + sep + '.hivemind/\n', 'utf8');
+    await writeAtomic(gi, existing + sep + '.hivemind/\n');
     return { ok: true, added: true };
   } catch (err) {
     return { ok: false, message: err.message };

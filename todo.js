@@ -28,35 +28,67 @@ function todoPath(root) {
   return resolved;
 }
 
-// Read the todo list. A missing file is a normal "no todos yet" state; a corrupt
-// file yields an empty list so the panel still renders (we never silently
-// overwrite it — only an explicit save from the panel replaces it).
+// Serialize writes per file, and write atomically (temp + rename), so a reader
+// never sees a half-written file and two windows saving at once don't tear the
+// file — Node maps rename to MoveFileEx(REPLACE_EXISTING) on Windows.
+const locks = new Map();
+function withLock(key, fn) {
+  const prev = locks.get(key) || Promise.resolve();
+  const next = prev.then(fn, fn);
+  locks.set(key, next.then(() => {}, () => {}));
+  return next;
+}
+
+let tmpSeq = 0;
+async function writeAtomic(p, data) {
+  const tmp = `${p}.${process.pid}.${tmpSeq++}.tmp`;
+  try {
+    await fs.promises.writeFile(tmp, data, 'utf8');
+    await fs.promises.rename(tmp, p);
+  } catch (err) {
+    try { await fs.promises.unlink(tmp); } catch { /* nothing to clean up */ }
+    throw err;
+  }
+}
+
+// Read the todo list. A missing file is a normal "no todos yet" state. A file
+// that exists but can't be read or parsed (locked mid-write, truncated by a
+// crash) is reported as unreadable — NOT as an empty list — so the panel shows
+// an error rather than an empty list the user's next edit would save over the
+// real todos.
 async function readTodos(root) {
   if (!root) return { ok: false, reason: 'no-dir' };
   const p = todoPath(root);
   if (!p) return { ok: false, reason: 'error', message: 'Invalid todo path.' };
+  let raw;
   try {
-    const raw = await fs.promises.readFile(p, 'utf8');
+    raw = await fs.promises.readFile(p, 'utf8');
+  } catch (err) {
+    if (err.code === 'ENOENT') return { ok: true, todos: [] };
+    return { ok: false, reason: 'unreadable', message: err.message };
+  }
+  try {
     const parsed = JSON.parse(raw);
     return { ok: true, todos: Array.isArray(parsed) ? parsed : [] };
   } catch (err) {
-    if (err.code === 'ENOENT') return { ok: true, todos: [] };
-    return { ok: true, todos: [] };
+    return { ok: false, reason: 'corrupt', message: err.message };
   }
 }
 
-// Write the todo list, creating `.hivemind/` if needed.
+// Write the todo list, creating `.hivemind/` if needed. Serialized and atomic.
 async function writeTodos(root, todos) {
   const p = todoPath(root);
   if (!p) return { ok: false, message: 'Invalid todo path.' };
-  try {
-    await fs.promises.mkdir(path.dirname(p), { recursive: true });
-    const list = Array.isArray(todos) ? todos : [];
-    await fs.promises.writeFile(p, JSON.stringify(list, null, 2), 'utf8');
-    return { ok: true };
-  } catch (err) {
-    return { ok: false, message: err.message };
-  }
+  return withLock(p, async () => {
+    try {
+      await fs.promises.mkdir(path.dirname(p), { recursive: true });
+      const list = Array.isArray(todos) ? todos : [];
+      await writeAtomic(p, JSON.stringify(list, null, 2));
+      return { ok: true };
+    } catch (err) {
+      return { ok: false, message: err.message };
+    }
+  });
 }
 
 module.exports = { readTodos, writeTodos };

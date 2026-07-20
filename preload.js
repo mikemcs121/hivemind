@@ -188,8 +188,15 @@ contextBridge.exposeInMainWorld('api', {
   // on disk (downloading a non-default one into userData on first use), and
   // resolves { ok, alreadyPresent } / { ok:false, error }. Download progress for
   // the current fetch streams via onSttDownloadProgress.
+  // Native models (`native: true` in the renderer's STT_MODELS) decode in a
+  // sherpa-onnx utility process instead of the renderer's WASM worker:
+  // nativeLoad boots it, nativeTranscribe sends one utterance's Float32Array
+  // and resolves { ok, text } | { ok:false, error }, nativeStop kills it.
   stt: {
     ensureModel: (repo) => ipcRenderer.invoke('stt:ensureModel', { repo }),
+    nativeLoad: (repo) => ipcRenderer.invoke('stt:nativeLoad', { repo }),
+    nativeTranscribe: (audio) => ipcRenderer.invoke('stt:nativeTranscribe', { audio }),
+    nativeStop: () => ipcRenderer.send('stt:nativeStop'),
   },
   onSttDownloadProgress: (cb) => {
     const h = (_e, payload) => cb(payload);

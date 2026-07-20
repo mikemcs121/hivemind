@@ -832,6 +832,28 @@ button.usage-pill.crit { color: var(--danger); }
 .chat-plan-body a.plan-link { color: var(--accent); text-decoration: underline; cursor: pointer; }
 .chat-plan-body a.plan-link:hover { color: var(--accent-2); }
 .chat-plan-body hr { border: 0; border-top: 1px solid var(--border); margin: 10px 0; }
+/* Embedded review on the plan card: the ＋ Comment button anchors to this
+   wrapper, and the comment rail + feedback row reuse the review window's
+   plan-cmt-* styles (defined with the plan-review rules further down). */
+.chat-plan-wrap { position: relative; }
+.chat-plan-cmts {
+  border-top: 1px solid var(--border); background: var(--panel);
+  max-height: 220px; overflow-y: auto;
+  font-size: calc(var(--pane-font, 13px) - 1px);
+}
+.chat-plan-cmts.hidden { display: none; }
+.chat-plan-feedback {
+  display: flex; align-items: center; gap: 6px;
+  padding: 7px 9px; border-top: 1px solid var(--border);
+}
+.chat-plan-feedback input {
+  flex: 1; min-width: 0;
+  background: var(--bg); color: var(--text); border: 1px solid var(--border);
+  border-radius: 6px; padding: 4px 8px; font: inherit;
+  font-size: calc(var(--pane-font, 13px) - 2px);
+}
+.chat-plan-feedback button { flex: none; }
+.chat-plan-feedback button:disabled { opacity: .45; cursor: default; }
 
 .chat-question-foot { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
 .chat-question.answered .chat-question-foot { display: none; }
@@ -1482,15 +1504,18 @@ button.usage-pill.crit { color: var(--danger); }
 }
 .history-row-time { font-size: 11px; color: var(--muted); margin-top: 2px; }
 .history-row-del,
-.history-row-send {
+.history-row-send,
+.history-row-speak {
   flex: none; display: none;
   background: transparent; border: none; color: var(--muted);
   cursor: pointer; font-size: 13px; padding: 1px 4px; border-radius: 4px;
 }
 .history-row:hover .history-row-del,
-.history-row:hover .history-row-send { display: block; }
+.history-row:hover .history-row-send,
+.history-row:hover .history-row-speak { display: block; }
 .history-row-del:hover { color: var(--danger); background: var(--bg); }
-.history-row-send:hover { color: var(--accent); background: var(--bg); }
+.history-row-send:hover,
+.history-row-speak:hover { color: var(--accent); background: var(--bg); }
 
 .history-empty { color: var(--muted); padding: 12px; font-size: 12px; }
 
@@ -1924,9 +1949,30 @@ mark.plan-cmt {
   font-size: 13px; line-height: 1.45; white-space: pre-wrap;
   overflow-wrap: break-word;
 }
-.hm-msg.user { align-self: flex-end; background: var(--surface); }
+.hm-msg.user { align-self: flex-end; background: var(--surface); position: relative; }
 .hm-msg.bee { align-self: flex-start; background: var(--panel); border: 1px solid var(--border); }
 .hm-msg.err { border-color: var(--danger); }
+/* Edit & re-apply a sent command — pencil floats left of the bubble on hover. */
+.hm-msg-edit {
+  position: absolute; left: -24px; top: 50%; transform: translateY(-50%);
+  background: transparent; border: none; color: var(--muted); cursor: pointer;
+  font-size: 12px; padding: 2px 4px; opacity: 0; transition: opacity 0.12s;
+}
+.hm-msg.user:hover .hm-msg-edit, .hm-msg-edit:focus-visible { opacity: 1; }
+.hm-msg-edit:hover { color: var(--text); }
+.hm-msg.user.editing { width: 85%; }
+.hm-edit-ta {
+  width: 100%; resize: none; box-sizing: border-box;
+  background: var(--panel); border: 1px solid var(--border); color: var(--text);
+  border-radius: 6px; padding: 6px 8px; font-size: 13px; font-family: inherit;
+  line-height: 1.45;
+}
+.hm-edit-actions { display: flex; gap: 6px; justify-content: flex-end; margin-top: 6px; }
+.hm-edit-actions button {
+  font-size: 12px; padding: 3px 10px; border-radius: 6px; cursor: pointer;
+  background: var(--panel); border: 1px solid var(--border); color: var(--text);
+}
+.hm-edit-actions button.primary { background: var(--accent); border: none; color: var(--on-accent); }
 .hm-chat-inputrow {
   display: flex; align-items: flex-end; gap: 8px;
   padding: 10px; border-top: 1px solid var(--border);

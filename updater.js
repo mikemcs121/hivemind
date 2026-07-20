@@ -95,22 +95,53 @@ function httpsGet(url, redirectsLeft = 5) {
   });
 }
 
+// Stream a URL to `destPath`. Every failure mode — write-stream error (disk
+// full / permission), response-stream error (connection dropped mid-body), a
+// bad or non-HTTPS redirect, an idle stall — rejects the promise exactly once
+// instead of throwing an unhandled 'error' that would crash the main process.
 function downloadToFile(url, destPath) {
   return new Promise((resolve, reject) => {
     const file = fs.createWriteStream(destPath);
+    let settled = false;
+    const fail = (err) => {
+      if (settled) return;
+      settled = true;
+      file.destroy();
+      reject(err);
+    };
+    file.on('error', fail);
+
     function download(u, redirectsLeft = 5) {
-      https.get(u, { headers: { 'User-Agent': USER_AGENT } }, res => {
+      let parsed;
+      try { parsed = new URL(u); } catch (_) { return fail(new Error(`Invalid download URL: ${u}`)); }
+      // Only ever fetch over HTTPS — a redirect to http:// would silently drop
+      // TLS and (via `https.get`) throw synchronously here otherwise.
+      if (parsed.protocol !== 'https:') return fail(new Error(`Refusing non-HTTPS download (${parsed.protocol})`));
+
+      const req = https.get(parsed, { headers: { 'User-Agent': USER_AGENT } }, res => {
         if ([301, 302, 303, 307, 308].includes(res.statusCode) && res.headers.location && redirectsLeft > 0) {
-          download(res.headers.location, redirectsLeft - 1);
+          res.resume(); // drain so the socket can be reused/closed
+          let next;
+          try { next = new URL(res.headers.location, parsed).toString(); } catch (_) { return fail(new Error('Bad redirect location')); }
+          download(next, redirectsLeft - 1);
           return;
         }
         if (res.statusCode !== 200) {
-          reject(new Error(`Download failed (HTTP ${res.statusCode})`));
-          return;
+          res.resume();
+          return fail(new Error(`Download failed (HTTP ${res.statusCode})`));
         }
+        res.on('error', fail);
         res.pipe(file);
-        file.on('finish', () => file.close(resolve));
-      }).on('error', reject);
+        file.on('finish', () => {
+          if (settled) return;
+          settled = true;
+          file.close(err => (err ? reject(err) : resolve()));
+        });
+      });
+      // Idle-stall guard: a server that sends headers then nothing must not
+      // leave the update promise pending forever.
+      req.setTimeout(120000, () => req.destroy(new Error('Download timed out')));
+      req.on('error', fail);
     }
     download(url);
   });
@@ -163,46 +194,78 @@ async function checkForUpdates(win) {
       // leave a half-written, launchable exe behind.
       await downloadToFile(portableAsset.browser_download_url, partPath);
 
-      // Promote the completed download to its final name.
+      // Integrity check: a misbehaving proxy/captive portal can return a clean
+      // HTTP 200 with a truncated body, which would otherwise be promoted and
+      // launched. GitHub reports the exact asset byte size, so verify against
+      // it before we touch the old exe. (No published hash to check, but a size
+      // mismatch catches the truncation case that matters.)
+      const expectedSize = Number(portableAsset.size) || 0;
+      const gotSize = fs.statSync(partPath).size;
+      if (expectedSize && gotSize !== expectedSize) {
+        throw new Error(`Downloaded ${gotSize} bytes but expected ${expectedSize} — update aborted to protect the working copy.`);
+      }
+
+      // Promote the completed, size-verified download to its final name.
       try { fs.unlinkSync(newExePath); } catch (_) { /* didn't exist */ }
       fs.renameSync(partPath, newExePath);
 
-      // Launch the new version, schedule deletion of the old exe, then quit.
-      spawn(newExePath, [], { detached: true, stdio: 'ignore' }).unref();
+      // Launch the new version. Deleting the old exe is destructive, so gate it
+      // on the new process ACTUALLY spawning: the 'spawn' event fires only once
+      // the OS started the process (catching a corrupt PE or AV-quarantined
+      // download), and 'error' fires if it couldn't — in which case we keep the
+      // old exe and tell the user rather than delete their only working copy.
+      const child = spawn(newExePath, [], { detached: true, stdio: 'ignore' });
+      let launchSettled = false;
 
-      // Delete the running exe AND every other older-versioned sibling, so a
-      // folder that accumulated old copies is swept in one update. The old exe
-      // stays locked until this process (and the portable launcher wrapping
-      // it) fully exits, so retry the deletes for up to ~30s and then give up
-      // rather than loop forever. `ping` is the delay because `timeout`
-      // refuses to run without console input, which a hidden window doesn't
-      // have.
-      const staleExes = findOlderExes(currentDir, latestTag);
-      if (!staleExes.some(p => p.toLowerCase() === oldExePath.toLowerCase())) {
-        staleExes.push(oldExePath); // renamed exe won't match the pattern
-      }
-      const batPath = path.join(app.getPath('temp'), 'hivemind-update-cleanup.bat');
-      fs.writeFileSync(batPath, [
-        '@echo off',
-        'set tries=0',
-        ':loop',
-        'set /a tries+=1',
-        ...staleExes.map(p => `del /f /q "${p}" >nul 2>nul`),
-        'if not exist ' + staleExes.map(p => `"${p}"`).join(' if not exist ') + ' goto done',
-        'if %tries% geq 30 goto done',
-        'ping -n 2 127.0.0.1 >nul',
-        'goto loop',
-        ':done',
-        'del /f /q "%~f0"',
-        '',
-      ].join('\r\n'));
-      spawn('cmd.exe', ['/c', batPath], { detached: true, stdio: 'ignore', windowsHide: true }).unref();
+      child.on('error', async (err) => {
+        if (launchSettled) return;
+        launchSettled = true;
+        await dialog.showMessageBox(win, {
+          type: 'error',
+          title: 'Update Failed',
+          message: `The updated version could not be started:\n${err.message}\n\nYour current version is unchanged. You can try again later, or download it manually from:\n${RELEASES_URL}`,
+        });
+      });
 
-      app.quit();
-      // node-pty's ConPTY children can keep the main process alive after
-      // quit on Windows, leaving a hidden zombie that holds the old exe
-      // locked forever. If quit hasn't actually exited shortly, force it.
-      setTimeout(() => app.exit(0), 5000);
+      child.on('spawn', () => {
+        if (launchSettled) return;
+        launchSettled = true;
+        child.unref();
+
+        // Delete the running exe AND every other older-versioned sibling, so a
+        // folder that accumulated old copies is swept in one update. The old
+        // exe stays locked until this process (and the portable launcher
+        // wrapping it) fully exits, so retry the deletes for up to ~30s and
+        // then give up rather than loop forever. `ping` is the delay because
+        // `timeout` refuses to run without console input, which a hidden
+        // window doesn't have.
+        const staleExes = findOlderExes(currentDir, latestTag);
+        if (!staleExes.some(p => p.toLowerCase() === oldExePath.toLowerCase())) {
+          staleExes.push(oldExePath); // renamed exe won't match the pattern
+        }
+        const batPath = path.join(app.getPath('temp'), 'hivemind-update-cleanup.bat');
+        fs.writeFileSync(batPath, [
+          '@echo off',
+          'set tries=0',
+          ':loop',
+          'set /a tries+=1',
+          ...staleExes.map(p => `del /f /q "${p}" >nul 2>nul`),
+          'if not exist ' + staleExes.map(p => `"${p}"`).join(' if not exist ') + ' goto done',
+          'if %tries% geq 30 goto done',
+          'ping -n 2 127.0.0.1 >nul',
+          'goto loop',
+          ':done',
+          'del /f /q "%~f0"',
+          '',
+        ].join('\r\n'));
+        spawn('cmd.exe', ['/c', batPath], { detached: true, stdio: 'ignore', windowsHide: true }).unref();
+
+        app.quit();
+        // node-pty's ConPTY children can keep the main process alive after
+        // quit on Windows, leaving a hidden zombie that holds the old exe
+        // locked forever. If quit hasn't actually exited shortly, force it.
+        setTimeout(() => app.exit(0), 5000);
+      });
     } catch (dlErr) {
       try { fs.unlinkSync(partPath); } catch (_) { /* nothing to clean */ }
       await dialog.showMessageBox(win, {

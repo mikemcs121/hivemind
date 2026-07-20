@@ -1,6 +1,6 @@
 'use strict';
 
-const { app, BrowserWindow, Menu, MenuItem, ipcMain, dialog, Notification, clipboard, protocol, net, shell } = require('electron');
+const { app, BrowserWindow, Menu, MenuItem, ipcMain, dialog, Notification, clipboard, protocol, net, shell, utilityProcess } = require('electron');
 const path = require('path');
 const { pathToFileURL } = require('url');
 const fs = require('fs');
@@ -59,6 +59,26 @@ const STT_DOWNLOADS = {
     'onnx/encoder_model_quantized.onnx',
     'onnx/decoder_model_merged_quantized.onnx',
   ],
+  'csukuangfj/sherpa-onnx-nemo-parakeet-tdt-0.6b-v2-int8': [
+    'encoder.int8.onnx',
+    'decoder.int8.onnx',
+    'joiner.int8.onnx',
+    'tokens.txt',
+  ],
+};
+
+// Native speech models: too heavy for the renderer's WASM worker, so they run
+// via sherpa-onnx in a utility process (see stt-native.js). Maps repo id to
+// the recognizer's file layout; renderer entries with `native: true` in
+// STT_MODELS must have a row here (and one in STT_DOWNLOADS to be fetchable).
+const STT_NATIVE = {
+  'csukuangfj/sherpa-onnx-nemo-parakeet-tdt-0.6b-v2-int8': {
+    encoder: 'encoder.int8.onnx',
+    decoder: 'decoder.int8.onnx',
+    joiner: 'joiner.int8.onnx',
+    tokens: 'tokens.txt',
+    modelType: 'nemo_transducer',
+  },
 };
 
 const HM_MIME = {
@@ -313,6 +333,28 @@ function createWindow() {
 
   mainWindow.removeMenu();
   mainWindow.loadFile(path.join(__dirname, 'src', 'index.html'));
+
+  // Lock down navigation. The renderer is a local file:// page that should never
+  // navigate anywhere else and never open child windows (which would inherit the
+  // preload and re-expose window.api). Any http/https/mailto link goes to the OS
+  // browser instead; everything else is denied. Backstops the renderer's own
+  // escaping so a stray link/injection can't repoint the app or spawn a window.
+  mainWindow.webContents.setWindowOpenHandler(({ url }) => {
+    try {
+      const u = new URL(String(url));
+      if (['http:', 'https:', 'mailto:'].includes(u.protocol)) shell.openExternal(u.href);
+    } catch (_) { /* malformed URL — just deny */ }
+    return { action: 'deny' };
+  });
+  mainWindow.webContents.on('will-navigate', (e, url) => {
+    if (url !== mainWindow.webContents.getURL()) {
+      e.preventDefault();
+      try {
+        const u = new URL(String(url));
+        if (['http:', 'https:', 'mailto:'].includes(u.protocol)) shell.openExternal(u.href);
+      } catch (_) { /* malformed URL — stay put */ }
+    }
+  });
 
   // Microphone access for the voice-to-text control. The renderer drives speech
   // recognition (Web Speech API), which opens the mic via getUserMedia; without
@@ -840,6 +882,9 @@ app.whenReady().then(() => {
     if (files.every((f) => fs.existsSync(path.join(dest, f)))) {
       return { ok: true, alreadyPresent: true };
     }
+    const progress = (payload) => {
+      if (evt.sender && !evt.sender.isDestroyed()) evt.sender.send('stt:downloadProgress', payload);
+    };
     try {
       for (let i = 0; i < files.length; i++) {
         const f = files[i];
@@ -847,18 +892,112 @@ app.whenReady().then(() => {
         if (fs.existsSync(out)) continue;
         const res = await net.fetch(`https://huggingface.co/${repo}/resolve/main/${f}`);
         if (!res.ok) throw new Error(`${f}: HTTP ${res.status} ${res.statusText}`);
-        const buf = Buffer.from(await res.arrayBuffer());
         fs.mkdirSync(path.dirname(out), { recursive: true });
-        fs.writeFileSync(out, buf);
-        if (evt.sender && !evt.sender.isDestroyed()) {
-          evt.sender.send('stt:downloadProgress', { repo, done: i + 1, total: files.length });
+        // Stream to a .part file: native models run to hundreds of MB, so
+        // buffering in memory is off the table, and the rename at the end
+        // means a killed download can't leave a truncated file that would
+        // pass the existence check above. Byte progress streams to the HUD.
+        const totalBytes = Number(res.headers.get('content-length')) || 0;
+        const ws = fs.createWriteStream(out + '.part');
+        const reader = res.body.getReader();
+        let bytes = 0;
+        let lastAt = 0;
+        for (;;) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          bytes += value.length;
+          if (!ws.write(Buffer.from(value))) await new Promise((r) => ws.once('drain', r));
+          const now = Date.now();
+          if (now - lastAt > 250) {
+            lastAt = now;
+            progress({ repo, done: i, total: files.length, file: f, bytes, totalBytes });
+          }
         }
+        await new Promise((resolve, reject) => ws.end((err) => (err ? reject(err) : resolve())));
+        fs.renameSync(out + '.part', out);
+        progress({ repo, done: i + 1, total: files.length, file: f, bytes, totalBytes });
       }
       return { ok: true, alreadyPresent: false };
     } catch (err) {
       return { ok: false, error: (err && err.message) || String(err) };
     }
   });
+
+  // -- IPC: native speech engine (sherpa-onnx in a utility process) ---------
+  // Heavy models (Parakeet) decode natively with full multi-core CPU — far
+  // beyond what the renderer's WASM worker can do — in a child process, so
+  // inference can't stall the UI and a native crash can't take down the app.
+  // One engine at a time; picking a different model replaces it.
+  let nativeStt = null;   // { proc, repo, pending: Map<id, resolve>, nextId, ready }
+
+  function stopNativeStt() {
+    if (!nativeStt) return;
+    const st = nativeStt;
+    nativeStt = null;
+    try { st.proc.kill(); } catch (_) { /* already gone */ }
+    for (const resolve of st.pending.values()) resolve({ ok: false, error: 'speech engine stopped' });
+    st.pending.clear();
+  }
+
+  ipcMain.handle('stt:nativeLoad', (_e, { repo }) => {
+    const spec = STT_NATIVE[repo];
+    if (!spec) return { ok: false, error: 'not a native speech model: ' + repo };
+    if (nativeStt && nativeStt.repo === repo) return nativeStt.ready;
+    stopNativeStt();
+
+    // Prefer the user-downloaded copy; tolerate a bundled one for dev setups.
+    const roots = [path.join(app.getPath('userData'), 'models', repo), path.join(__dirname, 'models', repo)];
+    const dir = roots.find((r) => fs.existsSync(path.join(r, spec.tokens)));
+    if (!dir) return { ok: false, error: 'model files missing — download did not complete' };
+
+    const proc = utilityProcess.fork(path.join(__dirname, 'stt-native.js'), [], { serviceName: 'hivemind-stt' });
+    const st = { proc, repo, pending: new Map(), nextId: 0, ready: null };
+    nativeStt = st;
+    st.ready = new Promise((resolve) => {
+      proc.once('exit', () => {
+        // Covers both a load-time crash (resolve the ready promise with an
+        // error) and a later one (fail whatever was in flight).
+        resolve({ ok: false, error: 'speech engine process exited' });
+        if (nativeStt === st) nativeStt = null;
+        for (const res of st.pending.values()) res({ ok: false, error: 'speech engine crashed' });
+        st.pending.clear();
+      });
+      proc.on('message', (msg) => {
+        if (!msg) return;
+        if (msg.type === 'ready') resolve({ ok: true });
+        else if (msg.type === 'error') { resolve({ ok: false, error: msg.message }); stopNativeStt(); }
+        else if (msg.type === 'result') {
+          const res = st.pending.get(msg.id);
+          if (res) { st.pending.delete(msg.id); res({ ok: true, text: msg.text || '', error: msg.error }); }
+        }
+      });
+      proc.postMessage({
+        type: 'load',
+        config: {
+          encoder: path.join(dir, spec.encoder),
+          decoder: path.join(dir, spec.decoder),
+          joiner: path.join(dir, spec.joiner),
+          tokens: path.join(dir, spec.tokens),
+          modelType: spec.modelType,
+        },
+        numThreads: Math.max(1, Math.min(os.cpus().length - 2, 8)),
+      });
+    });
+    return st.ready;
+  });
+
+  ipcMain.handle('stt:nativeTranscribe', (_e, { audio }) => {
+    const st = nativeStt;
+    if (!st) return { ok: false, error: 'speech engine not running' };
+    const id = ++st.nextId;
+    return new Promise((resolve) => {
+      st.pending.set(id, resolve);
+      st.proc.postMessage({ type: 'transcribe', id, audio });
+    });
+  });
+
+  ipcMain.on('stt:nativeStop', () => stopNativeStt());
+  app.on('will-quit', () => stopNativeStt());
 
   // -- IPC: portable build --------------------------------------------------
   // Detect whether a hive's directory is the Hivemind source checkout, and (if
