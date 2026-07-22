@@ -392,6 +392,67 @@ async function ghCreateRepo(cwd, { name, visibility = 'private', push = true } =
   });
 }
 
+// List the signed-in user's GitHub repositories for the clone picker. Returns
+// a parsed array (newest-updated first, as gh sorts them) or an error object.
+// gh carries its own auth, so this only works once the user is signed in.
+async function ghListRepos({ limit = 100 } = {}) {
+  const n = Math.min(Math.max(parseInt(limit, 10) || 100, 1), 500);
+  const res = await runCmd('gh', undefined, [
+    'repo', 'list',
+    '--limit', String(n),
+    '--json', 'nameWithOwner,description,visibility,updatedAt,url',
+  ], { timeout: 60000, notFound: 'The GitHub CLI (gh) is not installed.' });
+  if (res.code !== 0) {
+    return { ok: false, message: (res.stderr || res.stdout || 'Could not list repositories.').trim() };
+  }
+  try {
+    const list = JSON.parse(res.stdout || '[]');
+    return { ok: true, repos: Array.isArray(list) ? list : [] };
+  } catch (_) {
+    return { ok: false, message: 'Could not parse the repository list from gh.' };
+  }
+}
+
+// Clone a repo into <destParent>/<folder> and return the created path. `target`
+// is an owner/repo shorthand or a clone URL; gh handles auth (private repos
+// included). Guards: target can't start with '-' (option injection), folder is
+// a strict single path segment, and the destination must not already exist —
+// git clone into a populated directory is exactly the mess we want to avoid.
+async function ghClone({ target, destParent, folder } = {}) {
+  const t = (target || '').trim();
+  if (!t || t.startsWith('-')) return { code: 1, stdout: '', stderr: 'A repository to clone is required.' };
+  const parent = (destParent || '').trim();
+  if (!parent) return { code: 1, stdout: '', stderr: 'Choose a folder to clone into.' };
+
+  // Derive a default folder name from the repo when the caller left it blank.
+  let name = (folder || '').trim();
+  if (!name) {
+    name = t.replace(/\.git$/i, '').replace(/[\\/]+$/, '').split(/[\\/]/).pop() || 'repo';
+  }
+  if (name === '.' || name === '..' || !/^[A-Za-z0-9._-]+$/.test(name)) {
+    return { code: 1, stdout: '', stderr: 'Invalid folder name. Use letters, numbers, dashes, underscores, or dots.' };
+  }
+
+  let dest;
+  try {
+    if (!fs.existsSync(parent) || !fs.statSync(parent).isDirectory()) {
+      return { code: 1, stdout: '', stderr: 'The chosen location is not an existing folder.' };
+    }
+    dest = path.join(parent, name);
+    if (fs.existsSync(dest)) {
+      return { code: 1, stdout: '', stderr: `A folder named "${name}" already exists there. Pick a different name.` };
+    }
+  } catch (e) {
+    return { code: 1, stdout: '', stderr: String((e && e.message) || e) };
+  }
+
+  const res = await runCmd('gh', parent, ['repo', 'clone', t, dest], {
+    timeout: 300000, // clones can be large; well past the 120s network default
+    notFound: 'The GitHub CLI (gh) is not installed.',
+  });
+  return Object.assign({}, res, { dir: res.code === 0 ? dest : null });
+}
+
 // ---------------------------------------------------------------------------
 // AI commit message: feed the current diff to `claude -p` and return the text.
 // Prefers the staged diff; falls back to the full working-tree diff. The
@@ -514,5 +575,5 @@ async function hmInterpret(payload) {
 module.exports = {
   status, diff, stage, stageAll, unstage, unstageAll, discard,
   commit, branches, log, checkout, createBranch, init, fetch, pull, push, resetToRemote,
-  getRemoteUrl, setRemoteOrigin, ghCheck, ghCreateRepo, aiCommit, hmInterpret,
+  getRemoteUrl, setRemoteOrigin, ghCheck, ghCreateRepo, ghListRepos, ghClone, aiCommit, hmInterpret,
 };

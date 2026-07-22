@@ -264,6 +264,93 @@ function spawnPty({ id, cwd, cols, rows, startupCommand, model, resume, permissi
 }
 
 // ---------------------------------------------------------------------------
+// GitHub device-flow sign-in, for the "Clone from GitHub" New-hive wizard.
+//
+// `gh auth login --web` is interactive and refuses to run without a real TTY,
+// so we drive it through a node-pty shell exactly like a terminal pane: type
+// the command, parse the one-time code out of the output, open the GitHub
+// device page in the browser, and auto-answer gh's remaining prompts. Progress
+// streams to the renderer over `gh:authStatus`. Only one login runs at a time.
+// ---------------------------------------------------------------------------
+let ghAuthProc = null;
+
+function sendGhAuth(win, payload) {
+  if (win && !win.isDestroyed()) win.webContents.send('gh:authStatus', payload);
+}
+
+function startGhAuth(win) {
+  cancelGhAuth();
+  const shellPath = defaultShell();
+  let proc;
+  try {
+    proc = pty.spawn(shellPath, [], {
+      name: 'xterm-color', cols: 80, rows: 24, cwd: os.homedir(),
+      env: Object.assign({}, process.env, { NO_COLOR: '1', GIT_TERMINAL_PROMPT: '0' }),
+      useConpty: true,
+    });
+  } catch (_) {
+    sendGhAuth(win, { phase: 'error', message: 'Could not start a shell to run gh.' });
+    return { ok: false };
+  }
+  ghAuthProc = proc;
+
+  let buf = '';
+  let sawCode = false;
+  let answeredCred = false;
+  let done = false;
+  const finish = (phase, extra) => {
+    if (done) return;
+    done = true;
+    clearTimeout(timer);
+    sendGhAuth(win, Object.assign({ phase }, extra || {}));
+    try { proc.kill(); } catch (_) { /* already gone */ }
+    if (ghAuthProc === proc) ghAuthProc = null;
+  };
+  const timer = setTimeout(
+    () => finish('error', { message: 'Timed out waiting for GitHub sign-in. Please try again.' }),
+    300000,
+  );
+
+  proc.onData((data) => {
+    buf += data;
+    // gh decorates its output with ANSI; strip it so the regexes see plain text.
+    const clean = buf.replace(/\x1b\[[0-9;?]*[A-Za-z]/g, '');
+
+    const codeM = clean.match(/one-time code:\s*([A-Z0-9]{4}-[A-Z0-9]{4})/i);
+    if (codeM && !sawCode) {
+      sawCode = true;
+      sendGhAuth(win, { phase: 'code', code: codeM[1], url: 'https://github.com/login/device' });
+      try { shell.openExternal('https://github.com/login/device'); } catch (_) { /* user can open manually */ }
+    }
+    // gh blocks on "Press Enter to open github.com…" — nudge it forward.
+    if (/Press Enter/i.test(data)) { try { proc.write('\r'); } catch (_) { /* ignore */ } }
+    // "Authenticate Git with your GitHub credentials? (Y/n)" — accept the default.
+    else if (!answeredCred && /credentials\?/i.test(clean)) { answeredCred = true; try { proc.write('\r'); } catch (_) { /* ignore */ } }
+
+    if (/Authentication complete|Logged in (?:to \S+ )?as\b|✓\s*Logged in/i.test(clean)) {
+      const userM = clean.match(/Logged in (?:to \S+ )?as\s+(\S+)/i);
+      finish('success', { user: userM ? userM[1] : null });
+    }
+  });
+  proc.onExit(() => { if (!done) finish('error', { message: 'gh sign-in ended before completing. Please try again.' }); });
+
+  // Let the shell prompt settle, then type the login command. --git-protocol
+  // https + --web leaves only prompts we auto-answer above.
+  setTimeout(() => {
+    if (ghAuthProc === proc) {
+      try { proc.write('gh auth login --hostname github.com --git-protocol https --web\r'); } catch (_) { /* ignore */ }
+    }
+  }, 600);
+  sendGhAuth(win, { phase: 'starting' });
+  return { ok: true };
+}
+
+function cancelGhAuth() {
+  if (ghAuthProc) { try { ghAuthProc.kill(); } catch (_) { /* ignore */ } ghAuthProc = null; }
+  return { ok: true };
+}
+
+// ---------------------------------------------------------------------------
 // Filesystem watcher: a single recursive watch on the active board's directory.
 // Debounced so a burst of writes (e.g. a build) collapses into one refresh.
 // ---------------------------------------------------------------------------
@@ -786,6 +873,12 @@ app.whenReady().then(() => {
   ipcMain.handle('git:setRemote', (_e, { cwd, url }) => git.setRemoteOrigin(cwd, url));
   ipcMain.handle('gh:check', () => git.ghCheck());
   ipcMain.handle('gh:createRepo', (_e, { cwd, name, visibility, push }) => git.ghCreateRepo(cwd, { name, visibility, push }));
+  // "Clone from GitHub" New-hive wizard: list the user's repos, run a PTY-driven
+  // device-flow sign-in, and clone a chosen repo into a new folder.
+  ipcMain.handle('gh:listRepos', (_e, opts) => git.ghListRepos(opts || {}));
+  ipcMain.handle('gh:clone', (_e, opts) => git.ghClone(opts || {}));
+  ipcMain.handle('gh:authStart', (e) => startGhAuth(BrowserWindow.fromWebContents(e.sender) || mainWindow));
+  ipcMain.handle('gh:authCancel', () => cancelGhAuth());
   ipcMain.handle('git:aiCommit', (_e, { cwd }) => git.aiCommit(cwd));
   // Conversational Hivemind commands: map free-form phrasing onto the command
   // registry with a one-shot `claude -p` (fast model, scratch dir).
@@ -1075,6 +1168,7 @@ function sweepOldTempImages() {
 
 app.on('window-all-closed', () => {
   transcript.disposeAll();
+  cancelGhAuth();
   for (const { proc } of ptys.values()) {
     try {
       proc.kill();

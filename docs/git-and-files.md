@@ -42,6 +42,8 @@ raw CLI result shape `{ code, stdout, stderr }` — **they never reject**; failu
 | `setRemoteOrigin(cwd, url)` (`git.js:334`) | url | CLI result | `git remote add origin <url>` or `set-url` if origin exists |
 | `ghCheck()` (`git.js:346`) | none | `{ installed, authenticated, user, message }` | `gh --version`; `gh auth status` |
 | `ghCreateRepo(cwd, { name, visibility, push })` (`git.js:367`) | name may be `repo` or `owner/repo` | CLI result (120s) | `gh repo create <n> --source <cwd> --remote origin --private/--public/--internal [--push]` (push only if `HEAD` exists) |
+| `ghListRepos({ limit })` | limit clamped 1–500 (default 100) | `{ ok, repos: [{ nameWithOwner, description, visibility, updatedAt, url }] }` or `{ ok:false, message }` | `gh repo list --limit <n> --json …` |
+| `ghClone({ target, destParent, folder })` | `target` = owner/repo or URL; `folder` a single path segment (defaults from `target`) | CLI result (300s) plus `dir` (created path, or `null` on failure) | `gh repo clone <target> <destParent>/<folder>` — refuses if the dest already exists |
 | `aiCommit(cwd)` (`git.js:445`) | — | `{ code, message }` | `git diff --staged` (fallback `git diff`), truncated at 60 KB, piped on stdin to `claude -p "<fixed instruction>"` run in a temp scratch dir |
 | `hmInterpret(payload)` (`git.js:486`) | JSON-able payload (≤100 KB) | `{ code, message }` — one command line or `NONE` | `claude -p --model haiku "<fixed instruction>"` with the payload as stdin JSON. Lives here only because it reuses `runClaudePrompt` |
 
@@ -67,8 +69,12 @@ Every path is a project-relative, "/"-separated `rel` resolved through `safeJoin
 Wiring is uniform: renderer calls `window.api.git.*` / `window.api.files.*` (exposed by
 `contextBridge` in `preload.js:61-108`), which `ipcRenderer.invoke`s a channel handled in
 `main.js:746-785`, which calls the module function directly. Channel names mirror the
-function names (`git:status`, `git:diff`, … `gh:check`, `gh:createRepo`, `git:aiCommit`,
-`hm:interpret`, `files:list`, `files:open`, `files:reveal`).
+function names (`git:status`, `git:diff`, … `gh:check`, `gh:createRepo`, `gh:listRepos`,
+`gh:clone`, `git:aiCommit`, `hm:interpret`, `files:list`, `files:open`, `files:reveal`).
+Exception: the GitHub device-flow **sign-in** (`gh:authStart`/`gh:authCancel`, streaming
+`gh:authStatus`) is *not* backed by `git.js` — it runs `gh auth login --web` inside a
+`node-pty` shell in the main process (`startGhAuth`, `main.js`), because that command needs
+a real TTY.
 
 | Feature | Renderer | Channel(s) → function |
 |---|---|---|
@@ -84,6 +90,7 @@ function names (`git:status`, `git:diff`, … `gh:check`, `gh:createRepo`, `git:
 | Push button (Ctrl+Enter in message box): stages all → commits (auto-drafts message if box empty, fallback "Update from Hivemind") → pushes, `-u origin <branch>` first time | `doPush` `renderer.js:5850` | `git:stageAll`, `git:commit`, `git:aiCommit`, `git:push` |
 | ⋯ overflow → "Revert to GitHub" (confirm dialog) | `doRevertToRemote` `renderer.js:5712` | `git:resetToRemote` |
 | "Connect to GitHub" wizard (create via gh, or link URL + push) | `renderer.js:8216-8369` | `gh:check`, `gh:createRepo`, `git:setRemote`, `git:push` |
+| "Clone a project from GitHub…" in the New-hive modal (`#modal-clone` → `#clone-backdrop`): sign in via device flow, pick a repo (list or URL) + destination, clone, fill the modal's dir/name | `openCloneWizard`/`renderCloneChoose`/`cloneDoClone` `renderer.js` | `gh:check`, `gh:authStart`+`gh:authStatus`, `gh:listRepos`, `gh:clone` |
 | `show diff [for <file>]` chat command | `renderer.js:1698` | `git:status`, then `showDiff` |
 | File Explorer panel (`#files-toggle`): lazy tree, click = OS-open, ⤓ insert path into thread, ⧉ reveal | `refreshFiles`/`renderFxItem` `renderer.js:6036-6138` | `files:list`, `files:open`, `files:reveal` |
 | Slash-command autocomplete (`.claude/commands`, `.claude/skills`) and `@`-path completion in composer | `renderer.js:2768-2810` | `files:list` |

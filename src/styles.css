@@ -1804,12 +1804,12 @@ mark.plan-cmt {
 .gh-card:hover { border-color: var(--accent); }
 .gh-card .gh-card-title { font-weight: 600; font-size: 13px; }
 .gh-card .gh-card-desc { font-size: 12px; color: var(--muted); line-height: 1.4; }
-#gh-body label { display: flex; flex-direction: column; gap: 6px; font-size: 13px; color: var(--muted); }
-#gh-body input[type="text"] {
+#gh-body label, #clone-body label { display: flex; flex-direction: column; gap: 6px; font-size: 13px; color: var(--muted); }
+#gh-body input[type="text"], #clone-body input[type="text"] {
   background: var(--panel); border: 1px solid var(--border); color: var(--text);
   border-radius: 6px; padding: 8px 10px; font-size: 13px;
 }
-#gh-body input[type="text"]:focus { outline: none; border-color: var(--accent); }
+#gh-body input[type="text"]:focus, #clone-body input[type="text"]:focus { outline: none; border-color: var(--accent); }
 .gh-radios { display: flex; gap: 8px; }
 .gh-radio {
   flex: 1; display: flex; align-items: center; gap: 8px; cursor: pointer;
@@ -1840,6 +1840,43 @@ mark.plan-cmt {
 .gh-msg.err { color: var(--danger); }
 .gh-msg.ok { color: var(--accent-2); }
 .gh-msg.hidden { display: none; }
+
+/* ---------------- Clone-from-GitHub wizard ---------------- */
+/* Reuses the .gh-* building blocks; its own shell stacks above the New-hive
+   modal (z-index 50) that launches it. */
+.modal-link {
+  align-self: flex-start; background: none; border: none; padding: 4px 0;
+  color: var(--accent); font-size: 12px; cursor: pointer;
+}
+.modal-link:hover { text-decoration: underline; filter: brightness(1.1); }
+#clone-backdrop {
+  position: fixed; inset: 0; background: rgba(0,0,0,.55);
+  display: flex; align-items: center; justify-content: center; z-index: 70;
+}
+#clone-backdrop.hidden { display: none; }
+#clone-modal {
+  background: var(--bg-alt); border: 1px solid var(--border); border-radius: 12px;
+  width: 540px; max-width: 92vw; display: flex; flex-direction: column; overflow: hidden;
+}
+#clone-title { font-weight: 600; font-size: 14px; }
+#clone-body { padding: 18px; display: flex; flex-direction: column; gap: 14px; }
+/* Searchable list of the user's repositories. */
+.clone-repos {
+  display: flex; flex-direction: column; gap: 2px;
+  max-height: 240px; overflow-y: auto;
+  border: 1px solid var(--border); border-radius: 8px; padding: 4px;
+}
+.clone-repo {
+  text-align: left; background: none; color: var(--text); border: 1px solid transparent;
+  border-radius: 6px; padding: 8px 10px; cursor: pointer; display: flex; flex-direction: column; gap: 2px;
+}
+.clone-repo:hover { background: var(--surface); }
+.clone-repo.sel { border-color: var(--accent); background: var(--surface); }
+.clone-repo .cr-name { font-size: 13px; font-weight: 600; }
+.clone-repo .cr-name .cr-vis { font-weight: 400; font-size: 11px; color: var(--muted); margin-left: 6px; }
+.clone-repo .cr-desc { font-size: 12px; color: var(--muted); line-height: 1.3;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.clone-empty { font-size: 12px; color: var(--muted); text-align: center; padding: 16px 0; }
 
 /* ---------------- Voice typing ---------------- */
 /* Mic toggle in the board bar: red + pulsing while actively listening. */

@@ -130,6 +130,10 @@ native dialogs and no renderer IPC.
 | `git:setRemote` | `{ cwd, url }` | Set `origin` URL |
 | `gh:check` | — | Is the `gh` CLI installed/authenticated |
 | `gh:createRepo` | `{ cwd, name, visibility, push }` | `gh repo create` |
+| `gh:listRepos` | `{ limit }` | `git.ghListRepos` — the signed-in user's repos for the clone picker (`gh repo list --json`) |
+| `gh:clone` | `{ target, destParent, folder }` | `git.ghClone` — clone a repo into `<destParent>/<folder>`; returns `{ code, …, dir }` |
+| `gh:authStart` | — | Begin PTY-driven `gh auth login --web` device flow; streams `gh:authStatus`. Returns `{ ok }` |
+| `gh:authCancel` | — | Kill any in-flight device-flow login PTY |
 | `git:aiCommit` | `{ cwd }` | Draft a commit message from the diff via one-shot `claude -p` |
 | `hm:interpret` | `{ payload }` | Map free-form "Hivemind, …" phrasing onto the command registry via one-shot `claude -p` (`git.hmInterpret`) |
 | `files:list` / `files:open` / `files:reveal` | `{ cwd, rel }` | File Explorer: list a dir, open in OS default app, reveal in Explorer |
@@ -178,6 +182,7 @@ native dialogs and no renderer IPC.
 | `transcript:status` | `{ paneId, status, file }` | Transcript binding status change (`transcript.js:921`) |
 | `stt:downloadProgress` | `{ repo, done, total, file, bytes, totalBytes }` | Speech-model download progress; byte fields update ≤4×/s so big native models show MB progress |
 | `build:progress` | `{ line }` | Portable build progress line (`main.js:897`) |
+| `gh:authStatus` | `{ phase, code?, url?, user?, message? }` | GitHub device-flow login progress (`startGhAuth`): `phase` is `starting`/`code`/`success`/`error` |
 
 ## Preload API
 
@@ -194,6 +199,7 @@ above). Every `on*` subscription returns an unsubscribe function.
 | `onPtyData(cb)` / `onPtyExit(cb)` | `pty:data` / `pty:exit` events |
 | `git.status/diff/stage/stageAll/unstage/unstageAll/discard/commit/branches/checkout/createBranch/init/fetch/pull/push/resetToRemote` | matching `git:*` channels |
 | `git.remoteUrl/setRemote/ghCheck/ghCreateRepo/aiCommitMessage` | `git:remoteUrl` / `git:setRemote` / `gh:check` / `gh:createRepo` / `git:aiCommit` |
+| `git.ghListRepos/ghClone/ghAuthStart/ghAuthCancel/onGhAuthStatus` | `gh:listRepos` / `gh:clone` / `gh:authStart` / `gh:authCancel` / `gh:authStatus` event |
 | `hm.interpret(payload)` | `hm:interpret` |
 | `setWatch(cwd)` / `onFsChanged(cb)` | `watch:set` / `fs:changed` event |
 | `files.list/open/reveal(cwd, rel)` | `files:*` |

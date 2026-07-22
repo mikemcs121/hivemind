@@ -83,6 +83,17 @@ contextBridge.exposeInMainWorld('api', {
     ghCheck: () => ipcRenderer.invoke('gh:check'),
     ghCreateRepo: (cwd, opts) => ipcRenderer.invoke('gh:createRepo', Object.assign({ cwd }, opts)),
 
+    // "Clone from GitHub" New-hive wizard: list repos, device-flow sign-in, clone.
+    ghListRepos: (opts) => ipcRenderer.invoke('gh:listRepos', opts || {}),
+    ghClone: (opts) => ipcRenderer.invoke('gh:clone', opts || {}),
+    ghAuthStart: () => ipcRenderer.invoke('gh:authStart'),
+    ghAuthCancel: () => ipcRenderer.invoke('gh:authCancel'),
+    onGhAuthStatus: (cb) => {
+      const h = (_e, payload) => cb(payload);
+      ipcRenderer.on('gh:authStatus', h);
+      return () => ipcRenderer.removeListener('gh:authStatus', h);
+    },
+
     // Draft a commit message from the current diff via `claude -p`.
     aiCommitMessage: (cwd) => ipcRenderer.invoke('git:aiCommit', { cwd }),
   },

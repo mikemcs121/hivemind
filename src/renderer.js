@@ -5470,6 +5470,10 @@ $('modal-browse').onclick = async () => {
   if (dir) mDir.value = dir;
 };
 
+// "Clone a project from GitHub…" — sign in and clone a repo into a new folder,
+// then fill this modal's directory (and name) fields. See the clone wizard.
+$('modal-clone').onclick = () => openCloneWizard();
+
 $('modal-cancel').onclick = closeModal;
 $('modal-save').onclick = async () => {
   const name = mName.value.trim() || 'Untitled hive';
@@ -8458,6 +8462,8 @@ document.addEventListener('keydown', (e) => {
   if (e.key !== 'Escape') return;
   // Training stacks above Settings — close it first.
   if (voiceTrainIsOpen()) { closeVoiceTraining(); return; }
+  // The clone wizard stacks above the New-hive modal — close it first.
+  if (!cloneBackdrop.classList.contains('hidden')) { closeCloneWizard(); return; }
   if (!planBackdrop.classList.contains('hidden')) closePlanReview();
   else if (!diffBackdrop.classList.contains('hidden')) diffBackdrop.classList.add('hidden');
   else if (!branchBackdrop.classList.contains('hidden')) branchBackdrop.classList.add('hidden');
@@ -8719,6 +8725,261 @@ function wizardActions({ backTo, right = [] }) {
   bar.appendChild(r);
   return bar;
 }
+
+// ---------------------------------------------------------------------------
+// Clone-from-GitHub wizard (launched from the New-hive modal)
+//
+// Lets you sign in to GitHub and clone one of your repos into a fresh folder
+// while creating a hive. Steps: check gh → (device-flow sign-in if needed) →
+// pick a repo (from your list or a pasted URL) + destination → clone. On
+// success it fills the New-hive modal's directory/name fields.
+// ---------------------------------------------------------------------------
+const cloneBackdrop = $('clone-backdrop');
+const cloneBody = $('clone-body');
+const cloneMsg = $('clone-msg');
+let cloneBusy = false;
+let cloneAuthUnsub = null;
+let cloneRepos = [];           // cached repo list from gh
+let cloneSel = null;           // { target, folder } for the highlighted repo
+
+function cloneSetMsg(text, kind) {
+  if (!text) { cloneMsg.classList.add('hidden'); cloneMsg.textContent = ''; return; }
+  cloneMsg.textContent = text;
+  cloneMsg.className = 'gh-msg' + (kind ? ' ' + kind : '');
+}
+
+function stopCloneAuth() {
+  if (cloneAuthUnsub) { try { cloneAuthUnsub(); } catch (_) { /* ignore */ } cloneAuthUnsub = null; }
+  try { window.api.git.ghAuthCancel(); } catch (_) { /* ignore */ }
+}
+
+function openCloneWizard() {
+  cloneBusy = false;
+  cloneSel = null;
+  cloneRepos = [];
+  cloneSetMsg('');
+  cloneBackdrop.classList.remove('hidden');
+  cloneStepCheck();
+}
+
+function closeCloneWizard() {
+  stopCloneAuth();
+  cloneBackdrop.classList.add('hidden');
+  cloneSetMsg('');
+}
+
+// -- Step 1: is gh installed / signed in? -----------------------------------
+async function cloneStepCheck() {
+  cloneBody.innerHTML = '';
+  cloneBody.appendChild(el('p', 'gh-intro', 'Checking the GitHub CLI…'));
+  const gh = await window.api.git.ghCheck();
+  if (!gh.installed) { renderCloneGhMissing(); return; }
+  if (!gh.authenticated) { renderCloneSignin(); return; }
+  renderCloneChoose(gh);
+}
+
+function renderCloneGhMissing() {
+  stopCloneAuth();
+  cloneBody.innerHTML = '';
+  cloneBody.appendChild(el('p', 'gh-intro', 'The GitHub CLI (gh) is required to sign in and clone from GitHub.'));
+  const note = el('p', 'gh-note');
+  note.append('Install it from ');
+  const a = el('button', 'modal-link', 'cli.github.com');
+  a.style.padding = '0';
+  a.onclick = () => window.api.openExternal('https://cli.github.com');
+  note.append(a, ', then click Re-check.');
+  cloneBody.appendChild(note);
+  cloneBody.appendChild(wizardActions({ right: [['Re-check', cloneStepCheck, true]] }));
+}
+
+// -- Step 2: device-flow sign-in --------------------------------------------
+function renderCloneSignin() {
+  stopCloneAuth();
+  cloneBody.innerHTML = '';
+  cloneBody.appendChild(el('p', 'gh-intro', 'Sign in to GitHub to browse and clone your repositories.'));
+  cloneBody.appendChild(el('p', 'gh-note', 'This opens github.com in your browser with a one-time code to authorize the GitHub CLI.'));
+  cloneBody.appendChild(wizardActions({ right: [['Sign in with browser', startCloneAuth, true]] }));
+}
+
+function startCloneAuth() {
+  if (cloneBusy) return;
+  cloneBusy = true;
+  cloneSetMsg('');
+  cloneBody.innerHTML = '';
+  cloneBody.appendChild(el('p', 'gh-intro', 'Starting GitHub sign-in…'));
+
+  stopCloneAuth();
+  cloneAuthUnsub = window.api.git.onGhAuthStatus((s) => {
+    if (!s) return;
+    if (s.phase === 'code') {
+      cloneBody.innerHTML = '';
+      cloneBody.appendChild(el('p', 'gh-intro', 'Enter this one-time code in your browser to authorize the GitHub CLI:'));
+      cloneBody.appendChild(el('div', 'gh-code', s.code || ''));
+      const note = el('p', 'gh-note', 'Your browser should have opened to github.com/login/device. If not, open it manually and paste the code.');
+      cloneBody.appendChild(note);
+      cloneBody.appendChild(wizardActions({
+        right: [
+          ['Open github.com/login/device', () => window.api.openExternal(s.url || 'https://github.com/login/device')],
+          ['Cancel', () => { stopCloneAuth(); cloneBusy = false; renderCloneSignin(); }],
+        ],
+      }));
+    } else if (s.phase === 'success') {
+      stopCloneAuth();
+      cloneBusy = false;
+      renderCloneChoose({ user: s.user });
+    } else if (s.phase === 'error') {
+      stopCloneAuth();
+      cloneBusy = false;
+      cloneBody.innerHTML = '';
+      cloneBody.appendChild(el('p', 'gh-intro', 'Sign-in did not complete.'));
+      cloneBody.appendChild(el('p', 'gh-note', s.message || 'Please try again.'));
+      cloneBody.appendChild(wizardActions({ right: [['Try again', renderCloneSignin, true]] }));
+    }
+  });
+  window.api.git.ghAuthStart();
+}
+
+// -- Step 3: choose a repo + destination, then clone ------------------------
+async function renderCloneChoose(gh) {
+  cloneBusy = false;
+  cloneSel = null;
+  cloneBody.innerHTML = '';
+  cloneBody.appendChild(el('p', 'gh-intro',
+    `Signed in as ${gh && gh.user ? gh.user : 'your GitHub account'}. Pick a repository to clone.`));
+
+  // Searchable repo list.
+  const search = document.createElement('input');
+  search.type = 'text';
+  search.spellcheck = false;
+  search.placeholder = 'Search your repositories…';
+  cloneBody.appendChild(search);
+
+  const listEl = el('div', 'clone-repos');
+  listEl.appendChild(el('div', 'clone-empty', 'Loading your repositories…'));
+  cloneBody.appendChild(listEl);
+
+  // "or paste a URL" escape hatch.
+  const urlLabel = document.createElement('label');
+  urlLabel.append(document.createTextNode('…or paste a repository URL / owner/repo'));
+  const urlInput = document.createElement('input');
+  urlInput.type = 'text';
+  urlInput.spellcheck = false;
+  urlInput.placeholder = 'https://github.com/owner/repo  or  owner/repo';
+  urlLabel.appendChild(urlInput);
+  cloneBody.appendChild(urlLabel);
+
+  // Destination: parent folder + new folder name.
+  const destLabel = document.createElement('label');
+  destLabel.append(document.createTextNode('Clone into folder'));
+  const destRow = el('div', 'dir-row');
+  const destInput = document.createElement('input');
+  destInput.type = 'text';
+  destInput.spellcheck = false;
+  destInput.placeholder = 'C:\\path\\to\\parent-folder';
+  // Default the parent to a sibling of an existing hive's directory, if any.
+  const anyDir = (boards.find((b) => b.dir) || {}).dir || '';
+  const parentDefault = anyDir.replace(/[\\/]+$/, '').replace(/[\\/][^\\/]+$/, '');
+  if (parentDefault) destInput.value = parentDefault;
+  const browseBtn = mkBtn('Browse…', async () => {
+    const d = await window.api.pickDir();
+    if (d) destInput.value = d;
+  });
+  destRow.append(destInput, browseBtn);
+  destLabel.appendChild(destRow);
+  cloneBody.appendChild(destLabel);
+
+  const folderLabel = document.createElement('label');
+  folderLabel.append(document.createTextNode('New folder name'));
+  const folderInput = document.createElement('input');
+  folderInput.type = 'text';
+  folderInput.spellcheck = false;
+  folderInput.placeholder = 'my-project';
+  folderLabel.appendChild(folderInput);
+  cloneBody.appendChild(folderLabel);
+
+  const shortName = (nameWithOwner) => (nameWithOwner || '').split('/').pop() || '';
+  const setSelection = (target, folder) => {
+    cloneSel = target ? { target, folder } : null;
+    if (folder && !folderInput.value.trim()) folderInput.value = folder;
+  };
+
+  const paint = (filter) => {
+    listEl.innerHTML = '';
+    const f = (filter || '').toLowerCase();
+    const rows = cloneRepos.filter((r) => !f || (r.nameWithOwner || '').toLowerCase().includes(f)
+      || (r.description || '').toLowerCase().includes(f));
+    if (!rows.length) {
+      listEl.appendChild(el('div', 'clone-empty', cloneRepos.length ? 'No matching repositories.' : 'No repositories found.'));
+      return;
+    }
+    for (const r of rows) {
+      const btn = el('button', 'clone-repo');
+      btn.type = 'button';
+      const nm = el('span', 'cr-name', r.nameWithOwner || '');
+      if (r.visibility) nm.appendChild(el('span', 'cr-vis', (r.visibility || '').toLowerCase()));
+      btn.appendChild(nm);
+      if (r.description) btn.appendChild(el('span', 'cr-desc', r.description));
+      btn.onclick = () => {
+        urlInput.value = '';
+        [...listEl.querySelectorAll('.clone-repo')].forEach((c) => c.classList.remove('sel'));
+        btn.classList.add('sel');
+        setSelection(r.nameWithOwner, shortName(r.nameWithOwner));
+      };
+      listEl.appendChild(btn);
+    }
+  };
+
+  search.addEventListener('input', () => paint(search.value));
+  urlInput.addEventListener('input', () => {
+    // Typing a URL overrides any list selection.
+    [...listEl.querySelectorAll('.clone-repo')].forEach((c) => c.classList.remove('sel'));
+    const u = urlInput.value.trim();
+    if (u) setSelection(u, shortName(u.replace(/\.git$/i, '')));
+    else cloneSel = null;
+  });
+
+  const actions = wizardActions({
+    right: [['Clone & fill in', () => cloneDoClone(destInput.value, folderInput.value), true]],
+  });
+  cloneBody.appendChild(actions);
+
+  // Fetch the repo list (after the UI is up so it feels responsive).
+  const res = await window.api.git.ghListRepos({ limit: 200 });
+  if (!res || !res.ok) {
+    listEl.innerHTML = '';
+    listEl.appendChild(el('div', 'clone-empty', (res && res.message) || 'Could not load your repositories. You can still paste a URL below.'));
+    return;
+  }
+  cloneRepos = res.repos || [];
+  paint('');
+}
+
+async function cloneDoClone(destParent, folder) {
+  if (cloneBusy) return;
+  const target = cloneSel && cloneSel.target;
+  if (!target) { cloneSetMsg('Choose a repository from the list or paste a URL.', 'err'); return; }
+  if (!(destParent || '').trim()) { cloneSetMsg('Choose a folder to clone into.', 'err'); return; }
+  cloneBusy = true;
+  cloneSetMsg('Cloning ' + target + '…');
+  try {
+    const res = await window.api.git.ghClone({ target, destParent, folder });
+    if (!res || res.code !== 0 || !res.dir) {
+      cloneSetMsg((res && (res.stderr || res.stdout) || 'Clone failed.').trim(), 'err');
+      return;
+    }
+    // Fill the New-hive modal so the user just needs to hit Save.
+    mDir.value = res.dir;
+    if (!mName.value.trim()) mName.value = (folder || '').trim() || (cloneSel.folder || 'Untitled hive');
+    closeCloneWizard();
+  } catch (e) {
+    cloneSetMsg(String((e && e.message) || e), 'err');
+  } finally {
+    cloneBusy = false;
+  }
+}
+
+$('clone-close').onclick = closeCloneWizard;
+cloneBackdrop.addEventListener('mousedown', (e) => { if (e.target === cloneBackdrop) closeCloneWizard(); });
 
 // -- Small DOM helpers ------------------------------------------------------
 function el(tag, cls, text) {

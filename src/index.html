@@ -258,6 +258,19 @@
       </div>
     </div>
 
+    <!-- Clone-from-GitHub wizard (used when creating a new hive) -->
+    <div id="clone-backdrop" class="hidden">
+      <div id="clone-modal">
+        <div class="gh-head">
+          <span id="clone-title">Clone from GitHub</span>
+          <div class="spacer"></div>
+          <button id="clone-close" class="git-icon" title="Close">✕</button>
+        </div>
+        <div id="clone-body"></div>
+        <div id="clone-msg" class="gh-msg hidden"></div>
+      </div>
+    </div>
+
     <!-- Settings (tabbed) — consolidates app preferences in one place -->
     <div id="settings-backdrop" class="hidden">
       <div id="settings-modal">
@@ -467,7 +480,7 @@
           <div class="settings-group">
             <div class="settings-group-title">Getting started</div>
             <ol class="help-list">
-              <li>Click <strong>＋</strong> next to the logo to create a <em>hive</em> and point it at a project directory.</li>
+              <li>Click <strong>＋</strong> next to the logo to create a <em>hive</em> and point it at a project directory — pick an existing folder with <strong>Browse…</strong>, or use <strong>⬇ Clone a project from GitHub…</strong> to sign in to GitHub and clone one of your repositories into a new folder first.</li>
               <li>Press <strong>＋ Thread</strong> to open a Claude thread — open as many as you like; they all share the hive's directory.</li>
               <li>Use the
                 <strong><svg class="help-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z" /></svg> Explorer</strong>
@@ -688,6 +701,7 @@
             <input id="modal-dir" type="text" placeholder="C:\\path\\to\\project" spellcheck="false" />
             <button id="modal-browse">Browse…</button>
           </div>
+          <button id="modal-clone" type="button" class="modal-link">⬇ Clone a project from GitHub…</button>
         </label>
         <label>Startup command
           <input id="modal-cmd" type="text" placeholder="claude" spellcheck="false" />

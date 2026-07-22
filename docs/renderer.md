@@ -80,7 +80,7 @@ UI says hive/thread.
 | 7546–7793 | Plan comments + Approve / Request changes | `planCommentsKey`, `renderCommentList`, `saveDraftComment`, `resolveComment`, `persistComments`, `planAnswerMenu`, `planAwaitScreen`, `planSendFeedback` |
 | 7794–8058 | Chat-card embedded plan review | `cardPlanComments`, `cardPersistComments`, `refreshCardPlan`, `buildCardPlanReview` |
 | 8060–8152 | Diff viewer, branch menu, **global Escape handler** | `showDiff`, `escapeHtml`, `renderDiff`, `openBranchMenu`, `switchBranch`, Escape keydown at ~8143 |
-| 8154–8417 | Connect-to-GitHub wizard; tiny DOM helpers | `openGitHubWizard`, `renderWizardChoice`, `startCreateFlow`, `doCreateRepo`, `renderLinkStep`, `doLink`, `renderDone`, `wizardActions`, `el`, `mkBtn`, `mkMini` |
+| 8154–8417 | Connect-to-GitHub wizard; **Clone-from-GitHub wizard** (New-hive modal); tiny DOM helpers | `openGitHubWizard`, `renderWizardChoice`, `startCreateFlow`, `doCreateRepo`, `renderLinkStep`, `doLink`, `renderDone`, `wizardActions`, `openCloneWizard`, `cloneStepCheck`, `renderCloneSignin`, `startCloneAuth`, `renderCloneChoose`, `cloneDoClone`, `el`, `mkBtn`, `mkMini` |
 | 8419–9278 | **Voice typing** — dictionary, correction learning, STT worker, VAD, capture, hotkey | `VOICE_DEFAULT_DICT`, `voiceDict`, `applyVoiceDict`, `STT_MODELS`, `sttModelId`, `VOICE_ENTER_RE`, `voiceLearnRecord/Harvest/FromTexts`, `vlTokens`, `vlAlign`, `voiceSuggestShow`, `currentVoicePane`, `commitVoiceText`, `resetSttWorker`, `ensureSttWorker`, `bootSttWorker`, `flushSegment`, `onAudioFrame`, `onVadVerdict`, `applyVadDecision`, `startCapture`, `stopCapture`, `startVoice`, `stopVoice`, `toggleVoice`, `voiceErrMessage`, HUD fns, `~` hotkey listener (~9262) |
 | 9280–9434 | **Settings modal** (tabbed General/Voice) | `settingsBackdrop`, `setSettingsTab`, `renderVoiceDict`, `upsertVoiceDict`, `addVoiceDictEntry`, `syncVoiceFields`, `syncGeneralFields`, `openSettings`, `closeSettings` |
 | 9436–9877 | Voice dictionary **training** modal | `voiceTrainState`, `vtExtractTerms`, `VT_TEMPLATES`, `vtGenerateSentences`, `vtPickPrompts`, `vtBuildSession`, `voiceTrainCommit`, `voiceTrainCheck`, `voiceTrainAdvance`, `vtSessionFromText`, `openVoiceTraining`, `closeVoiceTraining` |
@@ -154,7 +154,7 @@ Global (capture-phase document listeners, so they win over xterm):
 | `Ctrl+Enter` | Maximize / restore focused thread | `renderer.js:~5352` (`toggleZoom`) |
 | `Ctrl+Shift+]` / `Ctrl+Shift+[` | Cycle focus next / previous thread | `renderer.js:~5356` (`cycleFocus`) |
 | `Ctrl+1`…`Ctrl+9` | Focus Nth thread on the active hive | `renderer.js:~5361` |
-| `Esc` | Close the top open dialog — priority order: voice training → plan review → diff → branch → GitHub wizard → usage → help → settings | `renderer.js:~8143` |
+| `Esc` | Close the top open dialog — priority order: voice training → clone-from-GitHub wizard → plan review → diff → branch → GitHub wizard → usage → help → settings | `renderer.js:~8143` |
 
 Inside a terminal pane (`term.attachCustomKeyEventHandler` in `createPane`):
 
@@ -212,7 +212,7 @@ Everything the renderer calls on `window.api`, grouped (names only — schemas l
 - **PTY**: `spawnPty`, `writePty`, `resizePty`, `killPty`, `onPtyData`, `onPtyExit`
 - **Boards**: `listBoards`, `saveBoards`
 - **Transcript binder** (`window.api.transcript.*`): `bind`, `unbind`, `noteSent`, `refresh`, `listSessions`, `readSession`, `onEntries`, `onStatus`
-- **Git** (`window.api.git.*`): `status`, `fetch`, `pull`, `push`, `init`, `stage`, `unstage`, `stageAll`, `unstageAll`, `discard`, `commit`, `diff`, `branches`, `checkout`, `createBranch`, `setRemote`, `resetToRemote`, `ghCheck`, `ghCreateRepo`, `aiCommitMessage`
+- **Git** (`window.api.git.*`): `status`, `fetch`, `pull`, `push`, `init`, `stage`, `unstage`, `stageAll`, `unstageAll`, `discard`, `commit`, `diff`, `branches`, `checkout`, `createBranch`, `setRemote`, `resetToRemote`, `ghCheck`, `ghCreateRepo`, `ghListRepos`, `ghClone`, `ghAuthStart`, `ghAuthCancel`, `onGhAuthStatus`, `aiCommitMessage`
 - **Files** (`window.api.files.*`): `list`, `open`, `reveal`
 - **Todo** (`window.api.todo.*`): `read`, `write`, `ensureIgnored`
 - **Prompt history** (`window.api.promptHistory.*`): `read`, `write`, `append`, `ensureIgnored`
