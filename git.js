@@ -251,6 +251,19 @@ async function branches(cwd) {
   return res.stdout.split('\n').map((s) => s.trim()).filter(Boolean);
 }
 
+// Recent commits on the current branch, newest first. Fields are separated by
+// control characters so subjects containing any printable text parse cleanly.
+// Empty array on error (including a repo with no commits yet).
+async function log(cwd, count = 3) {
+  const n = Math.max(1, Math.min(50, Number(count) || 3));
+  const res = await runGit(cwd, ['log', '-n', String(n), '--pretty=format:%h%x1f%s%x1f%cr%x1f%an%x1e']);
+  if (res.code !== 0) return [];
+  return res.stdout.split('\x1e').map((s) => s.trim()).filter(Boolean).map((rec) => {
+    const [hash, subject, when, author] = rec.split('\x1f');
+    return { hash, subject, when, author };
+  });
+}
+
 const checkout = (cwd, name) =>
   safeRef(name) ? runGit(cwd, ['checkout', name])
                 : Promise.resolve({ code: 1, stdout: '', stderr: `invalid branch name: ${name}` });
@@ -500,6 +513,6 @@ async function hmInterpret(payload) {
 
 module.exports = {
   status, diff, stage, stageAll, unstage, unstageAll, discard,
-  commit, branches, checkout, createBranch, init, fetch, pull, push, resetToRemote,
+  commit, branches, log, checkout, createBranch, init, fetch, pull, push, resetToRemote,
   getRemoteUrl, setRemoteOrigin, ghCheck, ghCreateRepo, aiCommit, hmInterpret,
 };

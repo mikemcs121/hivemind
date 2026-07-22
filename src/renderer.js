@@ -373,6 +373,7 @@ function respawnPane(pane, { resume, initialPrompt } = {}) {
     updateHistoryChrome(pane, null);
   }
   resetChat(pane); // the new session's transcript backfills the chat view
+  updateChatBanner(pane); // drop a composer lock left by a pre-respawn attention state
   spawnPanePty(pane, { resume: resume || false, initialPrompt });
 }
 
@@ -544,6 +545,33 @@ function screenText(pane) {
   }
 }
 
+// The TUI hard-wraps at pane width, so a menu signature (the select-menu
+// footer, an approval header) can split across two screen rows and defeat a
+// single-line regex. Give pattern scans a second view of the screen with each
+// adjacent pair of rows glued back together — one wrap point anywhere can't
+// hide a match. (Same idea as the wrap-joined error scan in evaluateIdle,
+// applied to the live screen.)
+function joinWrapped(lines) {
+  const out = [];
+  for (let i = 0; i + 1 < lines.length; i++) {
+    const a = lines[i].trim(), b = lines[i + 1].trim();
+    if (a && b) out.push(a + ' ' + b);
+  }
+  return out.join('\n');
+}
+
+// MENU_PATTERNS against the screen, tolerating one hard wrap per signature.
+function menuOnScreen(screen) {
+  return MENU_PATTERNS.some((re) => re.test(screen)) ||
+    MENU_PATTERNS.some((re) => re.test(joinWrapped(screen.split('\n'))));
+}
+
+// "Something on screen is waiting for the user" — a blocking menu or a
+// finished-turn prose question.
+function promptVisibleOnScreen(screen) {
+  return menuOnScreen(screen) || QUESTION_PATTERNS.some((re) => re.test(screen));
+}
+
 const PROBE_MS = 700; // how often a busy pane's screen is checked for a menu
 
 // The transcript knows about one kind of prompt the screen scan can't be
@@ -554,6 +582,46 @@ const PROBE_MS = 700; // how often a busy pane's screen is checked for a menu
 function chatHasPendingQuestion(pane) {
   const c = pane.chat;
   return !!(c && !c.viewingHistory && c.pendingQuestions.size);
+}
+
+// pendingQuestions normally clears within one transcript batch: the CLI only
+// flushes an AskUserQuestion once it's answered, so the tool_use and its
+// tool_result arrive together (attachToolResult deletes the entry). If a
+// result never lands — interrupted turn, truncated JSONL, future flush-
+// behavior drift — the stale entry would pin 'attention' and the composer
+// lock forever with nothing on screen to answer. So: whenever the pane is
+// judged with no prompt visible, age transcript entries out after a grace
+// period (screen-parsed 'screenq:' entries are already lifecycle-managed by
+// syncScreenQuestion and excluded here).
+const QUESTION_EXPIRE_MS = 5000;
+const strandedQuestionIds = (c) =>
+  [...c.pendingQuestions.keys()].filter((k) => k.indexOf('screenq:') !== 0);
+function syncQuestionExpiry(pane, promptVisible) {
+  const c = pane.chat;
+  if (promptVisible || !c || !strandedQuestionIds(c).length) {
+    clearTimeout(pane.qExpireTimer);
+    pane.qExpireTimer = null;
+    return;
+  }
+  if (pane.qExpireTimer) return;
+  pane.qExpireTimer = setTimeout(() => {
+    pane.qExpireTimer = null;
+    const cc = pane.chat;
+    if (pane.disposed || !cc || cc.viewingHistory) return;
+    if (promptVisibleOnScreen(screenText(pane))) return; // it showed up after all
+    for (const k of strandedQuestionIds(cc)) {
+      cc.pendingQuestions.delete(k);
+      const row = cc.byKey.get(cc.toolByUseId.get(k));
+      const card = row && row.querySelector('.chat-question');
+      if (card && !card.classList.contains('answered')) {
+        card.classList.add('answered');
+        const ans = card.querySelector('.chat-question-answer');
+        if (ans) { ans.textContent = '(answered in the terminal)'; ans.classList.remove('hidden'); }
+      }
+    }
+    updateChatBanner(pane);
+    if (pane.state === 'attention') evaluateIdle(pane); // drop the pinned attention
+  }, QUESTION_EXPIRE_MS);
 }
 
 // A *pending* AskUserQuestion never reaches the transcript: Claude Code only
@@ -582,11 +650,21 @@ const SCREEN_CHECKED_RE = /[x✓✔√◼☑]/;
 const SCREEN_SEP_RE = /^[\s─—–-]*$/;
 const SCREEN_CHIP_RE = /^\[[^\]]{0,3}\]\s*(\S.{0,40})$/;
 
+// Menus can render inside a bordered box (the plan dialog does; permission
+// dialogs have in past versions) — shed │/┃ border chrome so the ^-anchored
+// row regexes still see the content.
+const stripBoxChrome = (l) => l.replace(/^\s*[│┃]/, '').replace(/[│┃]\s*$/, '');
+// Wrap-tolerant row test: the row itself, or the row glued to the next one
+// (the TUI hard-wraps at pane width).
+const testWrapped = (re, lines, i) =>
+  re.test(lines[i]) ||
+  (i + 1 < lines.length && re.test(lines[i].trim() + ' ' + lines[i + 1].trim()));
+
 function parseScreenQuestion(screen) {
-  const lines = screen.split('\n');
+  const lines = screen.split('\n').map(stripBoxChrome);
   let foot = -1;
   for (let i = lines.length - 1; i >= 0; i--) {
-    if (SELECT_FOOTER_RE.test(lines[i])) { foot = i; break; }
+    if (testWrapped(SELECT_FOOTER_RE, lines, i)) { foot = i; break; }
   }
   if (foot < 0) return parseScreenReview(lines);
   // The options block: the "1." line closest above the footer, then numbered
@@ -613,6 +691,11 @@ function parseScreenQuestion(screen) {
       }
       if (box) hasCheckbox = true;
       options.push({ label, description: '', checked: SCREEN_CHECKED_RE.test(box) });
+    } else if (m && Number(m[2]) > options.length + 1) {
+      // A numbered row out of sequence means the "1." anchored on wasn't this
+      // menu's first option (prose above a partly scrolled menu) — better no
+      // card than one whose digits actuate unseen rows.
+      return null;
     } else if (options.length) {
       const t = lines[i].trim();
       // The focusable "Submit" row under the last option is menu chrome, not
@@ -729,39 +812,58 @@ const CODEX_KEYHINT_RE = /\s*\((?:[a-z]\+)?[a-z]{1,5}\)$/i;
 
 function parseCodexApproval(pane, screen) {
   if (pane.agent !== 'codex') return null;
-  const lines = screen.split('\n');
+  const lines = screen.split('\n').map(stripBoxChrome);
   let foot = -1;
   for (let i = lines.length - 1; i >= 0; i--) {
-    if (SELECT_FOOTER_RE.test(lines[i])) { foot = i; break; }
+    if (testWrapped(SELECT_FOOTER_RE, lines, i)) { foot = i; break; }
   }
   if (foot < 0) return null;
-  let head = -1;
+  // The header can hard-wrap too (a long command inside "Allow Codex to run
+  // …?") — accept a two-row match and treat its second row as consumed.
+  let head = -1, headText = '';
   for (let i = foot - 1; i >= 0; i--) {
-    if (CODEX_APPROVAL_HEAD_RE.test(lines[i].trim())) { head = i; break; }
+    const t = lines[i].trim();
+    if (CODEX_APPROVAL_HEAD_RE.test(t)) { head = i; headText = t; break; }
+    const pair = i + 1 < foot ? t + ' ' + lines[i + 1].trim() : '';
+    if (pair && CODEX_APPROVAL_HEAD_RE.test(pair)) { head = i + 1; headText = pair; break; }
   }
   if (head < 0) return null;
+  // Anchor the options on the "1." row closest above the footer — same
+  // defence as parseScreenQuestion. A top-down scan would let a numbered list
+  // in the detail block (a diff adding "1. Install deps") become the clickable
+  // options while the digits still fire the real approval.
+  let start = -1;
+  for (let i = foot - 1; i > head; i--) {
+    const m = SCREEN_OPT_RE.exec(lines[i]);
+    if (m && m[2] === '1') { start = i; break; }
+  }
+  if (start < 0) return null;
   const detail = []; // Reason: / Permission rule: / $ command … between header and options
+  for (let i = head + 1; i < start && detail.length < 8; i++) {
+    const t = lines[i].trim();
+    if (t && !SCREEN_SEP_RE.test(lines[i])) detail.push(t);
+  }
   const options = [];
-  for (let i = head + 1; i < foot; i++) {
+  for (let i = start; i < foot; i++) {
     const t = lines[i].trim();
     const m = SCREEN_OPT_RE.exec(lines[i]);
     if (m && Number(m[2]) === options.length + 1) {
       options.push({ label: m[3].trim().replace(CODEX_KEYHINT_RE, ''), description: '', checked: false });
     } else if (!t || SCREEN_SEP_RE.test(lines[i])) {
       continue;
+    } else if (m && Number(m[2]) > options.length + 1) {
+      return null; // out-of-sequence number — mis-anchored, don't guess
     } else if (options.length) {
       // A wrapped option label — cosmetically a description, same treatment
       // as parseScreenQuestion.
       const o = options[options.length - 1];
       o.description = (o.description ? o.description + ' ' : '') + t.replace(CODEX_KEYHINT_RE, '');
-    } else if (detail.length < 8) {
-      detail.push(t);
     }
   }
   if (options.length < 2) return null;
   return {
     header: 'Approval',
-    question: [lines[head].trim(), ...detail].join('\n'),
+    question: [headText, ...detail].join('\n'),
     options,
     multiSelect: false,
   };
@@ -784,6 +886,12 @@ function syncScreenQuestion(pane, screen) {
   // (a re-render would drop the clicked-option echo mid-interaction).
   const key = screenQuestionKey(pane);
   const sig = safeJson(parsed);
+  // A transcript tool_use just superseded this exact menu — the answered menu
+  // can stay painted for one more repaint while the transcript flush wins the
+  // race, and resurrecting it would re-lock the composer under the answered
+  // card (addQuestionRow stamps the supersede).
+  if (c.screenQSupSig === sig && Date.now() - (c.screenQSupAt || 0) < 2000) return;
+  c.screenQSupSig = null;
   if (c.screenQSig === sig && c.byKey.has(key)) return;
   c.screenQSig = sig;
   const fresh = !c.byKey.has(key);
@@ -793,6 +901,28 @@ function syncScreenQuestion(pane, screen) {
     input: { questions: [parsed] },
   });
   if (fresh && c.pinned) c.list.scrollTop = c.list.scrollHeight;
+}
+
+// Click-time staleness check for question-card buttons: the card can lag the
+// screen by up to a probe tick (700 ms) — the menu may have been answered in
+// the terminal, or replaced by a chained prompt (a permission menu right after
+// a question). A digit sent then would actuate whatever took its place, so
+// re-parse the live screen at click time and require it to still show the
+// menu this card rendered (question + option labels; checkbox state may
+// legitimately differ mid-toggle). On mismatch, repaint reality and swallow
+// the click.
+function cardMenuLive(pane, q) {
+  const c = pane.chat;
+  if (!c) return false;
+  const s = screenText(pane);
+  const parsed =
+    parseCodexApproval(pane, s) || parseScreenQuestion(s) || parsePlanScreenQuestion(pane, s);
+  const shape = (p) =>
+    safeJson([p.question, (Array.isArray(p.options) ? p.options : []).map((o) =>
+      typeof o === 'object' && o ? o.label : String(o))]);
+  if (parsed && shape(parsed) === shape(q)) return true;
+  syncScreenQuestion(pane, s); // removes or replaces the stale card
+  return false;
 }
 
 function removeScreenQuestion(pane) {
@@ -820,7 +950,7 @@ function probeAttention(pane) {
   const screen = screenText(pane);
   syncScreenQuestion(pane, screen);
   planScreenCheck(pane, screen);
-  if (MENU_PATTERNS.some((re) => re.test(screen)) || chatHasPendingQuestion(pane)) {
+  if (menuOnScreen(screen) || chatHasPendingQuestion(pane)) {
     pane.menuMiss = 0;
     setPaneState(pane, 'attention');
   } else if (pane.state === 'attention' && ++pane.menuMiss >= 2) {
@@ -902,6 +1032,9 @@ function evaluateIdle(pane) {
     // "switch model?" menu), and it vanishes on the next state change — the
     // chat row keeps the reason visible either way.
     if (pane.chat) addErrorRow(pane, 'err:' + pane.errorText.slice(0, 60), pane.errorText);
+    // An error can strand a stale question card (the probe is stopped and
+    // won't run again in this state) — re-judge the screen before settling.
+    syncScreenQuestion(pane);
     setPaneState(pane, 'error');
     return;
   }
@@ -913,9 +1046,11 @@ function evaluateIdle(pane) {
   const screen = screenText(pane);
   syncScreenQuestion(pane, screen);
   planScreenCheck(pane, screen);
-  const needsYou = MENU_PATTERNS.some((re) => re.test(screen)) ||
-    QUESTION_PATTERNS.some((re) => re.test(screen)) ||
-    chatHasPendingQuestion(pane);
+  const promptVisible = promptVisibleOnScreen(screen);
+  const needsYou = promptVisible || chatHasPendingQuestion(pane);
+  // A transcript-pending question with nothing on screen is a stranded lock —
+  // start (or cancel) its expiry clock.
+  syncQuestionExpiry(pane, promptVisible);
   // A turn that ended without reaching the plan-approval menu (⟳-requested
   // plans, or planning interrupted): the file is final for now, not mid-draft
   // — drop "drafting" so the 📋 chip doesn't stick.
@@ -943,6 +1078,14 @@ function setPaneState(pane, state) {
   if (pane.state === state) return;
   const prev = pane.state;
   pane.state = state;
+
+  // The process is gone — no menu can be waiting. Drop the live question
+  // chrome so the exit card isn't suppressed by an unanswerable question
+  // (the probe is stopped on death; nothing else would clean these up).
+  if (state === 'dead' && pane.chat) {
+    removeScreenQuestion(pane);
+    pane.chat.pendingQuestions.clear();
+  }
 
   pane.dot.className = 'dot ' + state;
   if (pane.statusEl) {
@@ -1102,11 +1245,16 @@ function sendToPane(pane, data) {
   markActivity(pane, ''); // typing means this pane is active again
 }
 
-// Type a prompt into a pane's TUI: multi-line text goes through bracketed
-// paste, and Enter follows as its own keystroke once the TUI has ingested the
-// text. The Codex CLI ("ChatGPT") treats rapid input as a paste burst and an
-// Enter arriving inside that burst becomes a plain newline instead of a
-// submit, so codex threads get a longer gap before the Enter keystroke.
+// Type a prompt into a pane's TUI: text goes through bracketed paste, and
+// Enter follows as its own keystroke once the TUI has ingested the text. Both
+// CLIs treat rapid input as a paste burst, and an Enter arriving inside that
+// burst becomes a plain newline instead of a submit — under load ConPTY can
+// hand the paste and a fixed-delay Enter to the CLI in a single read, so no
+// gap is safe on its own. The delay scales with payload size (codex needs a
+// longer floor), text is always bracketed so the burst has an explicit
+// terminator, and confirmSubmit() watches the screen afterwards and re-sends
+// Enter if the prompt is still sitting in the composer. Slash commands are
+// typed raw instead of pasted so the TUI's command handling sees them.
 // `images` are file paths the TUI should attach as actual image input: the
 // Codex composer converts a paste event into an image attachment only when
 // that paste is exactly one image path and nothing else, so each path goes
@@ -1114,10 +1262,64 @@ function sendToPane(pane, data) {
 // in text — codex's view_image tool is unreliable in the Windows sandbox).
 function typePrompt(pane, text, images = []) {
   for (const p of images) sendToPane(pane, '\x1b[200~' + p + '\x1b[201~');
-  if (text.includes('\n')) sendToPane(pane, '\x1b[200~' + text + '\x1b[201~');
-  else if (text) sendToPane(pane, text);
-  const delay = pane.agent === 'codex' ? 250 : 40;
-  setTimeout(() => { if (!pane.disposed) sendToPane(pane, '\r'); }, delay);
+  if (text && !text.includes('\n') && text.startsWith('/')) sendToPane(pane, text);
+  else if (text) sendToPane(pane, '\x1b[200~' + text + '\x1b[201~');
+  const delay = (pane.agent === 'codex' ? 250 : 150) +
+    Math.min(300, Math.ceil(text.length / 20));
+  const ptyId = pane.id; // a respawn in the gap remaps pane.id to a fresh pty
+  setTimeout(() => {
+    if (pane.disposed || pane.id !== ptyId) return;
+    // A menu can pop up during the paste delay — menu detection lags by up to
+    // a probe tick, and an Enter now would accept the highlighted row. Leave
+    // the text in the composer; confirmSubmit waits the menu out and presses
+    // Enter once it's gone.
+    if (pane.state === 'attention' || chatHasPendingQuestion(pane) ||
+        menuOnScreen(screenText(pane))) {
+      confirmSubmit(pane, ptyId, text, 5);
+      return;
+    }
+    sendToPane(pane, '\r');
+    confirmSubmit(pane, ptyId, text, 2);
+  }, delay);
+}
+
+// After the Enter, verify the prompt actually left the composer. When the
+// paste and the Enter coalesce into one read, the CLI keeps the text in its
+// input box — visible as the prompt's head still sitting on the composer row.
+// The composer is the LAST prompt-prefixed row on screen ("> " in Claude
+// Code — its transcript echoes of submitted prompts use the same chrome but
+// always sit above the composer — "▌" in codex, "│ >" in bordered builds), so
+// only that row and its wrap-continuation rows below it are judged. Menus and
+// questions on screen (or a pending chat question) mean Enter would actuate a
+// menu row instead, so those bail out.
+const SUBMIT_RETRY_MS = 1000;
+const COMPOSER_ROW_RE = /^\s*(?:[>❯](\s|$)|[│▌])/;
+function promptStuckOnScreen(screen, head) {
+  const rows = screen.split('\n');
+  for (let i = rows.length - 1; i >= 0; i--) {
+    if (!COMPOSER_ROW_RE.test(rows[i])) continue;
+    return rows.slice(i).some((l) => l.includes(head));
+  }
+  return false;
+}
+function confirmSubmit(pane, ptyId, text, tries) {
+  const head = String(text || '').split('\n', 1)[0].trim().slice(0, 40);
+  if (head.length < 3 || tries <= 0) return;
+  setTimeout(() => {
+    if (pane.disposed || pane.id !== ptyId) return;
+    const screen = screenText(pane);
+    // A menu in the way: don't actuate it — keep waiting for it to clear (the
+    // user answers it in card or terminal; the stuck prompt is still worth
+    // submitting afterwards), giving up once the tries run out.
+    if (pane.state === 'attention' || chatHasPendingQuestion(pane) ||
+        promptVisibleOnScreen(screen)) {
+      confirmSubmit(pane, ptyId, text, tries - 1);
+      return;
+    }
+    if (!promptStuckOnScreen(screen, head)) return;
+    sendToPane(pane, '\r');
+    confirmSubmit(pane, ptyId, text, tries - 1);
+  }, SUBMIT_RETRY_MS);
 }
 
 // Send a full prompt to a live pane, exactly like the chat composer would.
@@ -2972,6 +3174,7 @@ function resetChat(pane) {
   c.pendingResults.clear();
   c.pendingQuestions.clear();
   c.screenQSig = null;
+  c.screenQSupSig = null;
   c.pendingEcho = [];
   c.pinned = true;
   c.topic.textContent = '';
@@ -2994,7 +3197,15 @@ function chatBindStatus(pane, status) {
     // A (re)bind means a fresh source file; render it from scratch. And when
     // the binder takes a mis-bound file away (self-heal), 'searching' drops
     // the other thread's conversation instead of leaving it on screen.
-    if (status === 'bound' || status === 'searching') resetChat(pane);
+    if (status === 'bound' || status === 'searching') {
+      resetChat(pane);
+      // The reset dropped a live question card while its menu may still be on
+      // screen — and if the pane sits in quiet attention, the probe is stopped
+      // and nothing re-runs the sync until new output. Restore the card and
+      // re-judge the composer lock now.
+      syncScreenQuestion(pane);
+      updateChatBanner(pane);
+    }
     // If the terminal was only showing because the chat couldn't find its
     // transcript (the notice's "Open terminal" fallback), the reason is gone
     // now that it's bound — snap back to the chat view. Non-persistent, so a
@@ -3131,10 +3342,23 @@ function chatIngest(pane, entries, backfill) {
   // exitHistory() re-reads the live file to catch up.
   if (!c || c.viewingHistory) return;
   renderChatEntries(pane, entries, backfill);
+  // A batch of rows landing must not bury the live screen-question card —
+  // keep it trailing the newest content (an exitHistory backfill otherwise
+  // strands it at the top, scrolled out of view).
+  const sq = c.byKey.get(screenQuestionKey(pane));
+  if (sq && sq.nextSibling !== c.working) c.list.insertBefore(sq, c.working);
   // A question can land after the pane already went quiet and read 'idle'
   // (the transcript line trails the screen) — pull the state to 'attention'
-  // now instead of waiting for the next output burst.
-  if (chatHasPendingQuestion(pane) && pane.state === 'idle') setPaneState(pane, 'attention');
+  // now instead of waiting for the next output burst. Only when the screen
+  // corroborates that something is waiting: a tool_use whose result arrives
+  // in the next batch must not flash a "needs your input" notification. A
+  // transcript entry left pending with no prompt on screen ages out instead
+  // (syncQuestionExpiry).
+  if (chatHasPendingQuestion(pane)) {
+    const promptVisible = promptVisibleOnScreen(screenText(pane));
+    if (pane.state === 'idle' && promptVisible) setPaneState(pane, 'attention');
+    syncQuestionExpiry(pane, promptVisible);
+  }
 }
 
 function renderChatEntries(pane, entries, backfill) {
@@ -3428,8 +3652,13 @@ function addToolRow(pane, key, part) {
 function addQuestionRow(pane, key, part) {
   const c = pane.chat;
   // A real tool_use from the transcript supersedes the screen-parsed stand-in
-  // (it only lands once the question was answered and the menu left the screen).
-  if (part.id && part.id.indexOf('screenq:') !== 0) removeScreenQuestion(pane);
+  // (it only lands once the question was answered and the menu left the
+  // screen). Stamp the supersede so a probe tick racing one last repaint of
+  // the answered menu can't resurrect the stand-in (syncScreenQuestion).
+  if (part.id && part.id.indexOf('screenq:') !== 0) {
+    if (c.screenQSig) { c.screenQSupSig = c.screenQSig; c.screenQSupAt = Date.now(); }
+    removeScreenQuestion(pane);
+  }
   const questions = part.input.questions.filter((q) => q && typeof q === 'object');
   const isScreenCard = !!(part.id && part.id.indexOf('screenq:') === 0);
   upsertChatRow(pane, key, 'prompt', (row) => {
@@ -3514,17 +3743,33 @@ function addQuestionRow(pane, key, part) {
           body.appendChild(d);
         }
         btn.append(num, body);
-        btn.title = q.multiSelect
-          ? `Toggle "${label}" — presses ${i + 1} in the hidden terminal`
-          : `Answer "${label}" — presses ${i + 1} in the hidden terminal`;
+        if (i >= 9) {
+          // "10" is two keystrokes — the first would answer a single-select
+          // menu as option 1 and leak a stray "0" into whatever follows.
+          btn.disabled = true;
+          btn.title = `Option ${i + 1} — answer in the terminal (digit keys stop at 9)`;
+        } else {
+          btn.title = q.multiSelect
+            ? `Toggle "${label}" — presses ${i + 1} in the hidden terminal`
+            : `Answer "${label}" — presses ${i + 1} in the hidden terminal`;
+        }
         btn.onclick = (e) => {
           e.stopPropagation();
-          if (c.viewingHistory || card.classList.contains('answered') || pane.state === 'dead') return;
+          if (c.viewingHistory || card.classList.contains('answered') || card.dataset.sent ||
+              pane.state === 'dead' || pane.state === 'error') return;
+          // Send only when the live screen still shows this menu — screen
+          // cards verify the full shape, transcript cards (whose menu content
+          // is the tool input, not the screen) settle for a menu being up.
+          if (isScreenCard ? !cardMenuLive(pane, q) : !menuOnScreen(screenText(pane))) return;
           // Mirror the toggle locally — the TUI checks/unchecks out of sight.
           if (q.multiSelect) btn.classList.toggle('selected');
           else {
             [...opts.children].forEach((x) => x.classList.remove('selected'));
             btn.classList.add('selected');
+            // A single-select answers on the digit — one shot. Self-expire in
+            // case the keystroke was swallowed and the menu never advanced.
+            card.dataset.sent = '1';
+            setTimeout(() => { delete card.dataset.sent; }, 2500);
           }
           sendToPane(pane, String(i + 1));
         };
@@ -3550,7 +3795,12 @@ function addQuestionRow(pane, key, part) {
       review.title = 'Press Tab in the hidden terminal (open the review step, then click Submit answers)';
       review.onclick = (e) => {
         e.stopPropagation();
-        if (c.viewingHistory || card.classList.contains('answered') || pane.state === 'dead') return;
+        if (c.viewingHistory || card.classList.contains('answered') ||
+            pane.state === 'dead' || pane.state === 'error') return;
+        // Same staleness rule as the option buttons — a Tab into a menu that
+        // already advanced lands in the next screen.
+        if (isScreenCard ? !cardMenuLive(pane, questions[0])
+                         : !menuOnScreen(screenText(pane))) return;
         sendToPane(pane, '\t');
       };
       foot.appendChild(review);
@@ -3859,16 +4109,29 @@ function renderPromptCard(pane, state) {
     if (!isErr) {
       const keys = document.createElement('span');
       keys.className = 'chat-prompt-keys';
+      // Digit keys only make sense on a numbered menu — a prose "(y/n)" or
+      // "press enter" prompt would receive digits it never asked for.
+      const menuKeys = menuOnScreen(screenText(pane));
       for (const [label, seq, hint] of [
-        ['1', '1', 'Choose option 1'],
-        ['2', '2', 'Choose option 2'],
+        ...(menuKeys ? [['1', '1', 'Choose option 1'], ['2', '2', 'Choose option 2']] : []),
         ['Enter', '\r', 'Press Enter'],
         ['Esc', '\x1b', 'Press Escape'],
       ]) {
         const b = document.createElement('button');
         b.textContent = label;
         b.title = `${hint} in the hidden terminal`;
-        b.onclick = (e) => { e.stopPropagation(); sendToPane(pane, seq); };
+        b.onclick = (e) => {
+          e.stopPropagation();
+          // This card lags the screen by up to a probe tick — only actuate
+          // while the pane still reads attention AND a prompt is actually on
+          // screen; a stale Enter/Esc would land in a live turn.
+          if (c.viewingHistory || pane.state !== 'attention') return;
+          if (!promptVisibleOnScreen(screenText(pane))) {
+            removePromptCard(pane);
+            return;
+          }
+          sendToPane(pane, seq);
+        };
         keys.appendChild(b);
       }
       foot.appendChild(keys);
@@ -3930,7 +4193,17 @@ function updateChatBanner(pane) {
   // view scrolled to the bottom so it's actually visible.
   if (wasHidden && state === 'busy' && c.pinned) c.list.scrollTop = c.list.scrollHeight;
   const show = state === 'attention' || state === 'error' || state === 'dead';
-  if (!show || chatHasPendingQuestion(pane)) { removePromptCard(pane); return; }
+  // The exited-process card must never be suppressed by a question that can
+  // no longer be answered (death also clears pendingQuestions — this is
+  // belt-and-braces for ordering).
+  if (!show || (state !== 'dead' && chatHasPendingQuestion(pane))) { removePromptCard(pane); return; }
+  // In the two-tick window after a menu leaves the screen the state still
+  // reads 'attention' but there's nothing to answer — a card rendered now
+  // would show spinner chrome with live keys.
+  if (state === 'attention' && !promptVisibleOnScreen(screenText(pane))) {
+    removePromptCard(pane);
+    return;
+  }
   renderPromptCard(pane, state);
 }
 
@@ -5403,6 +5676,7 @@ const gitMsgbar = $('git-msgbar');
 let gitBusy = false;
 let gitMenuOpen = false; // the ⋯ overflow menu is open; suppress auto-refresh so it isn't wiped
 let lastStatus = null;
+let lastLog = []; // recent commits shown at the bottom of the panel
 
 function activeBoard() { return boards.find((b) => b.id === activeBoardId) || null; }
 function activeDir() { const b = activeBoard(); return b && b.dir ? b.dir : null; }
@@ -5575,8 +5849,12 @@ async function refreshGit(opts = {}) {
   if (!gitPanelOpen()) return;
   const dir = activeDir();
   if (!dir) { renderGitState({ ok: false, reason: 'no-dir' }); return; }
-  const st = await window.api.git.status(dir);
+  const [st, log] = await Promise.all([
+    window.api.git.status(dir),
+    window.api.git.log(dir, 3),
+  ]);
   lastStatus = st;
+  lastLog = st.ok ? log : [];
   renderGitState(st, opts);
   if (!opts.noFetch && st.ok && st.hasRemote) autoFetchGit(dir, opts.forceFetch);
 }
@@ -5656,6 +5934,8 @@ function renderGitState(st, opts = {}) {
     clean.textContent = 'No changes. Working tree clean.';
     gitBody.appendChild(clean);
   }
+
+  if (lastLog.length) gitBody.appendChild(renderCommitLog(lastLog));
 }
 
 function renderBranchBar(st) {
@@ -5943,6 +6223,37 @@ function renderSection(label, files, staged) {
   const ul = document.createElement('ul');
   ul.className = 'git-files';
   for (const f of files) ul.appendChild(renderFileRow(f, staged));
+  sec.appendChild(ul);
+  return sec;
+}
+
+// Read-only list of the last few commits on the current branch, shown at the
+// bottom of the panel so a push/commit is immediately visible in context.
+function renderCommitLog(commits) {
+  const sec = document.createElement('div');
+  sec.className = 'git-section';
+  const head = document.createElement('div');
+  head.className = 'git-section-head';
+  const title = document.createElement('span');
+  title.textContent = 'Recent Commits';
+  head.append(title);
+  sec.appendChild(head);
+
+  const ul = document.createElement('ul');
+  ul.className = 'git-log';
+  for (const c of commits) {
+    const li = document.createElement('li');
+    li.className = 'git-log-row';
+    const subj = document.createElement('span');
+    subj.className = 'git-log-subject';
+    subj.textContent = c.subject;
+    subj.title = `${c.hash} — ${c.author}, ${c.when}\n${c.subject}`;
+    const meta = document.createElement('span');
+    meta.className = 'git-log-meta';
+    meta.textContent = `${c.hash} · ${c.when}`;
+    li.append(subj, meta);
+    ul.appendChild(li);
+  }
   sec.appendChild(ul);
   return sec;
 }
@@ -7082,7 +7393,10 @@ function parsePlanMenu(screen) {
 // screen question re-syncs, which re-renders the card with the plan body.
 function planCardText(pane) {
   const pl = panePlan(pane);
-  if (!pl.cardFetch) {
+  // The probe re-enters this every 700 ms while a plan card is showing —
+  // throttle the IPC file read; 2 s is plenty live for a plan being edited.
+  if (!pl.cardFetch && (!pl.cardFetchAt || Date.now() - pl.cardFetchAt > 2000)) {
+    pl.cardFetchAt = Date.now();
     pl.cardFetch = (async () => {
       const dir = pane.board && pane.board.dir;
       let res = null;

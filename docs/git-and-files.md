@@ -30,6 +30,7 @@ raw CLI result shape `{ code, stdout, stderr }` — **they never reject**; failu
 | `discard(cwd, files)` (`git.js:230`) | array of `{ path, untracked }` | CLI result (last failure wins) | tracked: `git restore --source=HEAD --staged --worktree -- <files>`; untracked: `fs.rmSync` (guarded by `insideCwd`) |
 | `commit(cwd, message)` | message string | CLI result | `git commit -m <message>` |
 | `branches(cwd)` (`git.js:248`) | — | `string[]` (empty on error) | `git branch --format=%(refname:short)` |
+| `log(cwd, count = 3)` (`git.js:254`) | count clamped to 1–50 | `[{ hash, subject, when, author }]` newest first (empty on error / no commits) | `git log -n <count> --pretty=format:` with `%x1f`/`%x1e` separators |
 | `checkout(cwd, name)` | branch name (must pass `safeRef`) | CLI result | `git checkout <name>` |
 | `createBranch(cwd, name)` | branch name (`safeRef`) | CLI result | `git checkout -b <name>` |
 | `init(cwd)` | — | CLI result | `git init -b main` |
@@ -71,7 +72,8 @@ function names (`git:status`, `git:diff`, … `gh:check`, `gh:createRepo`, `git:
 
 | Feature | Renderer | Channel(s) → function |
 |---|---|---|
-| Source Control panel open/refresh (`#git-toggle`) | `refreshGit()` `renderer.js:5574` | `git:status` → `status` |
+| Source Control panel open/refresh (`#git-toggle`) | `refreshGit()` `renderer.js:5574` | `git:status` → `status`, `git:log` → `log` (fetched in parallel) |
+| "Recent Commits" list at the bottom of the panel (last 3, read-only) | `renderCommitLog` `renderer.js` | data from `git:log`, cached in `lastLog` |
 | Branch bar: name + `↓behind ↑ahead` counters, GitHub-page button | `renderBranchBar` `renderer.js:5661` | data from `status`; web button uses `remoteWebUrl` via `openExternal` |
 | Branch menu (switch / create) | `openBranchMenu` `renderer.js:8108` | `git:branches`, `git:checkout`, `git:createBranch` |
 | "Initialize Repository" (non-repo folder) | `renderer.js:5635` | `git:init` |

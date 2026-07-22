@@ -179,7 +179,7 @@ Claude entry shape (synthetic uuids `cx:<lineNo>`). Every string is capped at 50
 |---|---|---|
 | `transcript:bind` | invoke (`main.js:838`) | bind pane → session file; called at pane spawn (`src/renderer.js:4504`) |
 | `transcript:unbind` | send | release claim (pane close/respawn) |
-| `transcript:noteSent` | send | report sent text for the text-match rules; called by `deliverPrompt` (`src/renderer.js:1125`) and for spawn-time initial prompts (`src/renderer.js:4515` — mirrors main.js's whitespace normalization so it equals the transcript's first user line) |
+| `transcript:noteSent` | send | report sent text for the text-match rules; called by `deliverPrompt` (`src/renderer.js:1160`) and for spawn-time initial prompts (`src/renderer.js:4550` — mirrors main.js's whitespace normalization so it equals the transcript's first user line) |
 | `transcript:sessions` | invoke | list past sessions for the history menu (`listSessions` — titles from a head peek: rolling `summary` line, else first user message) |
 | `transcript:session` | invoke | read one whole past session (`readSession` — basename-only, containment-guarded) |
 | `transcript:refresh` | send | re-emit the live file from offset 0 (leaving history view) |

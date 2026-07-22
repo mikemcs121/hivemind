@@ -781,6 +781,12 @@ button.usage-pill.crit { color: var(--danger); }
   font-size: calc(var(--pane-font, 13px) - 1px);
 }
 .chat-question-opt:hover { border-color: var(--accent); }
+/* Keyboard answering (Tab + Enter/Space) gets the same affordance as hover. */
+.chat-question-opt:focus-visible,
+.chat-question-key:focus-visible,
+.chat-prompt-keys button:focus-visible { outline: none; border-color: var(--accent); }
+.chat-question-opt:disabled { opacity: 0.55; cursor: default; }
+.chat-question-opt:disabled:hover { border-color: var(--border); }
 .chat-question.answered .chat-question-opt { cursor: default; }
 .chat-question.answered .chat-question-opt:hover { border-color: var(--border); }
 /* Local echo of what this card sent — the TUI checks options out of sight. */
@@ -1346,6 +1352,15 @@ button.usage-pill.crit { color: var(--danger); }
   cursor: pointer; font-size: 13px; padding: 1px 5px; border-radius: 4px;
 }
 .git-section-head button:hover { color: var(--text); background: var(--surface); }
+
+/* Recent commits log */
+.git-log { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 5px; }
+.git-log-row { display: flex; flex-direction: column; gap: 1px; min-width: 0; padding: 2px 6px; }
+.git-log-subject {
+  font-size: 13px; color: var(--text);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.git-log-meta { font-size: 11px; color: var(--muted); }
 
 .git-files { list-style: none; margin: 0; padding: 0; }
 .git-file {

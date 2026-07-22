@@ -772,6 +772,7 @@ app.whenReady().then(() => {
   ipcMain.handle('git:discard', (_e, { cwd, files }) => git.discard(cwd, files));
   ipcMain.handle('git:commit', (_e, { cwd, message }) => git.commit(cwd, message));
   ipcMain.handle('git:branches', (_e, { cwd }) => git.branches(cwd));
+  ipcMain.handle('git:log', (_e, { cwd, count }) => git.log(cwd, count));
   ipcMain.handle('git:checkout', (_e, { cwd, name }) => git.checkout(cwd, name));
   ipcMain.handle('git:createBranch', (_e, { cwd, name }) => git.createBranch(cwd, name));
   ipcMain.handle('git:init', (_e, { cwd }) => git.init(cwd));

@@ -68,6 +68,7 @@ contextBridge.exposeInMainWorld('api', {
     discard: (cwd, files) => ipcRenderer.invoke('git:discard', { cwd, files }),
     commit: (cwd, message) => ipcRenderer.invoke('git:commit', { cwd, message }),
     branches: (cwd) => ipcRenderer.invoke('git:branches', { cwd }),
+    log: (cwd, count) => ipcRenderer.invoke('git:log', { cwd, count }),
     checkout: (cwd, name) => ipcRenderer.invoke('git:checkout', { cwd, name }),
     createBranch: (cwd, name) => ipcRenderer.invoke('git:createBranch', { cwd, name }),
     init: (cwd) => ipcRenderer.invoke('git:init', { cwd }),
