@@ -63,10 +63,52 @@ const safeRef = (name) => typeof name === 'string' && name.length > 0 && !name.s
 // Guards the two places git file paths are used directly on the filesystem
 // (untracked-file read in diff(), untracked-file delete in discard()) so a
 // path that escaped the project tree can't read or delete outside it.
+// This is a lexical check; on win32 paths are case-insensitive, so fold case
+// before the prefix compare to avoid false-negatives when case differs.
 function insideCwd(cwd, rel) {
   const base = path.resolve(cwd);
   const full = path.resolve(base, rel);
-  return full === base || full.startsWith(base + path.sep);
+  let a = full, b = base;
+  if (process.platform === 'win32') { a = a.toLowerCase(); b = b.toLowerCase(); }
+  return a === b || a.startsWith(b + path.sep);
+}
+
+// realpathSync that tolerates a not-yet-existing target: resolve the nearest
+// existing ancestor, then re-append the missing trailing segments. Throws for
+// any non-ENOENT error (permission, loop, …).
+function realpathAllowMissing(p) {
+  let abs = path.resolve(p);
+  const missing = [];
+  for (;;) {
+    try {
+      const real = fs.realpathSync(abs);
+      if (!missing.length) return real;
+      missing.reverse();
+      return path.join(real, ...missing);
+    } catch (e) {
+      if (!e || e.code !== 'ENOENT') throw e;
+      const parent = path.dirname(abs);
+      if (parent === abs) throw e; // reached the filesystem root, still missing
+      missing.push(path.basename(abs));
+      abs = parent;
+    }
+  }
+}
+
+// True only if the *real* (symlink-resolved) location of `p` is inside `root`.
+// A lexical guard (insideCwd/safeJoin) is defeated by an in-tree symlink that
+// points outside the project, so resolve real paths before touching the file
+// system. Tolerates a missing target via realpathAllowMissing. On win32
+// realpath returns canonical case, so compare case-insensitively there.
+function realInside(root, p) {
+  let base, real;
+  try {
+    base = fs.realpathSync(path.resolve(root));
+    real = realpathAllowMissing(p);
+  } catch (_) { return false; }
+  let a = real, b = base;
+  if (process.platform === 'win32') { a = a.toLowerCase(); b = b.toLowerCase(); }
+  return a === b || a.startsWith(b + path.sep);
 }
 
 // ---------------------------------------------------------------------------
@@ -204,6 +246,9 @@ async function diff(cwd, file, staged, untracked) {
     try {
       if (!insideCwd(cwd, file)) return { code: 1, text: 'refused: path outside project' };
       const full = path.join(cwd, file);
+      // Lexically inside, but an in-tree symlink can still point outside — check
+      // the real target before reading so we never follow it out of the project.
+      if (!realInside(cwd, full)) return { code: 1, text: 'refused: path outside project' };
       const buf = fs.readFileSync(full);
       if (buf.includes(0)) return { code: 0, text: '(binary file)' };
       const body = buf.toString('utf8').split('\n').map((l) => '+' + l).join('\n');
@@ -237,7 +282,10 @@ async function discard(cwd, files) {
   }
   for (const f of untracked) {
     if (!insideCwd(cwd, f)) { last = { code: 1, stdout: '', stderr: `refused: path outside project (${f})` }; continue; }
-    try { fs.rmSync(path.join(cwd, f), { force: true }); }
+    // porcelain v2 reports an untracked directory as a single `dir/` entry, so
+    // recursive is required to remove a non-empty folder (these are being
+    // deliberately discarded).
+    try { fs.rmSync(path.join(cwd, f), { recursive: true, force: true }); }
     catch (e) { last = { code: 1, stdout: '', stderr: String(e.message || e) }; }
   }
   return last;
@@ -343,11 +391,36 @@ async function hasCommits(cwd) {
   return (await runGit(cwd, ['rev-parse', '--verify', 'HEAD'])).code === 0;
 }
 
+// Accept only ordinary git transports. Git's smart-transport helpers — `ext::`,
+// `fd::` — run arbitrary shell commands, and `file::`/other `scheme::` forms are
+// never expected here, so reject anything matching a `scheme::` helper prefix.
+// Allowed: https/http/ssh/git URLs and scp-style user@host:path.
+function isSafeRemoteUrl(url) {
+  const u = (url || '').trim();
+  if (!u) return false;
+  if (/^[a-z][a-z0-9+.-]*::/i.test(u)) return false;        // ext:: fd:: file:: …
+  if (/^(https?|ssh|git):\/\//i.test(u)) return true;       // standard URL schemes
+  if (/^[^@/\\]+@[^:/\\]+:.+$/.test(u)) return true;        // scp-style user@host:path
+  return false;
+}
+
+// Clone targets additionally allow gh's `owner/repo` shorthand.
+function isSafeCloneTarget(target) {
+  const t = (target || '').trim();
+  if (!t) return false;
+  if (isSafeRemoteUrl(t)) return true;
+  if (/^[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+$/.test(t)) return true; // owner/repo
+  return false;
+}
+
 // Point `origin` at a URL — adding the remote, or repointing it if it exists.
 async function setRemoteOrigin(cwd, url) {
   if (!ok(cwd)) return { code: 1, stdout: '', stderr: 'This board has no project directory set.' };
   const u = (url || '').trim();
   if (!u) return { code: 1, stdout: '', stderr: 'A repository URL is required.' };
+  if (!isSafeRemoteUrl(u)) {
+    return { code: 1, stdout: '', stderr: 'Unsupported repository URL. Use an https, ssh, or git URL (or user@host:path).' };
+  }
   const existing = await runGit(cwd, ['remote', 'get-url', 'origin']);
   const args = existing.code === 0
     ? ['remote', 'set-url', 'origin', u]
@@ -381,6 +454,11 @@ async function ghCreateRepo(cwd, { name, visibility = 'private', push = true } =
   if (!ok(cwd)) return { code: 1, stdout: '', stderr: 'This board has no project directory set.' };
   const n = (name || '').trim();
   if (!n) return { code: 1, stdout: '', stderr: 'A repository name is required.' };
+  // `n` is passed positionally to `gh repo create <name>`; a leading '-' would
+  // read as an option (argument injection). Allow "repo" or "owner/repo" only.
+  if (n.startsWith('-') || !/^[A-Za-z0-9._-]+(\/[A-Za-z0-9._-]+)?$/.test(n)) {
+    return { code: 1, stdout: '', stderr: 'Invalid repository name. Use letters, numbers, dashes, underscores, dots, or owner/repo.' };
+  }
   const vis = visibility === 'public' ? '--public'
     : visibility === 'internal' ? '--internal'
     : '--private';
@@ -421,6 +499,11 @@ async function ghListRepos({ limit = 100 } = {}) {
 async function ghClone({ target, destParent, folder } = {}) {
   const t = (target || '').trim();
   if (!t || t.startsWith('-')) return { code: 1, stdout: '', stderr: 'A repository to clone is required.' };
+  // Reject ext::/fd::/file:: and other unexpected transports (they can run
+  // arbitrary shell commands); accept only real URLs or owner/repo shorthand.
+  if (!isSafeCloneTarget(t)) {
+    return { code: 1, stdout: '', stderr: 'Unsupported repository. Use an https, ssh, or git URL, or owner/repo.' };
+  }
   const parent = (destParent || '').trim();
   if (!parent) return { code: 1, stdout: '', stderr: 'Choose a folder to clone into.' };
 

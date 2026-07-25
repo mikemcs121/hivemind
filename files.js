@@ -18,8 +18,49 @@ function safeJoin(root, rel) {
   if (typeof root !== 'string' || !root.length) return null;
   const base = path.resolve(root);
   const resolved = path.resolve(rel ? path.join(base, rel) : base);
-  if (resolved !== base && !resolved.startsWith(base + path.sep)) return null;
+  // Lexical check only. On win32 paths are case-insensitive, so fold case before
+  // the prefix compare to avoid rejecting legitimate in-tree paths that differ
+  // only in case.
+  let a = resolved, b = base;
+  if (process.platform === 'win32') { a = a.toLowerCase(); b = b.toLowerCase(); }
+  if (a !== b && !a.startsWith(b + path.sep)) return null;
   return resolved;
+}
+
+// realpathSync that tolerates a not-yet-existing target: resolve the nearest
+// existing ancestor, then re-append the missing trailing segments.
+function realpathAllowMissing(p) {
+  let abs = path.resolve(p);
+  const missing = [];
+  for (;;) {
+    try {
+      const real = fs.realpathSync(abs);
+      if (!missing.length) return real;
+      missing.reverse();
+      return path.join(real, ...missing);
+    } catch (e) {
+      if (!e || e.code !== 'ENOENT') throw e;
+      const parent = path.dirname(abs);
+      if (parent === abs) throw e; // reached the filesystem root, still missing
+      missing.push(path.basename(abs));
+      abs = parent;
+    }
+  }
+}
+
+// True only if the *real* (symlink-resolved) location of `p` is inside `root`.
+// safeJoin is lexical and is defeated by an in-tree symlink pointing outside the
+// project, so resolve real paths before listing/opening/revealing. On win32
+// realpath returns canonical case, so compare case-insensitively there.
+function realInside(root, p) {
+  let base, real;
+  try {
+    base = fs.realpathSync(path.resolve(root));
+    real = realpathAllowMissing(p);
+  } catch (_) { return false; }
+  let a = real, b = base;
+  if (process.platform === 'win32') { a = a.toLowerCase(); b = b.toLowerCase(); }
+  return a === b || a.startsWith(b + path.sep);
 }
 
 // List one directory level. `rel` is empty for the project root. Entries are
@@ -28,6 +69,9 @@ async function list(root, rel) {
   const dir = safeJoin(root, rel);
   if (!root) return { ok: false, reason: 'no-dir' };
   if (!dir) return { ok: false, reason: 'error', message: 'Path is outside the project directory.' };
+  // Lexically inside, but a symlink component could still point outside — verify
+  // the real directory is within the project before reading it.
+  if (!realInside(root, dir)) return { ok: false, reason: 'error', message: 'Path is outside the project directory.' };
 
   let dirents;
   try {
@@ -37,16 +81,21 @@ async function list(root, rel) {
     return { ok: false, reason: 'error', message: err.message };
   }
 
-  const entries = dirents.map((d) => {
+  const entries = [];
+  for (const d of dirents) {
     let isDir = d.isDirectory();
-    // A symlink that points at a directory should expand like one.
+    // A symlink that points at a directory should expand like one — but a
+    // symlink whose real target escapes the project tree must not be followed,
+    // so omit it from the listing entirely.
     if (d.isSymbolicLink()) {
-      try { isDir = fs.statSync(path.join(dir, d.name)).isDirectory(); }
+      const target = path.join(dir, d.name);
+      if (!realInside(root, target)) continue;
+      try { isDir = fs.statSync(target).isDirectory(); }
       catch (_) { isDir = false; }
     }
     const childRel = rel ? rel.replace(/\/+$/, '') + '/' + d.name : d.name;
-    return { name: d.name, path: childRel, isDir };
-  });
+    entries.push({ name: d.name, path: childRel, isDir });
+  }
 
   entries.sort((a, b) => {
     if (a.isDir !== b.isDir) return a.isDir ? -1 : 1;
@@ -60,6 +109,7 @@ async function list(root, rel) {
 async function open(root, rel) {
   const p = safeJoin(root, rel);
   if (!p) return { ok: false, message: 'Path is outside the project directory.' };
+  if (!realInside(root, p)) return { ok: false, message: 'Path is outside the project directory.' };
   const err = await shell.openPath(p); // '' on success
   return err ? { ok: false, message: err } : { ok: true };
 }
@@ -68,6 +118,7 @@ async function open(root, rel) {
 function reveal(root, rel) {
   const p = safeJoin(root, rel);
   if (!p) return { ok: false, message: 'Path is outside the project directory.' };
+  if (!realInside(root, p)) return { ok: false, message: 'Path is outside the project directory.' };
   shell.showItemInFolder(p);
   return { ok: true };
 }

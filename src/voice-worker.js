@@ -59,6 +59,11 @@ env.backends.onnx.wasm.numThreads =
 const DEFAULT_MODEL = 'onnx-community/moonshine-base-ONNX';
 const DEFAULT_DTYPE = { encoder_model: 'q8', decoder_model_merged: 'q8' };
 
+// Off by default: this is an offline dictation app, so the recognized text is
+// private and must never hit the console in normal use. Flip to true only when
+// locally debugging the pipeline.
+const VOICE_DEBUG = false;
+
 let transcriber = null;
 
 // -- Silero VAD --------------------------------------------------------------
@@ -119,6 +124,15 @@ function handleVad(msg) {
           vadStateGen = msg.gen;
           vadState = new Tensor('float32', new Float32Array(2 * 128), [2, 1, 128]);
         }
+        // Invariant: renderer frames are a whole multiple of VAD_CHUNK (frames
+        // are 1024 samples = 2 chunks), so this loop consumes every sample. A
+        // frame that is NOT a multiple would silently drop its trailing
+        // <512-sample remainder; flag that while debugging rather than change the
+        // scoring math.
+        if (VOICE_DEBUG && msg.audio.length % VAD_CHUNK !== 0) {
+          console.warn('[voice-worker] VAD frame not a multiple of ' + VAD_CHUNK +
+            ' (len=' + msg.audio.length + '); trailing samples dropped');
+        }
         for (let i = 0; i + VAD_CHUNK <= msg.audio.length; i += VAD_CHUNK) {
           const p = await vadProb(msg.audio.subarray(i, i + VAD_CHUNK));
           prob = (prob == null) ? p : Math.max(prob, p);
@@ -161,19 +175,27 @@ async function load(msg) {
   }
 }
 
-async function transcribe(id, audio) {
-  if (!transcriber) { self.postMessage({ type: 'result', id, text: '' }); return; }
-  try {
-    // Moonshine is an English-only model: language/task are fixed, so we pass
-    // only the audio. Segments are already short, so no internal chunking.
-    const out = await transcriber(audio);
-    const text = (out && out.text) || '';
-    console.log('[voice-worker] samples=' + audio.length +
-      ' text=' + JSON.stringify(text));
-    self.postMessage({ type: 'result', id, text });
-  } catch (err) {
-    self.postMessage({ type: 'result', id, text: '', error: (err && (err.message || String(err))) });
-  }
+// Route ASR through the same vadQueue mutex as VAD scoring so only one ONNX
+// inference runs at a time — the two share the WASM runtime, and overlapping
+// them can corrupt VAD's carried recurrent state and thrash the thread pool.
+function transcribe(id, audio) {
+  vadQueue = vadQueue.then(async () => {
+    if (!transcriber) { self.postMessage({ type: 'result', id, text: '' }); return; }
+    try {
+      // Moonshine is an English-only model: language/task are fixed, so we pass
+      // only the audio. Segments are already short, so no internal chunking.
+      const out = await transcriber(audio);
+      const text = (out && out.text) || '';
+      // Never log the recognized text (privacy — offline dictation). Length only,
+      // and only when explicitly debugging.
+      if (VOICE_DEBUG) {
+        console.log('[voice-worker] samples=' + audio.length + ' chars=' + text.length);
+      }
+      self.postMessage({ type: 'result', id, text });
+    } catch (err) {
+      self.postMessage({ type: 'result', id, text: '', error: (err && (err.message || String(err))) });
+    }
+  });
 }
 
 self.onmessage = (ev) => {

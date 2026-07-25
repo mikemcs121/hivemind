@@ -282,10 +282,17 @@ if (!isValidCodexModel(defaultCodexModel)) defaultCodexModel = 'default';
 // change mode mid-session, so switching a running thread restarts it (resuming
 // the conversation when one exists). The last choice is remembered as the
 // default for new threads.
+//
+// The thread can also change mode *without* Hivemind — shift+tab cycles
+// manual → accept edits → plan → auto in the TUI, and approving a plan leaves
+// plan mode for whichever mode the approval option named. `permScreenCheck`
+// reads the mode back off the footer so the dropdown shows what the thread is
+// really doing (see "Live permission mode" below).
 // ---------------------------------------------------------------------------
 const PERMS = [
   { value: 'default',     label: 'Default' },
   { value: 'acceptEdits', label: 'Accept Edits' },
+  { value: 'auto',        label: 'Auto' },
   { value: 'plan',        label: 'Plan' },
   { value: 'bypass',      label: 'Bypass ⚠' },
 ];
@@ -432,8 +439,50 @@ function setPanePerm(pane, mode) {
   // strands the pane in the bare shell. A used thread that never bound (has a
   // caption) falls back to --continue; a fresh, unused thread restarts clean.
   if (changed && pane.agent === 'claude' && pane.state !== 'dead') {
+    pane.permSetAt = Date.now(); // let the restart settle before trusting the screen
     respawnPane(pane, { resume: (pane.sessionBound && pane.sessionId) || !!pane.captionText });
   }
+}
+
+// --- Live permission mode ----------------------------------------------------
+// Claude Code names the current mode in its footer hint ("⏸ manual mode on",
+// "⏵⏵ accept edits on", "⏸ plan mode on", "⏵⏵ auto mode on", "⏵⏵ bypass
+// permissions on" — v2.1.220). The mode moves under us in two ordinary ways:
+// shift+tab in the terminal, and approving a plan ("Yes, and use auto mode" /
+// "Yes, manually approve edits" drop the thread out of plan mode). Reading it
+// back keeps the header dropdown honest. This never restarts the thread — it
+// only records what the thread already switched to (setPanePerm is the path
+// that *changes* the mode).
+// Anchored on the hint's own chrome (the ⏸/⏵⏵ glyph) and only read from the
+// bottom of the screen, where that hint lives — the same words quoted in
+// Claude's prose ("switch to plan mode on…") must not move the dropdown.
+const PERM_SCREEN_RE = /(?:⏸|⏵⏵|⏵)\s*(manual mode|plan mode|auto mode|accept edits|bypass permissions)\s+on\b/i;
+const PERM_SCREEN_MODES = {
+  'manual mode': 'default',
+  'accept edits': 'acceptEdits',
+  'auto mode': 'auto',
+  'plan mode': 'plan',
+  'bypass permissions': 'bypass',
+};
+const PERM_SETTLE_MS = 5000;
+function permScreenCheck(pane, screen) {
+  if (pane.agent !== 'claude' || pane.disposed || pane.state === 'dead') return;
+  // A mode we just asked for is mid-restart: the old process's last frame is
+  // still in the buffer and would read as a revert.
+  if (pane.permSetAt && Date.now() - pane.permSetAt < PERM_SETTLE_MS) return;
+  const tail = screen.split('\n').filter((l) => l.trim()).slice(-3);
+  let mode = null;
+  for (const line of tail) {
+    const m = PERM_SCREEN_RE.exec(line);
+    if (m) mode = PERM_SCREEN_MODES[m[1].toLowerCase()];
+  }
+  // No match means the hint is covered (a dialog, a full-screen menu) — never
+  // read absence as a mode change.
+  if (!mode || mode === pane.permMode) return;
+  pane.permMode = mode;
+  if (pane.permSelect && pane.permSelect.value !== mode) pane.permSelect.value = mode;
+  paintPermSelect(pane);
+  persistLayout(pane.board.id); // a restart should come back in the mode it ended in
 }
 
 // ---------------------------------------------------------------------------
@@ -660,8 +709,33 @@ const testWrapped = (re, lines, i) =>
   re.test(lines[i]) ||
   (i + 1 < lines.length && re.test(lines[i].trim() + ' ' + lines[i + 1].trim()));
 
+// An AskUserQuestion whose options carry `preview` text renders side-by-side:
+// a narrow option list on the left and the focused option's preview in a box
+// to the right, with a "Notes: press n to add notes" hint under it. Every one
+// of those right-hand columns lands on the same screen rows as the options, so
+// without cutting them off the box art and the preview body end up inside
+// option labels and descriptions. Returns the column the preview box starts
+// at, or -1 when this is an ordinary menu.
+function previewCutColumn(lines, start, end) {
+  const cols = [];
+  for (let i = start; i < end; i++) {
+    const m = /[┌│└├┬]/.exec(lines[i]);
+    if (m && m.index > 0) cols.push(m.index);
+  }
+  if (cols.length < 3) return -1;
+  const left = Math.min(...cols);
+  // A real box edge repeats down the same column; one stray glyph in a label
+  // (or a wrapped code sample) doesn't.
+  return cols.filter((c) => c === left).length >= 3 ? left : -1;
+}
+
 function parseScreenQuestion(screen) {
-  const lines = screen.split('\n').map(stripBoxChrome);
+  // `raw` keeps the preview box's own left edge (stripBoxChrome would eat it
+  // as outer dialog chrome, which is exactly what hid the preview column from
+  // the cut); `lines` is the ordinary chrome-stripped view everything else
+  // works on.
+  const raw = screen.split('\n');
+  const lines = raw.map(stripBoxChrome);
   let foot = -1;
   for (let i = lines.length - 1; i >= 0; i--) {
     if (testWrapped(SELECT_FOOTER_RE, lines, i)) { foot = i; break; }
@@ -676,11 +750,21 @@ function parseScreenQuestion(screen) {
     if (m && m[2] === '1') { start = i; break; }
   }
   if (start < 0) return null;
+  // Preview layout: drop everything right of the preview box so only the
+  // option column is parsed (the "Notes:" hint sits in that column too, and
+  // slicing leaves it blank, which the separator test then skips).
+  let cut = previewCutColumn(raw, start, foot);
+  // Guard against a fully bordered dialog, where the *left* border is the first
+  // box character on every row: cutting there would erase the option list. The
+  // cut only stands if the "1." row still parses as an option without its
+  // right-hand column.
+  if (cut >= 0 && !SCREEN_OPT_RE.test(stripBoxChrome(raw[start].slice(0, cut)))) cut = -1;
+  const row = (i) => (cut < 0 ? lines[i] : stripBoxChrome(raw[i].slice(0, cut)).replace(/\s+$/, ''));
   const options = [];
   let hasCheckbox = false;
   for (let i = start; i < foot; i++) {
-    if (SCREEN_SEP_RE.test(lines[i])) continue;
-    const m = SCREEN_OPT_RE.exec(lines[i]);
+    if (SCREEN_SEP_RE.test(row(i))) continue;
+    const m = SCREEN_OPT_RE.exec(row(i));
     if (m && Number(m[2]) === options.length + 1) {
       let label = m[3].trim();
       let box = m[1] || '';
@@ -697,10 +781,11 @@ function parseScreenQuestion(screen) {
       // card than one whose digits actuate unseen rows.
       return null;
     } else if (options.length) {
-      const t = lines[i].trim();
-      // The focusable "Submit" row under the last option is menu chrome, not
-      // an option description.
-      if (/^Submit$/.test(t)) continue;
+      const t = row(i).trim();
+      // Focusable menu chrome under the last option ("Submit" on the
+      // multi-select tab, "Chat about this" on the preview layout, where it
+      // sits below a separator and carries no number) — not a description.
+      if (/^(Submit|Chat about this)$/.test(t)) continue;
       const o = options[options.length - 1];
       o.description = (o.description ? o.description + ' ' : '') + t;
     }
@@ -727,6 +812,12 @@ function parseScreenQuestion(screen) {
     question,
     options,
     multiSelect: hasCheckbox || /space to (toggle|select)/i.test(lines[foot]),
+    // The preview/notes layout is the one menu style where a digit only MOVES
+    // the selection — Enter commits it (verified against Claude Code v2.1.220;
+    // plain menus still answer on the digit alone). Cards send the Enter only
+    // when this is set, so a menu that answers immediately can't receive a
+    // stray Enter aimed at whatever screen follows it.
+    needsEnter: cut >= 0 || /\bto add notes\b/i.test(lines[foot]),
   };
 }
 
@@ -950,6 +1041,7 @@ function probeAttention(pane) {
   const screen = screenText(pane);
   syncScreenQuestion(pane, screen);
   planScreenCheck(pane, screen);
+  permScreenCheck(pane, screen);
   if (menuOnScreen(screen) || chatHasPendingQuestion(pane)) {
     pane.menuMiss = 0;
     setPaneState(pane, 'attention');
@@ -1046,6 +1138,7 @@ function evaluateIdle(pane) {
   const screen = screenText(pane);
   syncScreenQuestion(pane, screen);
   planScreenCheck(pane, screen);
+  permScreenCheck(pane, screen);
   const promptVisible = promptVisibleOnScreen(screen);
   const needsYou = promptVisible || chatHasPendingQuestion(pane);
   // A transcript-pending question with nothing on screen is a stranded lock —
@@ -1238,10 +1331,14 @@ function setPaneCaption(pane, text, { persist = true } = {}) {
   if (persist) persistLayout(pane.board.id);
 }
 
-// Send keystrokes/text to a pane.
-function sendToPane(pane, data) {
+// Send keystrokes/text to a pane. `caption: false` keeps the keystrokes out of
+// the caption tracker: menu answers (a card's digit, Enter, Tab) and review
+// feedback aren't the thread's task, and a digit with no Enter behind it would
+// otherwise sit in `capBuf` and glue itself onto the front of the next real
+// prompt ("1Plan a shout() function…").
+function sendToPane(pane, data, { caption = true } = {}) {
   window.api.writePty(pane.id, data);
-  feedCaptionInput(pane, data);
+  if (caption) feedCaptionInput(pane, data);
   markActivity(pane, ''); // typing means this pane is active again
 }
 
@@ -1844,18 +1941,19 @@ const HM_COMMANDS = [
     name: 'permission-mode',
     patterns: [
       /^(?:set\s+)?(?:the\s+)?permissions?(?:\s+mode)?\s+(?:to\s+)?(.+)$/i,
-      /^(?:enter\s+|go\s+to\s+|switch\s+to\s+)?(plan|bypass|accept\s*edits|default)\s+mode$/i,
+      /^(?:enter\s+|go\s+to\s+|switch\s+to\s+)?(plan|bypass|auto|accept\s*edits|default)\s+mode$/i,
     ],
-    help: '<strong>plan / bypass / accept edits / default mode</strong> — this Claude thread\'s permission mode (restarts it, resuming the conversation).',
+    help: '<strong>plan / auto / bypass / accept edits / default mode</strong> — this Claude thread\'s permission mode (restarts it, resuming the conversation).',
     run(m, { pane }) {
       if (!pane) { hmToast('No thread to change.', 'err'); return; }
       if (pane.agent !== 'claude') { hmToast('Permission modes only apply to Claude threads.', 'err'); return; }
       const q = m[1].trim().toLowerCase().replace(/\s+mode$/, '').replace(/[\s-]+/g, '');
       const v = q === 'default' ? 'default'
         : q === 'plan' ? 'plan'
+        : q === 'auto' ? 'auto'
         : /^bypass/.test(q) ? 'bypass'
         : /^accept/.test(q) ? 'acceptEdits' : null;
-      if (!v) { hmToast('Permission modes: Default, Accept Edits, Plan, Bypass.', 'err'); return; }
+      if (!v) { hmToast('Permission modes: Default, Accept Edits, Auto, Plan, Bypass.', 'err'); return; }
       const label = (PERMS.find((p) => p.value === v) || {}).label || v;
       if (pane.permMode === v) { hmToast('Already in ' + label + ' mode.'); return; }
       const restarting = pane.state !== 'dead';
@@ -2671,11 +2769,14 @@ function initChatUI(pane, body) {
   // TUI's input line stays visible (.pane.term-chat CSS). Track that height as
   // the textarea autosizes and attachment chips wrap — the observer fires once
   // on observe, seeding the variable before first paint.
-  new ResizeObserver(() => {
+  // Stored on the pane so closePane can disconnect it — otherwise the observer
+  // (and the composer/closure it pins) leaks for every open→close of a pane.
+  pane.composerResizeObserver = new ResizeObserver(() => {
     if (pane.disposed) return;
     pane.el.style.setProperty('--chat-composer-h', composer.offsetHeight + 'px');
     if (pane.el.classList.contains('term-chat')) fitBoard(pane.board.id);
-  }).observe(composer);
+  });
+  pane.composerResizeObserver.observe(composer);
 
   // Composer wiring. Keystrokes stay local to the textarea; Enter sends.
   // The autocomplete menu gets first look at keys so ↑/↓/Tab/Enter/Esc can
@@ -3400,9 +3501,13 @@ function renderChatEntry(pane, e) {
     return;
   }
   if (e.type === 'assistant' && e.message && Array.isArray(e.message.content)) {
+    // Give uuid-less entries a unique anon base (matching chatKeyFor's scheme)
+    // so two of them can't produce colliding `a:0`/`a:1` keys that overwrite
+    // each other via upsertChatRow. Real uuids keep their stable `uuid:i` keys.
+    const base = e.uuid || 'anon:' + (++chatAnonSeq);
     e.message.content.forEach((part, i) => {
       if (!part) return;
-      const key = (e.uuid || 'a') + ':' + i;
+      const key = base + ':' + i;
       if (part.type === 'text' && part.text && part.text.trim()) {
         upsertChatRow(pane, key, 'assistant', (row) => {
           row.innerHTML = '<div class="chat-bubble assistant chat-md">' + markdownToHtml(part.text) + '</div>';
@@ -3751,7 +3856,7 @@ function addQuestionRow(pane, key, part) {
         } else {
           btn.title = q.multiSelect
             ? `Toggle "${label}" — presses ${i + 1} in the hidden terminal`
-            : `Answer "${label}" — presses ${i + 1} in the hidden terminal`;
+            : `Answer "${label}" — presses ${i + 1}${q.needsEnter ? ' then Enter' : ''} in the hidden terminal`;
         }
         btn.onclick = (e) => {
           e.stopPropagation();
@@ -3771,7 +3876,18 @@ function addQuestionRow(pane, key, part) {
             card.dataset.sent = '1';
             setTimeout(() => { delete card.dataset.sent; }, 2500);
           }
-          sendToPane(pane, String(i + 1));
+          sendToPane(pane, String(i + 1), { caption: false });
+          // Preview-layout menus take the digit as navigation only — commit it
+          // with Enter, after re-checking that the same menu is still up (the
+          // digit moves the caret but leaves the labels alone, so the shape
+          // check still matches). Without this the click looked like a no-op.
+          if (!q.multiSelect && q.needsEnter) {
+            setTimeout(() => {
+              if (pane.disposed || c.viewingHistory || pane.state === 'dead' || pane.state === 'error') return;
+              if (!cardMenuLive(pane, q)) return;
+              sendToPane(pane, '\r', { caption: false });
+            }, 250);
+          }
         };
         opts.appendChild(btn);
       });
@@ -3801,7 +3917,7 @@ function addQuestionRow(pane, key, part) {
         // already advanced lands in the next screen.
         if (isScreenCard ? !cardMenuLive(pane, questions[0])
                          : !menuOnScreen(screenText(pane))) return;
-        sendToPane(pane, '\t');
+        sendToPane(pane, '\t', { caption: false });
       };
       foot.appendChild(review);
     }
@@ -4130,7 +4246,7 @@ function renderPromptCard(pane, state) {
             removePromptCard(pane);
             return;
           }
-          sendToPane(pane, seq);
+          sendToPane(pane, seq, { caption: false });
         };
         keys.appendChild(b);
       }
@@ -4237,7 +4353,9 @@ const SIDEBAR_W_DEFAULT = 230;
   let startX = 0;
   let startW = 0;
   const refit = () => { if (typeof fitBoard === 'function' && activeBoardId) fitBoard(activeBoardId); };
-  const onMove = (e) => { applyW(startW + (e.clientX - startX)); refit(); };
+  // Keep the visual width live on every mousemove, but defer the fit/resizePty
+  // storm (one IPC per pane per move) to mouseup — same as the gutter-drag path.
+  const onMove = (e) => { applyW(startW + (e.clientX - startX)); };
   const onUp = () => {
     document.removeEventListener('mousemove', onMove);
     document.removeEventListener('mouseup', onUp);
@@ -5209,6 +5327,18 @@ function closePane(pane) {
   if (typeof planModalPane !== 'undefined' && planModalPane === pane) closePlanReview();
   clearTimeout(pane.idleTimer);
   stopAttentionProbe(pane);
+  if (pane.composerResizeObserver) {
+    try { pane.composerResizeObserver.disconnect(); } catch (_) { /* ignore */ }
+    pane.composerResizeObserver = null;
+  }
+  // Revoke any staged attachment thumbnails still in the composer — they're
+  // otherwise only revoked on send or manual chip removal, so closing a pane
+  // with attachments pending would leak their blob URLs.
+  if (pane.chat && Array.isArray(pane.chat.attachments)) {
+    for (const a of pane.chat.attachments) {
+      if (a && a.thumbUrl && a.thumbUrl.startsWith('blob:')) URL.revokeObjectURL(a.thumbUrl);
+    }
+  }
   window.api.killPty(pane.id);
   window.api.transcript.unbind(pane.id);
   try { pane.term.dispose(); } catch (_) { /* ignore */ }
@@ -5383,11 +5513,15 @@ window.api.transcript.onEntries(({ paneId, entries, backfill }) => {
   // file before claude creates it), and `--resume` of a never-written session
   // dies with "No conversation found".
   if (pane.agent === 'claude' && entries && entries.length) pane.sessionBound = true;
+  // Plan detection and cost must never miss an entry — chatIngest bails while
+  // the user browses history, so both run before it (and cost dedups on its own
+  // costSeen set, independent of viewingHistory). All three are isolated so a
+  // render exception in one can't skip the others.
   try { planScanEntries(pane, entries || [], !!backfill); } catch (_) { /* never block the chat */ }
-  chatIngest(pane, entries || [], !!backfill);
   if (pane.agent === 'claude') {
     try { costIngest(pane, entries || []); } catch (_) { /* cost chip is best-effort */ }
   }
+  try { chatIngest(pane, entries || [], !!backfill); } catch (_) { /* never block plan/cost */ }
 });
 
 window.api.transcript.onStatus(({ paneId, status, file }) => {
@@ -5418,8 +5552,10 @@ window.api.transcript.onStatus(({ paneId, status, file }) => {
   chatBindStatus(pane, status);
 });
 
-// Click anywhere outside an open history menu closes it.
+// Click anywhere outside an open history menu closes it. Early-out with a single
+// cheap DOM query so the common case (no menu open) skips the per-pane walk.
 document.addEventListener('mousedown', (e) => {
+  if (!document.querySelector('.chat-history-menu:not(.hidden)')) return;
   for (const g of grids.values()) {
     for (const col of g.columns) {
       for (const pane of col.panes) {
@@ -5849,14 +5985,27 @@ async function gitRun(label, fn, { refresh = true, okMsg } = {}) {
 }
 
 // -- Load status and (re)render the panel -----------------------------------
+let gitRefreshGen = 0; // bumped per refresh so a stale in-flight read can't repaint another hive
 async function refreshGit(opts = {}) {
   if (!gitPanelOpen()) return;
+  const gen = ++gitRefreshGen;
   const dir = activeDir();
   if (!dir) { renderGitState({ ok: false, reason: 'no-dir' }); return; }
-  const [st, log] = await Promise.all([
-    window.api.git.status(dir),
-    window.api.git.log(dir, 3),
-  ]);
+  let st, log;
+  try {
+    [st, log] = await Promise.all([
+      window.api.git.status(dir),
+      window.api.git.log(dir, 3),
+    ]);
+  } catch (e) {
+    // A git IPC rejection must not leave the panel stuck on a stale view.
+    if (gen !== gitRefreshGen || activeDir() !== dir) return;
+    renderGitState({ ok: false, message: String((e && e.message) || e) }, opts);
+    return;
+  }
+  // A newer refresh started, or the user switched hives while we awaited —
+  // discard this result so we never paint one hive's status over another's.
+  if (gen !== gitRefreshGen || activeDir() !== dir) return;
   lastStatus = st;
   lastLog = st.ok ? log : [];
   renderGitState(st, opts);
@@ -5961,7 +6110,7 @@ function renderBranchBar(st) {
   const counts = document.createElement('span');
   counts.className = 'git-counts';
   if (st.upstream) {
-    counts.innerHTML = `<span class="behind">↓${st.behind}</span> <span class="ahead">↑${st.ahead}</span>`;
+    counts.innerHTML = `<span class="behind">↓${Number(st.behind) || 0}</span> <span class="ahead">↑${Number(st.ahead) || 0}</span>`;
     counts.title = `Behind ${st.behind}, ahead ${st.ahead} of ${st.upstream}`;
   } else {
     counts.textContent = 'no upstream';
@@ -6131,7 +6280,14 @@ function doPull() {
 // (auto-drafting a message if the box is empty), then pushes — publishing the
 // repo to GitHub if it isn't connected yet. Does NOT pull; if the push is
 // rejected because the branch is behind, use Pull first.
+// In-flight guard: doPush awaits `aiCommitMessage` before entering any
+// gitBusy-guarded call, so without this a double-click (button or Ctrl+Enter)
+// would start two commit+push flows. A module-level flag (rather than the build
+// button's dataset.busy) is used because the push button is rebuilt on every
+// panel refresh and doPush is also reachable via the commit box's Ctrl+Enter.
+let pushInFlight = false;
 async function doPush() {
+  if (pushInFlight) return;
   const st = lastStatus;
   if (!st || !st.ok) { setGitMsg('No repository here.', 'err'); return; }
 
@@ -6139,37 +6295,42 @@ async function doPush() {
   // it pushes the current branch as part of finishing).
   if (!st.hasRemote) { openGitHubWizard(); return; }
 
-  const dir = activeDir();
-  const hasChanges = st.files && st.files.length > 0;
+  pushInFlight = true;
+  try {
+    const dir = activeDir();
+    const hasChanges = st.files && st.files.length > 0;
 
-  // 1) Commit any working-tree changes.
-  if (hasChanges) {
-    let msg = gitDraftMsg.trim();
-    if (!msg) {
-      // No typed message — draft one so the push needs no extra input.
-      setGitMsg('Drafting a commit message…');
-      try {
-        const r = await window.api.git.aiCommitMessage(dir);
-        if (r && r.code === 0 && r.message) msg = r.message.trim();
-      } catch { /* fall through to a default */ }
-      if (!msg) msg = 'Update from Hivemind';
+    // 1) Commit any working-tree changes.
+    if (hasChanges) {
+      let msg = gitDraftMsg.trim();
+      if (!msg) {
+        // No typed message — draft one so the push needs no extra input.
+        setGitMsg('Drafting a commit message…');
+        try {
+          const r = await window.api.git.aiCommitMessage(dir);
+          if (r && r.code === 0 && r.message) msg = r.message.trim();
+        } catch { /* fall through to a default */ }
+        if (!msg) msg = 'Update from Hivemind';
+      }
+      if (!st.files.some((f) => f.staged)) {
+        const staged = await gitRun('Staging all', (d) => window.api.git.stageAll(d), { refresh: false });
+        if (!staged || staged.code !== 0) { await refreshGit({ keepMsg: true }); return; }
+      }
+      const res = await gitRun('Committing', (d) => window.api.git.commit(d, msg), { refresh: false });
+      if (!res || res.code !== 0) { await refreshGit({ keepMsg: true }); return; }
+      gitDraftMsg = '';
     }
-    if (!st.files.some((f) => f.staged)) {
-      const staged = await gitRun('Staging all', (d) => window.api.git.stageAll(d), { refresh: false });
-      if (!staged || staged.code !== 0) { await refreshGit({ keepMsg: true }); return; }
-    }
-    const res = await gitRun('Committing', (d) => window.api.git.commit(d, msg), { refresh: false });
-    if (!res || res.code !== 0) { await refreshGit({ keepMsg: true }); return; }
-    gitDraftMsg = '';
+
+    // 2) Push (setting the upstream the first time the branch is published).
+    const setUpstream = !st.upstream;
+    await gitRun(
+      'Pushing to GitHub',
+      (d) => window.api.git.push(d, st.branch, setUpstream),
+      { okMsg: 'Pushed your changes to GitHub.' },
+    );
+  } finally {
+    pushInFlight = false;
   }
-
-  // 2) Push (setting the upstream the first time the branch is published).
-  const setUpstream = !st.upstream;
-  await gitRun(
-    'Pushing to GitHub',
-    (d) => window.api.git.push(d, st.branch, setUpstream),
-    { okMsg: 'Pushed your changes to GitHub.' },
-  );
 }
 
 let gitDraftMsg = '';
@@ -6348,12 +6509,16 @@ function filesOnBoardChange() {
   if (filesPanelOpen()) refreshFiles();
 }
 
+let filesRefreshGen = 0; // bumped per refresh so a stale in-flight listing can't repaint another hive
 async function refreshFiles() {
   if (!filesPanelOpen()) return;
   setFilesMsg('');
+  const gen = ++filesRefreshGen;
   const dir = activeDir();
   if (!dir) { renderFilesState({ ok: false, reason: 'no-dir' }); return; }
   const res = await window.api.files.list(dir, '');
+  // Discard if a newer refresh started or the user switched hives mid-read.
+  if (gen !== filesRefreshGen || activeDir() !== dir) return;
   renderFilesState(res);
 }
 
@@ -7197,6 +7362,7 @@ let planModalPane = null;    // the pane whose plan the review window shows
 let planText = null;         // raw markdown, or null when there's no plan file
 let planRenderedMtime = 0;   // mtime of the content currently rendered
 let planComments = [];       // [{ id, quote, occurrence, body, resolved, sent }]
+let planCommentsUnreadable = false; // the sidecar read failed (corrupt/locked) — never overwrite it with []
 let planPendingSel = null;   // { quote, occurrence } captured for a new comment
 let planDrafting = false;    // an inline comment editor is open
 let planPollTimer = null;    // live-refresh poll while the review is open
@@ -7569,6 +7735,7 @@ async function refreshPlanReview() {
   const cmtRes = key ? await window.api.plan.readComments(dir, key) : null;
   if (planModalPane !== pane || !planOpen()) return; // moved on during the reads
   planComments = (cmtRes && cmtRes.comments) || [];
+  planCommentsUnreadable = !!(cmtRes && cmtRes.ok === false);
   if (!res || !res.ok) { renderPlanDocState(res || { ok: false, reason: 'not-found' }); return; }
   planText = res.content;
   planRenderedMtime = res.mtime || 0;
@@ -7994,6 +8161,10 @@ function renderCommentList() {
 async function saveDraftComment(text) {
   const body = (text || '').trim();
   if (!body || !planPendingSel) { planDrafting = false; planPendingSel = null; renderCommentList(); return; }
+  if (planCommentsUnreadable) {
+    setPlanDocMsg('Comments file is unreadable — not adding until it can be read, so existing comments are not lost.', 'err');
+    planDrafting = false; planPendingSel = null; renderCommentList(); return;
+  }
   planComments.push({
     id: nextId('cmt'), quote: planPendingSel.quote,
     occurrence: planPendingSel.occurrence, body, resolved: false, sent: false,
@@ -8005,6 +8176,7 @@ async function saveDraftComment(text) {
 }
 
 async function resolveComment(id) {
+  if (planCommentsUnreadable) { setPlanDocMsg('Comments file is unreadable — cannot modify it right now.', 'err'); return; }
   planComments = planComments.filter((c) => c.id !== id);
   await persistComments();
   renderPlan();
@@ -8015,6 +8187,7 @@ async function persistComments() {
   const dir = pane && pane.board && pane.board.dir;
   const key = planCommentsKey(pane);
   if (!dir || !key) return;
+  if (planCommentsUnreadable) { setPlanDocMsg('Comments file is unreadable — not overwriting it. Fix or remove the .comments.json sidecar under .hivemind/plans/.', 'err'); return; }
   window.api.plan.ensureIgnored(dir); // sidecars live in `.hivemind/` — keep it out of Git
   const res = await window.api.plan.writeComments(dir, key, planComments);
   if (res && !res.ok) setPlanDocMsg(res.message || 'Could not save comments.', 'err');
@@ -8040,7 +8213,7 @@ function planAnswerMenu(labelRe, busyMsg) {
     paintPlanActions();
     return;
   }
-  sendToPane(pane, String(idx + 1));
+  sendToPane(pane, String(idx + 1), { caption: false });
   planSetState(pane, 'pending-result');
   setPlanDocMsg(busyMsg);
 }
@@ -8066,7 +8239,9 @@ async function planAwaitScreen(pane, re, timeoutMs) {
 // is up, pick "No, keep planning", wait for its inline feedback input, and
 // paste the comments; otherwise type the revision request directly. Marks the
 // comments sent — persisting them is the caller's job (the window and the
-// card each own their copy of the comment list).
+// card each own their copy of the comment list). Resolves false when the
+// feedback is still visibly sitting in the menu's input, so the caller can say
+// so instead of claiming it went out.
 async function planSendFeedback(pane, unsent, note) {
   const parts = unsent.map((c, n) => `[${n + 1}] Re "${c.quote}": ${c.body}`);
   if (note) parts.push(`[${parts.length + 1}] ${note}`);
@@ -8080,16 +8255,39 @@ async function planSendFeedback(pane, unsent, note) {
     // v2.1.21x menu the input (and its placeholder) is always on screen, so
     // the await returns immediately — the fixed delay keeps the paste from
     // racing the digit keypress that moves selection onto the input row.
-    sendToPane(pane, String(keepIdx + 1));
+    sendToPane(pane, String(keepIdx + 1), { caption: false });
     planSetState(pane, 'pending-result');
     await new Promise((r) => setTimeout(r, 200));
     await planAwaitScreen(pane, PLAN_FEEDBACK_INPUT_RE, 2500);
-    typePrompt(pane, feedback);
-  } else {
-    // No approval menu (hivemind/manual plans): just ask the thread directly.
-    typePrompt(pane, feedback + '\nThen rewrite the plan file at the same path.');
+    // Paste and submit by hand rather than through typePrompt: typePrompt
+    // refuses to press Enter while a menu is on screen (its Enter would
+    // actuate the menu) and confirmSubmit waits that menu out — but here the
+    // menu's own inline input IS the target, so nothing would ever submit and
+    // the feedback just sat in the field while the UI said it had been sent.
+    // Wait for the text to actually appear before the Enter (ConPTY can hand
+    // the CLI a paste and a fixed-delay Enter in one read, which turns the
+    // Enter into a newline inside the paste).
+    sendToPane(pane, '\x1b[200~' + feedback + '\x1b[201~', { caption: false });
+    const head = feedback.split('\n', 1)[0].slice(0, 40);
+    await planAwaitScreen(pane, new RegExp(escapeRegex(head)), 1500);
+    await new Promise((r) => setTimeout(r, 150));
+    sendToPane(pane, '\r', { caption: false });
+    // One bounded retry: if the feedback is still sitting on the approval menu
+    // a second later, the Enter was swallowed by the paste burst.
+    const stuck = () => !pane.disposed && pane.state !== 'dead' &&
+      !!parsePlanMenu(screenText(pane)) && screenText(pane).includes(head);
+    await new Promise((r) => setTimeout(r, 900));
+    if (stuck()) {
+      sendToPane(pane, '\r', { caption: false });
+      await new Promise((r) => setTimeout(r, 900));
+    }
+    unsent.forEach((c) => { c.sent = true; });
+    return !stuck();
   }
+  // No approval menu (hivemind/manual plans): just ask the thread directly.
+  typePrompt(pane, feedback + '\nThen rewrite the plan file at the same path.');
   unsent.forEach((c) => { c.sent = true; });
+  return true;
 }
 
 planReqChangesBtn.onclick = async () => {
@@ -8102,11 +8300,12 @@ planReqChangesBtn.onclick = async () => {
   const note = planDocNote.value.trim();
   if (!unsent.length && !note) { setPlanDocMsg('Add a comment (or overall feedback) first.', 'err'); return; }
   setPlanDocMsg('Sending your feedback…');
-  await planSendFeedback(pane, unsent, note);
+  const ok = await planSendFeedback(pane, unsent, note);
   planDocNote.value = '';
   await persistComments();
   renderCommentList();
-  setPlanDocMsg('Feedback sent — the thread will revise the plan.', 'ok');
+  if (ok) setPlanDocMsg('Feedback sent — the thread will revise the plan.', 'ok');
+  else setPlanDocMsg('Your feedback is typed into the thread but wasn’t submitted — press Enter in the terminal.', 'err');
 };
 
 // --- Chat-card plan review ---------------------------------------------------
@@ -8131,6 +8330,7 @@ function cardPlanComments(pane) {
       const res = dir && key ? await window.api.plan.readComments(dir, key) : null;
       if (pane.disposed) return;
       pl.cardComments = (res && res.comments) || [];
+      pl.cardCommentsUnreadable = !!(res && res.ok === false);
       refreshCardPlan(pane);
     })().finally(() => { pl.cardCmtFetch = null; });
   }
@@ -8141,6 +8341,7 @@ async function cardPersistComments(pane) {
   const dir = pane.board && pane.board.dir;
   const key = planCommentsKey(pane);
   if (!dir || !key) return;
+  if (panePlan(pane).cardCommentsUnreadable) { hmToast('Comments file is unreadable — not overwriting it.', 'err'); return; }
   window.api.plan.ensureIgnored(dir); // sidecars live in `.hivemind/` — keep it out of Git
   const res = await window.api.plan.writeComments(dir, key, panePlan(pane).cardComments || []);
   if (res && !res.ok) hmToast(res.message || 'Could not save comments.', 'err');
@@ -8165,7 +8366,11 @@ function buildCardPlanReview(pane, fold, planMd) {
   const pl = panePlan(pane);
   fold._hmRebuild = () => {
     while (fold.childElementCount > 1) fold.lastElementChild.remove(); // keep the <summary>
-    buildCardPlanReview(pane, fold, planMd);
+    // Rebuild from the live plan text, not the markdown captured when the card
+    // first rendered — a checkbox tick updates pl.cardText, and a later comment
+    // change routes through here; rebuilding with the stale copy would visually
+    // revert the checkbox.
+    buildCardPlanReview(pane, fold, panePlan(pane).cardText || planMd);
   };
 
   const body = document.createElement('div');
@@ -8268,6 +8473,7 @@ function buildCardPlanReview(pane, fold, planMd) {
     const save = async () => {
       const text = ta.value.trim();
       pl.cardDraft = null;
+      if (text && pl.cardCommentsUnreadable) { hmToast('Comments file is unreadable — not adding until it can be read.', 'err'); fold._hmRebuild(); return; }
       if (text) {
         (pl.cardComments || (pl.cardComments = [])).push({
           id: nextId('cmt'), quote: draft.quote, occurrence: draft.occurrence,
@@ -8320,6 +8526,7 @@ function buildCardPlanReview(pane, fold, planMd) {
     const act = document.createElement('div');
     act.className = 'plan-cmt-act';
     act.appendChild(mkMini('✓', 'Resolve (remove) this comment', async () => {
+      if (pl.cardCommentsUnreadable) { hmToast('Comments file is unreadable — cannot modify it.', 'err'); return; }
       pl.cardComments = (pl.cardComments || []).filter((x) => x.id !== c.id);
       await cardPersistComments(pane);
       fold._hmRebuild();
@@ -8363,11 +8570,12 @@ function buildCardPlanReview(pane, fold, planMd) {
     const noteText = note.value.trim();
     if (!unsent.length && !noteText) { hmToast('Add a comment (or overall feedback) first.', 'err'); return; }
     send.disabled = true;
-    await planSendFeedback(pane, unsent, noteText);
+    const ok = await planSendFeedback(pane, unsent, noteText);
     pl.cardNote = '';
     await cardPersistComments(pane);
     fold._hmRebuild();
-    hmToast('Feedback sent — the thread will revise the plan.');
+    if (ok) hmToast('Feedback sent — the thread will revise the plan.');
+    else hmToast('Feedback is typed into the thread but wasn’t submitted — press Enter in the terminal.', 'err');
   };
   foot.append(note, send);
 
@@ -8386,8 +8594,15 @@ async function showDiff(f, staged) {
   diffTitle.textContent = f.path;
   diffBody.innerHTML = '<span class="diff-meta">Loading…</span>';
   diffBackdrop.classList.remove('hidden');
-  const res = await window.api.git.diff(dir, f.path, staged, f.untracked);
-  diffBody.innerHTML = renderDiff(res.text || '(no changes)');
+  let res;
+  try {
+    res = await window.api.git.diff(dir, f.path, staged, f.untracked);
+  } catch (e) {
+    diffBody.innerHTML = '<span class="diff-meta">Could not load the diff: '
+      + escapeHtml(String((e && e.message) || e)) + '</span>';
+    return;
+  }
+  diffBody.innerHTML = renderDiff((res && res.text) || '(no changes)');
 }
 
 function escapeHtml(s) {
@@ -8429,7 +8644,15 @@ async function openBranchMenu() {
   branchListEl.innerHTML = '<li>Loading…</li>';
   branchNew.value = '';
   branchBackdrop.classList.remove('hidden');
-  const list = await window.api.git.branches(dir);
+  let list;
+  try {
+    list = await window.api.git.branches(dir);
+  } catch (e) {
+    branchListEl.innerHTML = '<li>Could not load branches: '
+      + escapeHtml(String((e && e.message) || e)) + '</li>';
+    return;
+  }
+  if (!Array.isArray(list)) list = [];
   const current = lastStatus && lastStatus.branch;
   branchListEl.innerHTML = '';
   for (const b of list) {
@@ -9455,6 +9678,7 @@ function bootSttWorker(entry, opts = {}) {
       const bootstrap = "import 'hm://app/voice-worker.js';";
       const url = URL.createObjectURL(new Blob([bootstrap], { type: 'text/javascript' }));
       worker = new Worker(url, { type: 'module' });
+      URL.revokeObjectURL(url); // the Worker has captured the module — don't leak the URL
     } catch (err) {
       reject(err);
       return;
@@ -9694,6 +9918,7 @@ async function startCapture() {
     });`;
     const url = URL.createObjectURL(new Blob([src], { type: 'text/javascript' }));
     await audioCtx.audioWorklet.addModule(url);
+    URL.revokeObjectURL(url); // module is registered — the URL is no longer needed
     micProcessor = new AudioWorkletNode(audioCtx, 'hm-mic-capture', {
       numberOfInputs: 1, numberOfOutputs: 1, outputChannelCount: [1],
     });

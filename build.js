@@ -14,6 +14,7 @@
 
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 const { spawn } = require('child_process');
 
 // Read a directory's package.json (or null if missing/invalid).
@@ -224,21 +225,38 @@ async function publishRelease(cwd, version, onProgress) {
     return { ok: false, message: `Built exe not found: ${exePath}` };
   }
 
+  // Authenticity sidecar: compute the SHA-256 of the exact exe bytes and write
+  // it next to the exe as `<exe>.sha256` (lowercase hex only, no filename). The
+  // portable auto-updater downloads this sidecar and refuses to launch a
+  // download whose digest doesn't match — the size check alone can't detect a
+  // tampered-but-same-length exe.
+  const sha256 = crypto.createHash('sha256').update(fs.readFileSync(exePath)).digest('hex');
+  const shaPath = `${exePath}.sha256`;
+  fs.writeFileSync(shaPath, sha256);
+  log(`Computed SHA-256 checksum → ${path.basename(shaPath)} (${sha256}).`);
+
   log(`Committing version bump to ${version}…`);
   // Commit ONLY package.json's content — pathspec-limited so whatever another
   // concurrent Hivemind thread happens to have staged is not swept into the
   // "Bump version" commit and pushed. (A pathspec commit ignores the rest of
   // the index, so no separate `git add` is needed.)
   const commit = await run('git', ['commit', '-m', `Bump version to ${version}`, '--', 'package.json'], cwd, null);
+  let pushWarning = null;
   if (commit.code !== 0) {
+    pushWarning = `version bump was not committed (${lastLine(commit.output)})`;
     log(`Could not commit the version bump (continuing): ${lastLine(commit.output)}`);
   } else {
     const push = await run('git', ['push'], cwd, null);
-    if (push.code !== 0) log(`Could not push the version bump (continuing): ${lastLine(push.output)}`);
+    if (push.code !== 0) {
+      pushWarning = `version bump was committed but not pushed (${lastLine(push.output)}) — push it manually so the repo matches the release`;
+      log(`Could not push the version bump (continuing): ${lastLine(push.output)}`);
+    }
   }
 
   log(`Publishing release v${version} to GitHub…`);
-  const gh = await run('gh', ['release', 'create', `v${version}`, exePath,
+  // Upload the exe AND its .sha256 sidecar so the auto-updater can verify the
+  // download's authenticity, not just its size.
+  const gh = await run('gh', ['release', 'create', `v${version}`, exePath, shaPath,
     '--title', `Hivemind v${version}`,
     '--notes', `Portable build v${version}. Download the .exe below — existing portable copies offer to update themselves on next launch.`,
   ], cwd, onProgress);
@@ -253,7 +271,10 @@ async function publishRelease(cwd, version, onProgress) {
   }
   const url = (gh.output.match(/https:\/\/\S+/) || [])[0] || null;
   log(`Release v${version} published.`);
-  return { ok: true, url };
+  const message = pushWarning
+    ? `Release v${version} published, but ${pushWarning}.`
+    : undefined;
+  return { ok: true, url, message };
 }
 
 module.exports = { isHivemindProject, buildPortable, bumpPatchVersion, restoreVersion, checkGhReady, publishRelease };

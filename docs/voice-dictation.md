@@ -44,7 +44,9 @@ The full pipeline, all in the renderer process except where noted:
    `onnxruntime-common` import can't resolve in a worker; see `voice-worker.js:28`):
    - the ASR pipeline (Moonshine by default, model id/dtype supplied by the `load` message);
    - Silero VAD (`voice-worker.js:64-130`), sharing the same WASM ONNX runtime, recurrent
-     state threaded per capture session (`gen`), inference serialized through `vadQueue`.
+     state threaded per capture session (`gen`).
+   Both VAD and ASR `transcribe()` inference now share the same `vadQueue` serialization
+   mutex, so only one ONNX inference runs at a time (previously only VAD was serialized).
    Backend is WASM only — Electron 29 exposes no `navigator.gpu`, so there is no WebGPU path
    (`voice-worker.js:56-58`). Multi-threaded WASM needs `SharedArrayBuffer`, force-enabled at
    `main.js:21`.
@@ -172,6 +174,9 @@ the worker's `ready` must **not** set `sttReady` — only the native engine's lo
 - **Offline at runtime.** `env.allowRemoteModels = false` (`voice-worker.js:36`); the worker
   can only read `hm://models/`. All network fetching happens in Node (fetch-model.mjs at
   install/build time, `stt:ensureModel` in the main process on first selection).
+- **Recognized text isn't logged by default (privacy).** The worker no longer prints
+  recognized transcript text to the console; that logging is behind a `VOICE_DEBUG` flag that
+  defaults off. Keep new transcript logging behind the same flag.
 - **The worker holds one model for its lifetime.** Switching models requires
   `resetSttWorker()` + a fresh worker; never post a second `load` expecting a swap
   (`load` returns early `ready` if a transcriber already exists, `voice-worker.js:138`).

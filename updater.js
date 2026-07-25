@@ -15,6 +15,7 @@ const { app, dialog } = require('electron');
 const https = require('https');
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 const { spawn } = require('child_process');
 
 const REPO = 'mikemcs121/hivemind';
@@ -77,18 +78,40 @@ function cleanupStaleExes() {
   }
 }
 
+// Cap the accumulated body: the only responses fetched here are the release
+// JSON and the tiny .sha256 sidecar, so anything large is a misbehaving server.
+const HTTPS_GET_MAX_BODY = 10 * 1024 * 1024;
+
 function httpsGet(url, redirectsLeft = 5) {
   return new Promise((resolve, reject) => {
-    const req = https.get(url, {
+    let parsed;
+    try { parsed = new URL(url); } catch (_) { return reject(new Error(`Invalid URL: ${url}`)); }
+    // Only ever fetch over HTTPS — a redirect to http:// would silently drop TLS.
+    if (parsed.protocol !== 'https:') return reject(new Error(`Refusing non-HTTPS request (${parsed.protocol})`));
+
+    const req = https.get(parsed, {
       headers: { 'User-Agent': USER_AGENT },
     }, res => {
       if ([301, 302, 303, 307, 308].includes(res.statusCode) && res.headers.location && redirectsLeft > 0) {
-        resolve(httpsGet(res.headers.location, redirectsLeft - 1));
+        res.resume(); // drain so the socket can be reused/closed
+        let next;
+        try { next = new URL(res.headers.location, parsed).toString(); } catch (_) { return reject(new Error('Bad redirect location')); }
+        resolve(httpsGet(next, redirectsLeft - 1));
         return;
       }
       let data = '';
-      res.on('data', chunk => { data += chunk; });
-      res.on('end', () => resolve({ statusCode: res.statusCode, body: data }));
+      let aborted = false;
+      res.on('error', reject);
+      res.on('data', chunk => {
+        if (aborted) return;
+        data += chunk;
+        if (data.length > HTTPS_GET_MAX_BODY) {
+          aborted = true;
+          res.destroy();
+          reject(new Error('Response body exceeded size cap'));
+        }
+      });
+      res.on('end', () => { if (!aborted) resolve({ statusCode: res.statusCode, body: data }); });
     });
     req.setTimeout(5000, () => req.destroy());
     req.on('error', reject);
@@ -160,9 +183,18 @@ async function checkForUpdates(win) {
     const latestTag = release.tag_name || '';
     if (!isNewer(latestTag, app.getVersion())) return;
 
-    const portableAsset = (release.assets || []).find(a =>
-      /portable/i.test(a.name) && /\.exe$/i.test(a.name)
-    );
+    // Prefer the asset whose name matches the exact version we're updating to
+    // (PORTABLE_EXE_RE captures the version), so a release that happens to carry
+    // a stray older portable exe can't hand us a version-mismatched download.
+    // Fall back to the loose portable-exe match only if the exact one is absent.
+    const wantVersion = latestTag.replace(/^v/, '');
+    const assets = release.assets || [];
+    const portableAsset =
+      assets.find(a => {
+        const m = PORTABLE_EXE_RE.exec(a.name);
+        return m && m[1] === wantVersion;
+      }) ||
+      assets.find(a => /portable/i.test(a.name) && /\.exe$/i.test(a.name));
 
     // Single confirmation — on "Update Now" the app downloads and relaunches itself.
     const { response: updateResponse } = await dialog.showMessageBox(win, {
@@ -197,74 +229,133 @@ async function checkForUpdates(win) {
       // Integrity check: a misbehaving proxy/captive portal can return a clean
       // HTTP 200 with a truncated body, which would otherwise be promoted and
       // launched. GitHub reports the exact asset byte size, so verify against
-      // it before we touch the old exe. (No published hash to check, but a size
-      // mismatch catches the truncation case that matters.)
+      // it before we touch the old exe. A missing/zero size is itself a failure
+      // (we can't confirm completeness) — fail closed rather than skip.
       const expectedSize = Number(portableAsset.size) || 0;
       const gotSize = fs.statSync(partPath).size;
-      if (expectedSize && gotSize !== expectedSize) {
-        throw new Error(`Downloaded ${gotSize} bytes but expected ${expectedSize} — update aborted to protect the working copy.`);
+      if (!expectedSize || gotSize !== expectedSize) {
+        throw new Error(`Downloaded ${gotSize} bytes but expected ${expectedSize || 'unknown'} — update aborted to protect the working copy.`);
       }
 
-      // Promote the completed, size-verified download to its final name.
+      // Authenticity check: the size test can't detect a same-length tampered
+      // exe. The publisher writes a `<exe>.sha256` sidecar (see build.js
+      // publishRelease) containing the lowercase hex digest of the exact bytes.
+      // Download it, compare against the digest of what we actually received,
+      // and FAIL CLOSED — a missing sidecar or a mismatch aborts the update
+      // before the .part is ever promoted or launched.
+      const shaAsset = (release.assets || []).find(a => /\.sha256$/i.test(a.name));
+      if (!shaAsset) {
+        throw new Error('No SHA-256 checksum was published for this release — update aborted (cannot verify authenticity).');
+      }
+      const { statusCode: shaStatus, body: shaBody } = await httpsGet(shaAsset.browser_download_url);
+      if (shaStatus !== 200) {
+        throw new Error(`Could not download the SHA-256 checksum (HTTP ${shaStatus}) — update aborted.`);
+      }
+      const expectedHash = (String(shaBody).trim().split(/\s+/)[0] || '').toLowerCase();
+      if (!/^[0-9a-f]{64}$/.test(expectedHash)) {
+        throw new Error('The published SHA-256 checksum is malformed — update aborted.');
+      }
+      const actualHash = crypto.createHash('sha256').update(fs.readFileSync(partPath)).digest('hex');
+      if (actualHash !== expectedHash) {
+        throw new Error(`Checksum mismatch — the download failed SHA-256 verification (expected ${expectedHash}, got ${actualHash}). Update aborted to protect the working copy.`);
+      }
+
+      // Promote the completed, size- and checksum-verified download to its final name.
       try { fs.unlinkSync(newExePath); } catch (_) { /* didn't exist */ }
       fs.renameSync(partPath, newExePath);
 
-      // Launch the new version. Deleting the old exe is destructive, so gate it
-      // on the new process ACTUALLY spawning: the 'spawn' event fires only once
-      // the OS started the process (catching a corrupt PE or AV-quarantined
-      // download), and 'error' fires if it couldn't — in which case we keep the
-      // old exe and tell the user rather than delete their only working copy.
-      const child = spawn(newExePath, [], { detached: true, stdio: 'ignore' });
-      let launchSettled = false;
-
-      child.on('error', async (err) => {
-        if (launchSettled) return;
-        launchSettled = true;
-        await dialog.showMessageBox(win, {
-          type: 'error',
-          title: 'Update Failed',
-          message: `The updated version could not be started:\n${err.message}\n\nYour current version is unchanged. You can try again later, or download it manually from:\n${RELEASES_URL}`,
-        });
-      });
-
-      child.on('spawn', () => {
-        if (launchSettled) return;
-        launchSettled = true;
-        child.unref();
-
-        // Delete the running exe AND every other older-versioned sibling, so a
-        // folder that accumulated old copies is swept in one update. The old
-        // exe stays locked until this process (and the portable launcher
-        // wrapping it) fully exits, so retry the deletes for up to ~30s and
-        // then give up rather than loop forever. `ping` is the delay because
-        // `timeout` refuses to run without console input, which a hidden
-        // window doesn't have.
+      // Delete the running exe AND every other older-versioned sibling, then
+      // quit — only ever called once the new process is confirmed still running.
+      const cleanupAndQuit = () => {
+        // The old exe stays locked until this process (and the portable launcher
+        // wrapping it) fully exits, so retry the deletes for up to ~30s and then
+        // give up rather than loop forever. `ping` is the delay because
+        // `timeout` refuses to run without console input, which a hidden window
+        // doesn't have.
         const staleExes = findOlderExes(currentDir, latestTag);
         if (!staleExes.some(p => p.toLowerCase() === oldExePath.toLowerCase())) {
           staleExes.push(oldExePath); // renamed exe won't match the pattern
         }
-        const batPath = path.join(app.getPath('temp'), 'hivemind-update-cleanup.bat');
-        fs.writeFileSync(batPath, [
-          '@echo off',
-          'set tries=0',
-          ':loop',
-          'set /a tries+=1',
-          ...staleExes.map(p => `del /f /q "${p}" >nul 2>nul`),
-          'if not exist ' + staleExes.map(p => `"${p}"`).join(' if not exist ') + ' goto done',
-          'if %tries% geq 30 goto done',
-          'ping -n 2 127.0.0.1 >nul',
-          'goto loop',
-          ':done',
-          'del /f /q "%~f0"',
-          '',
-        ].join('\r\n'));
-        spawn('cmd.exe', ['/c', batPath], { detached: true, stdio: 'ignore', windowsHide: true }).unref();
+
+        // These paths come from PORTABLE_EXECUTABLE_FILE, a user-controlled
+        // location. `%` is expanded by cmd even inside quotes, so escape it to
+        // `%%`; a `"` (or a stray CR/LF) can't be represented safely inside a
+        // quoted cmd argument, so skip those paths entirely — cleanupStaleExes()
+        // retries them on a later launch — and still delete the safe ones.
+        const UNSAFE = /["\r\n]/;
+        const safeExes = staleExes.filter(p => {
+          if (UNSAFE.test(p)) {
+            console.warn(`[updater] skipping cleanup of path with unescapable characters: ${p}`);
+            return false;
+          }
+          return true;
+        });
+        const forBatch = (p) => p.replace(/%/g, '%%');
+
+        if (safeExes.length) {
+          const batPath = path.join(app.getPath('temp'), 'hivemind-update-cleanup.bat');
+          fs.writeFileSync(batPath, [
+            '@echo off',
+            'set tries=0',
+            ':loop',
+            'set /a tries+=1',
+            ...safeExes.map(p => `del /f /q "${forBatch(p)}" >nul 2>nul`),
+            'if not exist ' + safeExes.map(p => `"${forBatch(p)}"`).join(' if not exist ') + ' goto done',
+            'if %tries% geq 30 goto done',
+            'ping -n 2 127.0.0.1 >nul',
+            'goto loop',
+            ':done',
+            'del /f /q "%~f0"',
+            '',
+          ].join('\r\n'));
+          spawn('cmd.exe', ['/c', batPath], { detached: true, stdio: 'ignore', windowsHide: true }).unref();
+        }
 
         app.quit();
         // node-pty's ConPTY children can keep the main process alive after
         // quit on Windows, leaving a hidden zombie that holds the old exe
         // locked forever. If quit hasn't actually exited shortly, force it.
         setTimeout(() => app.exit(0), 5000);
+      };
+
+      // Launch the new version. Deleting the old exe is destructive, so gate it
+      // on the new process ACTUALLY running: 'spawn' fires once the OS started
+      // the process, but a corrupt PE / AV-quarantined download can still crash
+      // milliseconds later (still firing 'spawn'). So after 'spawn' we wait a
+      // short window and only sweep the old exe(s) if the child has NOT exited
+      // in that time. An early 'exit' — or an 'error' — is treated as a failed
+      // launch: keep the old exe and tell the user rather than delete their only
+      // working copy.
+      const child = spawn(newExePath, [], { detached: true, stdio: 'ignore' });
+      let launchSettled = false;
+      let confirmTimer = null;
+
+      const failLaunch = async (reason) => {
+        if (launchSettled) return;
+        launchSettled = true;
+        if (confirmTimer) { clearTimeout(confirmTimer); confirmTimer = null; }
+        await dialog.showMessageBox(win, {
+          type: 'error',
+          title: 'Update Failed',
+          message: `The updated version could not be started:\n${reason}\n\nYour current version is unchanged. You can try again later, or download it manually from:\n${RELEASES_URL}`,
+        });
+      };
+
+      child.on('error', (err) => { failLaunch(err.message); });
+
+      child.on('exit', (code, signal) => {
+        // The new exe died during (or before the end of) the confirmation
+        // window — that's a failed launch, not a successful handoff.
+        failLaunch(`the new version exited immediately (${code == null ? `signal ${signal}` : `code ${code}`}).`);
+      });
+
+      child.on('spawn', () => {
+        child.unref();
+        confirmTimer = setTimeout(() => {
+          if (launchSettled) return; // an 'exit'/'error' already claimed it
+          launchSettled = true;
+          cleanupAndQuit();
+        }, 4500);
       });
     } catch (dlErr) {
       try { fs.unlinkSync(partPath); } catch (_) { /* nothing to clean */ }

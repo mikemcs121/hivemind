@@ -19,6 +19,19 @@ const path = require('path');
 
 const PLANS_REL = '.hivemind/plans';
 
+// Serialize writes (and read-modify-writes) per path so two concurrent
+// Hivemind threads saving the same file, or racing gitignore appends, can't
+// interleave at the awaits and clobber each other. Same pattern as
+// todo.js/promptHistory.js. Rejections are swallowed on the stored chain so
+// one failure doesn't poison later work queued behind it.
+const locks = new Map();
+function withLock(key, fn) {
+  const prev = locks.get(key) || Promise.resolve();
+  const next = prev.then(fn, fn);
+  locks.set(key, next.then(() => {}, () => {}));
+  return next;
+}
+
 let tmpSeq = 0;
 // Atomic write: fully write a sibling temp file, then rename over the target so
 // a reader (or a concurrent Hivemind thread) never sees a half-written file and
@@ -87,17 +100,28 @@ async function readPlanFile(root, file) {
   }
 }
 
-// Read the sidecar comments. A missing/corrupt file yields an empty list so the
-// pane still renders the plan.
+// Read the sidecar comments. A genuinely missing file (ENOENT) is a normal
+// "no comments yet" state and yields an empty list. A file that exists but
+// can't be read (transient IO error) or parsed (locked mid-write, truncated by
+// a crash) is reported as unreadable/corrupt — NOT as an empty list — so the
+// caller can block the save instead of overwriting real comments with `[]`.
+// Same discipline as todo.js/promptHistory.js. Backward-compatible: error
+// results simply omit `comments`, and existing callers fall back to `[]`.
 async function readComments(root, planId) {
   const p = planPath(root, planId, '.comments.json');
-  if (!p) return { ok: true, comments: [] };
+  if (!p) return { ok: false, reason: 'error', message: 'Invalid plan path.' };
+  let raw;
   try {
-    const raw = await fs.promises.readFile(p, 'utf8');
+    raw = await fs.promises.readFile(p, 'utf8');
+  } catch (err) {
+    if (err.code === 'ENOENT') return { ok: true, comments: [] };
+    return { ok: false, reason: 'unreadable', message: err.message };
+  }
+  try {
     const parsed = JSON.parse(raw);
     return { ok: true, comments: Array.isArray(parsed) ? parsed : [] };
-  } catch (_) {
-    return { ok: true, comments: [] };
+  } catch (err) {
+    return { ok: false, reason: 'corrupt', message: err.message };
   }
 }
 
@@ -105,14 +129,16 @@ async function readComments(root, planId) {
 async function writeComments(root, planId, comments) {
   const p = planPath(root, planId, '.comments.json');
   if (!p) return { ok: false, message: 'Invalid plan path.' };
-  try {
-    await fs.promises.mkdir(path.dirname(p), { recursive: true });
-    const list = Array.isArray(comments) ? comments : [];
-    await writeAtomic(p, JSON.stringify(list, null, 2));
-    return { ok: true };
-  } catch (err) {
-    return { ok: false, message: err.message };
-  }
+  return withLock(p, async () => {
+    try {
+      await fs.promises.mkdir(path.dirname(p), { recursive: true });
+      const list = Array.isArray(comments) ? comments : [];
+      await writeAtomic(p, JSON.stringify(list, null, 2));
+      return { ok: true };
+    } catch (err) {
+      return { ok: false, message: err.message };
+    }
+  });
 }
 
 // Write the plan markdown itself (used when the user edits it in-panel, e.g.
@@ -120,14 +146,16 @@ async function writeComments(root, planId, comments) {
 async function writePlan(root, planId, content) {
   const p = planPath(root, planId, '.md');
   if (!p) return { ok: false, message: 'Invalid plan path.' };
-  try {
-    await fs.promises.mkdir(path.dirname(p), { recursive: true });
-    await writeAtomic(p, String(content == null ? '' : content));
-    const { mtimeMs } = await fs.promises.stat(p);
-    return { ok: true, mtime: mtimeMs };
-  } catch (err) {
-    return { ok: false, message: err.message };
-  }
+  return withLock(p, async () => {
+    try {
+      await fs.promises.mkdir(path.dirname(p), { recursive: true });
+      await writeAtomic(p, String(content == null ? '' : content));
+      const { mtimeMs } = await fs.promises.stat(p);
+      return { ok: true, mtime: mtimeMs };
+    } catch (err) {
+      return { ok: false, message: err.message };
+    }
+  });
 }
 
 // Clear a thread's plan: delete both the markdown and its comment sidecar.
@@ -157,22 +185,28 @@ async function clearPlan(root, planId) {
 async function ensureIgnored(root) {
   if (typeof root !== 'string' || !root.length) return { ok: false };
   const gi = path.join(path.resolve(root), '.gitignore');
-  try {
-    let existing = '';
-    try { existing = await fs.promises.readFile(gi, 'utf8'); } catch (err) {
-      if (err.code !== 'ENOENT') throw err;
+  // Serialize the whole read-modify-write per gitignore path: without the lock
+  // two concurrent callers (several `*:ensureIgnored` channels fire before
+  // nearly every write) could both read a file with no entry and both append,
+  // duplicating the `.hivemind/` line.
+  return withLock(gi, async () => {
+    try {
+      let existing = '';
+      try { existing = await fs.promises.readFile(gi, 'utf8'); } catch (err) {
+        if (err.code !== 'ENOENT') throw err;
+      }
+      const already = existing.split(/\r?\n/).some((l) => {
+        const t = l.trim().replace(/\/+$/, '');
+        return t === '.hivemind';
+      });
+      if (already) return { ok: true, added: false };
+      const sep = existing.length && !/\n$/.test(existing) ? '\n' : '';
+      await writeAtomic(gi, existing + sep + '.hivemind/\n');
+      return { ok: true, added: true };
+    } catch (err) {
+      return { ok: false, message: err.message };
     }
-    const already = existing.split(/\r?\n/).some((l) => {
-      const t = l.trim().replace(/\/+$/, '');
-      return t === '.hivemind';
-    });
-    if (already) return { ok: true, added: false };
-    const sep = existing.length && !/\n$/.test(existing) ? '\n' : '';
-    await writeAtomic(gi, existing + sep + '.hivemind/\n');
-    return { ok: true, added: true };
-  } catch (err) {
-    return { ok: false, message: err.message };
-  }
+  });
 }
 
 module.exports = { readPlan, readPlanFile, readComments, writeComments, writePlan, clearPlan, ensureIgnored };

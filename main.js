@@ -81,6 +81,13 @@ const STT_NATIVE = {
   },
 };
 
+// Single-flight guard for stt:ensureModel: keyed by the model's dest directory,
+// so two overlapping downloads of the same repo share one promise instead of
+// racing to write the same files (which would corrupt the model). The counter
+// makes every .part temp name unique across processes and concurrent writes.
+const sttDownloadsInFlight = new Map(); // dest -> Promise
+let sttPartCounter = 0;
+
 const HM_MIME = {
   '.js': 'text/javascript', '.mjs': 'text/javascript', '.wasm': 'application/wasm',
   '.json': 'application/json', '.onnx': 'application/octet-stream',
@@ -158,6 +165,24 @@ function saveBoards(boards) {
   }
 }
 
+// Is `cwd` the project directory of a saved board? Used to gate filesystem
+// writes driven by renderer-supplied paths (see attach:stage): a compromised
+// renderer must not be able to copy files into an arbitrary directory. Paths
+// are compared resolved, and case-insensitively on Windows/macOS.
+function isKnownBoardDir(cwd) {
+  try {
+    if (typeof cwd !== 'string' || !cwd || !path.isAbsolute(cwd)) return false;
+    const norm = (p) => {
+      const r = path.resolve(p);
+      return process.platform === 'win32' || process.platform === 'darwin' ? r.toLowerCase() : r;
+    };
+    const target = norm(cwd);
+    return loadBoards().some((b) => b && typeof b.dir === 'string' && b.dir && norm(b.dir) === target);
+  } catch (_) {
+    return false;
+  }
+}
+
 // ---------------------------------------------------------------------------
 // PTY management: one node-pty process per terminal pane.
 // ---------------------------------------------------------------------------
@@ -211,35 +236,37 @@ function spawnPty({ id, cwd, cols, rows, startupCommand, model, resume, permissi
     cmd = cmd.replace(/^(claude|codex)(\.exe|\.cmd)?\b/i, (m) => `${m} --model ${model}`);
   }
   // Permission mode: hand the choice to Claude Code as a startup flag. "default"
-  // adds nothing; "bypass" uses the dedicated skip flag so the thread never shows
-  // the accept-permissions screen. Only meaningful for the `claude` command.
+  // adds nothing (the CLI calls that mode "manual"); "bypass" uses the dedicated
+  // skip flag so the thread never shows the accept-permissions screen. Only
+  // meaningful for the `claude` command.
   const permFlag = {
     acceptEdits: '--permission-mode acceptEdits',
+    auto: '--permission-mode auto',
     plan: '--permission-mode plan',
     bypass: '--dangerously-skip-permissions',
   }[permissionMode];
-  if (permFlag && /^claude(\.exe)?\b/i.test(cmd) &&
+  if (permFlag && /^claude(\.exe|\.cmd)?\b/i.test(cmd) &&
       !/--permission-mode\b|--dangerously-skip-permissions\b/.test(cmd)) {
-    cmd = cmd.replace(/^claude(\.exe)?\b/i, (m) => `${m} ${permFlag}`);
+    cmd = cmd.replace(/^claude(\.exe|\.cmd)?\b/i, (m) => `${m} ${permFlag}`);
   }
   // Restoring a saved session: `resume: true` continues the most recent
   // conversation in this directory; a session-id string resumes that specific
   // conversation (Claude keeps writing to that same session id, so the pane's
   // transcript binding stays deterministic). Only meaningful for the `claude`
   // command.
-  if (resume && /^claude(\.exe)?\b/i.test(cmd) && !/--continue\b|--resume\b/.test(cmd)) {
+  if (resume && /^claude(\.exe|\.cmd)?\b/i.test(cmd) && !/--continue\b|--resume\b/.test(cmd)) {
     const flag = (typeof resume === 'string' && /^[a-zA-Z0-9-]+$/.test(resume))
       ? `--resume ${resume}`
       : '--continue';
-    cmd = cmd.replace(/^claude(\.exe)?\b/i, (m) => `${m} ${flag}`);
+    cmd = cmd.replace(/^claude(\.exe|\.cmd)?\b/i, (m) => `${m} ${flag}`);
   }
   // Fresh session: pin the session id Hivemind generated for this pane, so the
   // transcript file is known up front (`<sessionId>.jsonl`) instead of guessed
   // from timing after the fact. Never combined with a resume flag.
-  if (sessionId && !resume && /^claude(\.exe)?\b/i.test(cmd) &&
+  if (sessionId && !resume && /^claude(\.exe|\.cmd)?\b/i.test(cmd) &&
       /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(sessionId) &&
       !/--session-id\b|--continue\b|--resume\b/.test(cmd)) {
-    cmd = cmd.replace(/^claude(\.exe)?\b/i, (m) => `${m} --session-id ${sessionId}`);
+    cmd = cmd.replace(/^claude(\.exe|\.cmd)?\b/i, (m) => `${m} --session-id ${sessionId}`);
   }
   // An initial prompt (from a "Hivemind, open a new thread and…" command) rides
   // along as the agent CLI's positional argument. That's the only safe delivery:
@@ -296,6 +323,7 @@ function startGhAuth(win) {
 
   let buf = '';
   let sawCode = false;
+  let pressedEnter = false;
   let answeredCred = false;
   let done = false;
   const finish = (phase, extra) => {
@@ -322,8 +350,8 @@ function startGhAuth(win) {
       sendGhAuth(win, { phase: 'code', code: codeM[1], url: 'https://github.com/login/device' });
       try { shell.openExternal('https://github.com/login/device'); } catch (_) { /* user can open manually */ }
     }
-    // gh blocks on "Press Enter to open github.com…" — nudge it forward.
-    if (/Press Enter/i.test(data)) { try { proc.write('\r'); } catch (_) { /* ignore */ } }
+    // gh blocks on "Press Enter to open github.com…" — nudge it forward (once).
+    if (!pressedEnter && /Press Enter/i.test(clean)) { pressedEnter = true; try { proc.write('\r'); } catch (_) { /* ignore */ } }
     // "Authenticate Git with your GitHub credentials? (Y/n)" — accept the default.
     else if (!answeredCred && /credentials\?/i.test(clean)) { answeredCred = true; try { proc.write('\r'); } catch (_) { /* ignore */ } }
 
@@ -406,6 +434,9 @@ function createWindow() {
       preload: path.join(__dirname, 'preload.js'),
       contextIsolation: true,
       nodeIntegration: false,
+      // Explicit defense-in-depth: keep the renderer sandboxed (Electron 29's
+      // default) so a renderer compromise can't reach Node directly.
+      sandbox: true,
       // The preload runs sandboxed, so it can't require('os') to read the
       // Windows build number that xterm's windowsPty option needs. Compute it
       // here (full Node) and hand it over via argv, which the sandbox allows.
@@ -790,6 +821,13 @@ app.whenReady().then(() => {
   ipcMain.handle('attach:stage', (_e, { cwd, srcPath }) => {
     try {
       if (typeof cwd !== 'string' || !cwd || typeof srcPath !== 'string' || !srcPath) return null;
+      // Defense-in-depth against a compromised renderer: only ever stage into a
+      // known board's project directory, never an arbitrary caller-supplied
+      // path. The set of valid targets is exactly the boards' `dir` fields.
+      if (!isKnownBoardDir(cwd)) {
+        console.error('attach:stage refused: cwd is not a known board directory:', cwd);
+        return null;
+      }
       const dir = path.join(path.resolve(cwd), '.hivemind', 'attachments');
       fs.mkdirSync(dir, { recursive: true });
       plan.ensureIgnored(cwd);
@@ -979,41 +1017,81 @@ app.whenReady().then(() => {
     const progress = (payload) => {
       if (evt.sender && !evt.sender.isDestroyed()) evt.sender.send('stt:downloadProgress', payload);
     };
-    try {
-      for (let i = 0; i < files.length; i++) {
-        const f = files[i];
-        const out = path.join(dest, f);
-        if (fs.existsSync(out)) continue;
-        const res = await net.fetch(`https://huggingface.co/${repo}/resolve/main/${f}`);
-        if (!res.ok) throw new Error(`${f}: HTTP ${res.status} ${res.statusText}`);
-        fs.mkdirSync(path.dirname(out), { recursive: true });
-        // Stream to a .part file: native models run to hundreds of MB, so
-        // buffering in memory is off the table, and the rename at the end
-        // means a killed download can't leave a truncated file that would
-        // pass the existence check above. Byte progress streams to the HUD.
-        const totalBytes = Number(res.headers.get('content-length')) || 0;
-        const ws = fs.createWriteStream(out + '.part');
-        const reader = res.body.getReader();
-        let bytes = 0;
-        let lastAt = 0;
-        for (;;) {
-          const { done, value } = await reader.read();
-          if (done) break;
-          bytes += value.length;
-          if (!ws.write(Buffer.from(value))) await new Promise((r) => ws.once('drain', r));
-          const now = Date.now();
-          if (now - lastAt > 250) {
-            lastAt = now;
-            progress({ repo, done: i, total: files.length, file: f, bytes, totalBytes });
+
+    // Single-flight: a second ensureModel for the same target joins the download
+    // already running rather than racing to write the same files.
+    const inFlight = sttDownloadsInFlight.get(dest);
+    if (inFlight) return inFlight;
+
+    const run = (async () => {
+      try {
+        for (let i = 0; i < files.length; i++) {
+          const f = files[i];
+          const out = path.join(dest, f);
+          if (fs.existsSync(out)) continue;
+          const res = await net.fetch(`https://huggingface.co/${repo}/resolve/main/${f}`);
+          if (!res.ok) throw new Error(`${f}: HTTP ${res.status} ${res.statusText}`);
+          fs.mkdirSync(path.dirname(out), { recursive: true });
+          // Stream to a .part file: native models run to hundreds of MB, so
+          // buffering in memory is off the table, and the rename at the end
+          // means a killed download can't leave a truncated file that would
+          // pass the existence check above. Byte progress streams to the HUD.
+          // The .part name is made unique (pid + counter) so even a race on a
+          // different key can't clobber another writer's temp file.
+          const totalBytes = Number(res.headers.get('content-length')) || 0;
+          const partPath = `${out}.part-${process.pid}-${++sttPartCounter}`;
+          const ws = fs.createWriteStream(partPath);
+          let wsError = null;
+          // Persistent error listener: without it a stream error would be an
+          // uncaught 'error' event that crashes the process, and the drain
+          // await below could otherwise hang forever on a broken stream.
+          ws.on('error', (e) => { wsError = e; });
+          const reader = res.body.getReader();
+          let bytes = 0;
+          let lastAt = 0;
+          try {
+            for (;;) {
+              if (wsError) throw wsError;
+              const { done, value } = await reader.read();
+              if (done) break;
+              bytes += value.length;
+              if (!ws.write(Buffer.from(value))) {
+                // Wait for drain, but never block forever: reject on error too.
+                await new Promise((resolve, reject) => {
+                  const onDrain = () => { ws.off('error', onError); resolve(); };
+                  const onError = (e) => { ws.off('drain', onDrain); reject(e); };
+                  ws.once('drain', onDrain);
+                  ws.once('error', onError);
+                });
+              }
+              const now = Date.now();
+              if (now - lastAt > 250) {
+                lastAt = now;
+                progress({ repo, done: i, total: files.length, file: f, bytes, totalBytes });
+              }
+            }
+            await new Promise((resolve, reject) => ws.end((err) => (err ? reject(err) : resolve())));
+            if (wsError) throw wsError;
+            fs.renameSync(partPath, out);
+          } catch (e) {
+            // On any failure destroy the stream and remove the orphan .part.
+            try { ws.destroy(); } catch (_) { /* already closed */ }
+            try { fs.unlinkSync(partPath); } catch (_) { /* nothing to clean */ }
+            throw e;
           }
+          progress({ repo, done: i + 1, total: files.length, file: f, bytes, totalBytes });
         }
-        await new Promise((resolve, reject) => ws.end((err) => (err ? reject(err) : resolve())));
-        fs.renameSync(out + '.part', out);
-        progress({ repo, done: i + 1, total: files.length, file: f, bytes, totalBytes });
+        return { ok: true, alreadyPresent: false };
+      } catch (err) {
+        return { ok: false, error: (err && err.message) || String(err) };
       }
-      return { ok: true, alreadyPresent: false };
-    } catch (err) {
-      return { ok: false, error: (err && err.message) || String(err) };
+    })();
+
+    sttDownloadsInFlight.set(dest, run);
+    try {
+      return await run;
+    } finally {
+      sttDownloadsInFlight.delete(dest);
     }
   });
 
@@ -1085,13 +1163,28 @@ app.whenReady().then(() => {
     if (!st) return { ok: false, error: 'speech engine not running' };
     const id = ++st.nextId;
     return new Promise((resolve) => {
-      st.pending.set(id, resolve);
+      // Guard against a hung decode never sending a `result`: time the pending
+      // entry out so the renderer's invoke always settles. `settle` (stored in
+      // pending) clears the timer, so a normal result, a crash, or stop all
+      // resolve exactly once.
+      let timer = null;
+      const settle = (payload) => { if (timer) { clearTimeout(timer); timer = null; } resolve(payload); };
+      timer = setTimeout(() => {
+        if (st.pending.get(id) === settle) st.pending.delete(id);
+        settle({ ok: false, error: 'speech engine timed out (no result after 30s)' });
+      }, 30000);
+      st.pending.set(id, settle);
       st.proc.postMessage({ type: 'transcribe', id, audio });
     });
   });
 
   ipcMain.on('stt:nativeStop', () => stopNativeStt());
   app.on('will-quit', () => stopNativeStt());
+  // On macOS the app keeps running after the last window closes, so `will-quit`
+  // may never fire — tear the native engine down here too so its utility
+  // process doesn't leak. (Sibling of the PTY/watch teardown in the
+  // module-level window-all-closed handler; stopNativeStt is scoped here.)
+  app.on('window-all-closed', () => stopNativeStt());
 
   // -- IPC: portable build --------------------------------------------------
   // Detect whether a hive's directory is the Hivemind source checkout, and (if
@@ -1169,6 +1262,7 @@ function sweepOldTempImages() {
 app.on('window-all-closed', () => {
   transcript.disposeAll();
   cancelGhAuth();
+  clearWatch(); // stop the recursive fs.watch so it doesn't leak on macOS
   for (const { proc } of ptys.values()) {
     try {
       proc.kill();

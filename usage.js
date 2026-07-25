@@ -17,6 +17,7 @@ const path = require('path');
 const os = require('os');
 
 const USAGE_URL = 'https://api.anthropic.com/api/oauth/usage';
+const FETCH_TIMEOUT_MS = 8 * 1000; // abort a hung usage request instead of hanging
 
 const claudeDir = () => path.join(os.homedir(), '.claude');
 
@@ -53,27 +54,36 @@ function limitLabel(l) {
 
 async function fetchLimits() {
   const oauth = readOauth();
-  const res = await fetch(USAGE_URL, {
-    headers: {
-      Authorization: 'Bearer ' + oauth.accessToken,
-      'anthropic-beta': 'oauth-2025-04-20',
-    },
-  });
-  if (res.status === 401) {
-    // Token rotated/expired — Claude Code refreshes it whenever it runs, so a
-    // retry after using any thread usually clears this.
-    throw new Error('Claude sign-in token expired — use any thread once (Claude Code refreshes it), then retry.');
+  // A hung connection would otherwise never resolve and stall the usage poll;
+  // abort after a few seconds so it surfaces as a caught `limitsError` instead.
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+  try {
+    const res = await fetch(USAGE_URL, {
+      headers: {
+        Authorization: 'Bearer ' + oauth.accessToken,
+        'anthropic-beta': 'oauth-2025-04-20',
+      },
+      signal: controller.signal,
+    });
+    if (res.status === 401) {
+      // Token rotated/expired — Claude Code refreshes it whenever it runs, so a
+      // retry after using any thread usually clears this.
+      throw new Error('Claude sign-in token expired — use any thread once (Claude Code refreshes it), then retry.');
+    }
+    if (!res.ok) throw new Error('Usage endpoint returned HTTP ' + res.status);
+    const body = await res.json();
+    const limits = (Array.isArray(body.limits) ? body.limits : []).map((l) => ({
+      kind: l.kind || '',
+      label: limitLabel(l),
+      percent: typeof l.percent === 'number' ? l.percent : null,
+      resetsAt: l.resets_at || null,
+      severity: l.severity || 'normal',
+    })).filter((l) => l.percent !== null);
+    return { subscriptionType: oauth.subscriptionType || null, limits };
+  } finally {
+    clearTimeout(timer);
   }
-  if (!res.ok) throw new Error('Usage endpoint returned HTTP ' + res.status);
-  const body = await res.json();
-  const limits = (Array.isArray(body.limits) ? body.limits : []).map((l) => ({
-    kind: l.kind || '',
-    label: limitLabel(l),
-    percent: typeof l.percent === 'number' ? l.percent : null,
-    resetsAt: l.resets_at || null,
-    severity: l.severity || 'normal',
-  })).filter((l) => l.percent !== null);
-  return { subscriptionType: oauth.subscriptionType || null, limits };
 }
 
 // ---------------------------------------------------------------------------
@@ -84,7 +94,7 @@ async function fetchLimits() {
 // Only transcript files touched today can contain today's records, so mtime
 // prunes the scan cheaply. Records are deduped on message+request id because
 // a message can be re-emitted into the same transcript (e.g. on resume).
-function tokensToday() {
+async function tokensToday() {
   const projectsDir = path.join(claudeDir(), 'projects');
   const dayStart = new Date();
   dayStart.setHours(0, 0, 0, 0);
@@ -94,18 +104,20 @@ function tokensToday() {
   const seen = new Set();
 
   let dirs = [];
-  try { dirs = fs.readdirSync(projectsDir); } catch (_) { return { byModel }; }
+  try { dirs = await fs.promises.readdir(projectsDir); } catch (_) { return { byModel }; }
 
   for (const d of dirs) {
     const dir = path.join(projectsDir, d);
     let entries = [];
-    try { entries = fs.readdirSync(dir); } catch (_) { continue; }
+    try { entries = await fs.promises.readdir(dir); } catch (_) { continue; }
     for (const name of entries) {
       if (!name.endsWith('.jsonl')) continue;
       const file = path.join(dir, name);
       try {
-        if (fs.statSync(file).mtimeMs < startMs) continue;
-        const lines = fs.readFileSync(file, 'utf8').split('\n');
+        // `await` per file yields the event loop between files so a large
+        // scan can't block the main process; mtime still prunes the reads.
+        if ((await fs.promises.stat(file)).mtimeMs < startMs) continue;
+        const lines = (await fs.promises.readFile(file, 'utf8')).split('\n');
         for (const line of lines) {
           // Cheap pre-filter before paying for JSON.parse on every line.
           if (line.indexOf('"assistant"') === -1 || line.indexOf('"usage"') === -1) continue;
@@ -166,7 +178,7 @@ async function getUsage() {
   }
 
   try {
-    data.tokens = tokensToday();
+    data.tokens = await tokensToday();
   } catch (err) {
     data.tokensError = (err && err.message) || String(err);
   }
