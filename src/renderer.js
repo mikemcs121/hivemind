@@ -305,17 +305,18 @@ if (!isValidPerm(defaultPerm)) defaultPerm = 'default';
 // Per-thread agent
 //
 // Each thread can run a different coding agent CLI: Claude Code (the default),
-// OpenAI's Codex CLI ("ChatGPT"), or Google's Gemini CLI — so one hive can mix
-// e.g. three Claude threads and one ChatGPT thread. A Claude thread keeps the
-// hive's custom startup command (extra flags etc.); other agents run their own
-// command. Switching a live thread kills its process and starts the new agent
-// in the same pane. Claude and ChatGPT threads each show their own model
-// dropdown; Gemini threads show none.
+// OpenAI's Codex CLI ("ChatGPT"), Google's Gemini CLI, or xAI's Grok CLI — so
+// one hive can mix e.g. three Claude threads and one ChatGPT thread. A Claude
+// thread keeps the hive's custom startup command (extra flags etc.); other
+// agents run their own command. Switching a live thread kills its process and
+// starts the new agent in the same pane. Claude and ChatGPT threads each show
+// their own model dropdown; Gemini and Grok threads show none.
 // ---------------------------------------------------------------------------
 const AGENTS = [
   { value: 'claude', label: 'Claude',  command: 'claude', install: null },
   { value: 'codex',  label: 'ChatGPT', command: 'codex',  install: 'npm install -g @openai/codex' },
   { value: 'gemini', label: 'Gemini',  command: 'gemini', install: 'npm install -g @google/gemini-cli' },
+  { value: 'grok',   label: 'Grok',    command: 'grok',   install: 'npm install -g @xai-official/grok' },
 ];
 const isValidAgent = (a) => AGENTS.some((x) => x.value === a);
 const agentFor = (v) => AGENTS.find((x) => x.value === v) || AGENTS[0];
@@ -339,7 +340,7 @@ function setPaneAgent(pane, agent) {
   if (pane.modelSelect) pane.modelSelect.style.display = agent === 'claude' ? '' : 'none';
   if (pane.codexModelSelect) pane.codexModelSelect.style.display = agent === 'codex' ? '' : 'none';
   if (pane.permSelect) pane.permSelect.style.display = agent === 'claude' ? '' : 'none';
-  // Claude and ChatGPT are transcript-backed; Gemini stays terminal-only.
+  // Claude and ChatGPT are transcript-backed; Gemini/Grok stay terminal-only.
   updateChatAvailability(pane);
   // The cost estimate only applies to Claude conversations, and switching
   // agents starts a new one anyway — drop the accumulator and hide the chip.
@@ -1901,7 +1902,10 @@ const HM_COMMANDS = [
     help: '<strong>switch model to &lt;model&gt;</strong> — live on a Claude thread; restarts a ChatGPT thread with a fresh conversation.',
     run(m, { pane }) {
       if (!pane) { hmToast('No thread to switch models on.', 'err'); return; }
-      if (pane.agent === 'gemini') { hmToast('Gemini threads have no model picker.', 'err'); return; }
+      if (pane.agent !== 'claude' && pane.agent !== 'codex') {
+        hmToast(agentFor(pane.agent).label + ' threads have no model picker.', 'err');
+        return;
+      }
       const codex = pane.agent === 'codex';
       const list = codex ? CODEX_MODELS : MODELS;
       const hit = hmResolveModel(list, m[1]);
@@ -1923,14 +1927,15 @@ const HM_COMMANDS = [
   {
     name: 'agent',
     patterns: [
-      /^(?:switch|change)\s+(?:(?:this|the\s+current)\s+thread\s+)?to\s+(claude|chat\s*gpt|codex|gemini)$/i,
-      /^use\s+(claude|chat\s*gpt|codex|gemini)$/i,
+      /^(?:switch|change)\s+(?:(?:this|the\s+current)\s+thread\s+)?to\s+(claude|chat\s*gpt|codex|gemini|grok)$/i,
+      /^use\s+(claude|chat\s*gpt|codex|gemini|grok)$/i,
     ],
-    help: '<strong>switch to claude / chatgpt / gemini</strong> — restarts this thread on that agent (the conversation doesn\'t carry over).',
+    help: '<strong>switch to claude / chatgpt / gemini / grok</strong> — restarts this thread on that agent (the conversation doesn\'t carry over).',
     run(m, { pane }) {
       if (!pane) { hmToast('No thread to switch.', 'err'); return; }
       const raw = m[1].toLowerCase().replace(/\s+/g, '');
-      const v = raw === 'claude' ? 'claude' : raw === 'gemini' ? 'gemini' : 'codex';
+      // "chatgpt" and "codex" are the same agent; every other word is its value.
+      const v = (raw === 'chatgpt' || raw === 'codex') ? 'codex' : raw;
       if (pane.agent === v) { hmToast('This thread is already running ' + agentFor(v).label + '.'); return; }
       setPaneAgent(pane, v);
       persistLayout(pane.board.id);
@@ -4960,7 +4965,7 @@ function createPane(board, col, opts = {}) {
   zoomBtn.title = 'Maximize this thread (Ctrl+Enter)';
   const agentSelect = document.createElement('select');
   agentSelect.className = 'model-select agent-select';
-  agentSelect.title = 'Agent for this thread (Claude, ChatGPT, or Gemini)';
+  agentSelect.title = 'Agent for this thread (Claude, ChatGPT, Gemini, or Grok)';
   for (const a of AGENTS) {
     const opt = document.createElement('option');
     opt.value = a.value;
@@ -7270,7 +7275,7 @@ function revealPrompt(entry) {
       && focusedPane.board && focusedPane.board.id === activeBoardId) panes.push(focusedPane);
   for (const col of g.columns) {
     for (const p of col.panes) {
-      if (p.disposed || !p.chat || panes.includes(p)) continue; // Gemini panes have no chat
+      if (p.disposed || !p.chat || panes.includes(p)) continue; // Gemini/Grok panes have no chat
       panes.push(p);
     }
   }

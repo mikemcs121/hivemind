@@ -1,7 +1,8 @@
 # Hivemind architecture overview
 
-Hivemind is a Windows Electron app that runs a swarm of Claude Code (and Codex)
-threads in tiled terminal panes, organized into boards where each board is tied
+Hivemind is a Windows Electron app that runs a swarm of agent CLI threads
+(Claude Code, Codex, Gemini, Grok) in tiled terminal panes, organized into
+boards where each board is tied
 to one project directory. This doc is the top-level map; each subsystem has its
 own deep doc (see `docs/README.md` for the index and routing table).
 

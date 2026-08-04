@@ -38,7 +38,7 @@ UI says hive/thread.
 | 186–214 | Per-thread font sizing | `FONT_MIN/MAX/DEFAULT`, `clampFont`, `defaultFontSize`, `setPaneFontSize` |
 | 215–251 | Claude model list + API list prices (cost chip) | `MODELS`, `defaultModel`, `MODEL_PRICES`, `priceForModel` |
 | 253–295 | Codex (ChatGPT) models; permission modes | `CODEX_MODELS`, `defaultCodexModel`, `PERMS`, `defaultPerm`, `PERM_SCREEN_MODES`, `permScreenCheck` |
-| 297–436 | **Agents** (claude/codex/gemini) + per-pane setters | `AGENTS`, `agentFor`, `paneCommand`, `setPaneAgent`, `respawnPane`, `setPaneModel`, `setPaneCodexModel`, `paintPermSelect`, `setPanePerm` |
+| 297–436 | **Agents** (claude/codex/gemini/grok) + per-pane setters | `AGENTS`, `agentFor`, `paneCommand`, `setPaneAgent`, `respawnPane`, `setPaneModel`, `setPaneCodexModel`, `paintPermSelect`, `setPanePerm` |
 | 438–545 | **Terminal status detection** constants | `IDLE_MS`, `STATE_LABEL`, `SELECT_FOOTER_RE`, `REVIEW_PROMPT_RE`, `MENU_PATTERNS`, `QUESTION_PATTERNS`, `ERROR_PATTERNS`, `CMD_MISSING_PATTERNS`, `stripAnsi`, `screenText`, `joinWrapped`, `menuOnScreen`, `promptVisibleOnScreen`, `PROBE_MS`, `chatHasPendingQuestion`, `syncQuestionExpiry` |
 | 547–843 | Screen-parsed question cards + attention probe | `stripBoxChrome`, `testWrapped`, `parseScreenQuestion`, `parseScreenReview`, `parsePlanScreenQuestion`, `parseCodexApproval`, `syncScreenQuestion`, `cardMenuLive`, `removeScreenQuestion`, `probeAttention`, `startAttentionProbe`, `stopAttentionProbe` |
 | 845–978 | **Pane state machine** (busy/idle/attention/error/dead) | `markActivity`, `evaluateIdle`, `setDoneGlow`, `setPaneState`, `notify` |

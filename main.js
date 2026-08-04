@@ -581,7 +581,7 @@ const SPELL_TYPOS = {
 // Developer vocabulary Hunspell doesn't know. Without these, autocorrect would
 // "fix" real jargon into dictionary words ("linter" → "linger", "json" → "son").
 const SPELL_JARGON = [
-  'todo', 'todos', 'hivemind', 'claude', 'chatgpt', 'gemini', 'github', 'repo',
+  'todo', 'todos', 'hivemind', 'claude', 'chatgpt', 'gemini', 'grok', 'github', 'repo',
   'repos', 'json', 'yaml', 'toml', 'html', 'css', 'svg', 'npm', 'npx', 'nodejs',
   'lint', 'linter', 'linters', 'linting', 'async', 'await', 'config', 'configs',
   'backend', 'frontend', 'fullstack', 'middleware', 'endpoint', 'endpoints',
