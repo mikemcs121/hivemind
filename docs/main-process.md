@@ -30,7 +30,8 @@ The main process (`main.js`) is the privileged half of the app. It owns:
 
 `preload.js` is the context bridge: it exposes `window.api` (all channels wrapped as
 functions) to the sandboxed renderer. The renderer has `nodeIntegration: false`,
-`contextIsolation: true` — it can only do what `window.api` offers.
+`contextIsolation: true`, and `sandbox: true` (set explicitly in `webPreferences`, no
+longer relying on the Electron 29 default) — it can only do what `window.api` offers.
 
 ## Files
 
@@ -59,8 +60,9 @@ PTY. The command is built by string surgery on the configured `startupCommand`
 
 - `model` → inserts `--model <id>` after the `claude`/`codex` token (validated
   `[a-z0-9.-]+`).
-- `permissionMode` → `--permission-mode acceptEdits|plan` or
+- `permissionMode` → `--permission-mode acceptEdits|auto|plan` or
   `--dangerously-skip-permissions` for "bypass"; only for `claude` commands.
+  Hivemind's `default` adds no flag (the CLI calls that mode "manual").
 - `resume` → `--resume <sessionId>` (validated id) or `--continue` (boolean).
 - `sessionId` (fresh sessions only, strict UUID check) → `--session-id <uuid>` so
   the transcript file name is known up front. Never combined with resume.
@@ -113,7 +115,7 @@ native dialogs and no renderer IPC.
 | `dialog:pickFiles` | — | Native multi-file picker; returns path array |
 | `image:saveTemp` | `{ bytes, ext }` | Writes pasted/dropped image bytes to `os.tmpdir()/hivemind-images/`; returns path or null |
 | `image:fromClipboard` | — | Reads a native clipboard bitmap, saves as PNG in the same temp dir; returns path or null |
-| `attach:stage` | `{ cwd, srcPath }` | Copies a file into `<cwd>/.hivemind/attachments/` (sweeps >1-week-old copies); returns staged path or null |
+| `attach:stage` | `{ cwd, srcPath }` | Copies a file into `<cwd>/.hivemind/attachments/` (sweeps >1-week-old copies); returns staged path or null. Rejects (before any fs write) unless `cwd` is a known board directory (`isKnownBoardDir`, backed by `loadBoards()`) |
 | `pty:spawn` | `{ id, cwd, cols, rows, startupCommand, model, resume, permissionMode, initialPrompt, sessionId }` | Spawns a shell PTY, auto-types the composed agent command; returns `{ id }` |
 | `git:status` | `{ cwd }` | `git.status` — status object for the Source Control panel |
 | `git:diff` | `{ cwd, file, staged, untracked }` | Diff text for one file |
@@ -149,9 +151,9 @@ native dialogs and no renderer IPC.
 | `transcript:bind` | opts (paneId, cwd, sessionId, …) | Bind a chat pane to its Claude session JSONL; entries stream back via events |
 | `transcript:sessions` | opts | List a project's past sessions |
 | `transcript:session` | opts | Read one past session for the read-only overlay |
-| `stt:ensureModel` | `{ repo }` | Ensure a speech model's files exist (streamed download from Hugging Face into `userData/models`, `.part` + rename); returns `{ ok, alreadyPresent }` or `{ ok:false, error }` |
+| `stt:ensureModel` | `{ repo }` | Ensure a speech model's files exist (streamed download from Hugging Face into `userData/models`, unique `.part` temp names + rename, orphaned `.part` cleanup); single-flight in-flight guard keyed by destination so concurrent requests for the same file don't collide; returns `{ ok, alreadyPresent }` or `{ ok:false, error }` |
 | `stt:nativeLoad` | `{ repo }` | Spawn/load the sherpa-onnx speech engine (`stt-native.js` via `utilityProcess.fork`) for a `STT_NATIVE` model; idempotent per repo; returns `{ ok }` or `{ ok:false, error }` |
-| `stt:nativeTranscribe` | `{ audio }` (Float32Array) | Decode one utterance in the native engine; returns `{ ok, text, error? }` |
+| `stt:nativeTranscribe` | `{ audio }` (Float32Array) | Decode one utterance in the native engine; 30s timeout so a hung decode can't hang the renderer invoke; returns `{ ok, text, error? }` |
 | `build:isHivemind` | `{ cwd }` | Is this directory the Hivemind source checkout |
 | `build:portable` | `{ cwd }` | Bump patch version, build portable exe, publish GitHub release; single-flight via the `buildRunning` flag (`main.js:289`) |
 
@@ -168,7 +170,7 @@ native dialogs and no renderer IPC.
 | `transcript:unbind` | `{ paneId }` | Stop tailing that pane's transcript |
 | `transcript:noteSent` | `{ paneId, text }` | Report a composer send so binding can match a session file by first user message |
 | `transcript:refresh` | `{ paneId }` | Restore the live view after browsing history |
-| `stt:nativeStop` | — | Kill the native speech engine's utility process (also runs on `will-quit`) |
+| `stt:nativeStop` | — | Kill the native speech engine's utility process (`stopNativeStt` also runs on `will-quit` **and** `window-all-closed`) |
 
 ### main → renderer, `webContents.send` events
 
@@ -263,7 +265,8 @@ Main-process reads/writes (helper modules add more inside each project's
   failed build restores the previous version so failures don't burn version numbers.
   Always bump `package.json` version before a portable build — the artifact name
   embeds it and the updater compares it against releases.
-- **Window teardown kills all PTYs** and disposes transcript tails on
+- **Window teardown kills all PTYs**, disposes transcript tails, clears the fs watcher
+  (`clearWatch()`), and stops the native STT engine (`stopNativeStt`) on
   `window-all-closed` (`main.js:958`); there is no PTY persistence across restarts —
   panes are *re-created* from `boards.json` (optionally resuming Claude sessions
   via `--resume`/`--continue`).

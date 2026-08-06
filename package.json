@@ -1,6 +1,6 @@
 {
   "name": "hivemind",
-  "version": "0.1.15",
+  "version": "0.1.19",
   "description": "Run a swarm of Claude threads in tiled panes, organized into project boards",
   "main": "main.js",
   "scripts": {
@@ -33,7 +33,12 @@
     "npmRebuild": false,
     "beforeBuild": "./scripts/before-build.js",
     "files": [
-      "**/*"
+      "package.json",
+      "*.js",
+      "src/**/*",
+      "models/**/*",
+      "build/icon.ico",
+      "node_modules/**/*"
     ],
     "asarUnpack": [
       "models/**",

@@ -27,7 +27,7 @@ raw CLI result shape `{ code, stdout, stderr }` — **they never reject**; failu
 | `stageAll(cwd)` | — | CLI result | `git add -A` |
 | `unstage(cwd, files)` | array of paths | CLI result | `git reset -q HEAD -- <files>` |
 | `unstageAll(cwd)` | — | CLI result | `git reset -q HEAD` |
-| `discard(cwd, files)` (`git.js:230`) | array of `{ path, untracked }` | CLI result (last failure wins) | tracked: `git restore --source=HEAD --staged --worktree -- <files>`; untracked: `fs.rmSync` (guarded by `insideCwd`) |
+| `discard(cwd, files)` (`git.js:230`) | array of `{ path, untracked }` | CLI result (last failure wins) | tracked: `git restore --source=HEAD --staged --worktree -- <files>`; untracked: `fs.rmSync` (guarded by `insideCwd`; `{ recursive: true, force: true }` so untracked directories are removed too) |
 | `commit(cwd, message)` | message string | CLI result | `git commit -m <message>` |
 | `branches(cwd)` (`git.js:248`) | — | `string[]` (empty on error) | `git branch --format=%(refname:short)` |
 | `log(cwd, count = 3)` (`git.js:254`) | count clamped to 1–50 | `[{ hash, subject, when, author }]` newest first (empty on error / no commits) | `git log -n <count> --pretty=format:` with `%x1f`/`%x1e` separators |
@@ -39,28 +39,38 @@ raw CLI result shape `{ code, stdout, stderr }` — **they never reject**; failu
 | `push(cwd, { branch, setUpstream })` (`git.js:265`) | opts object | CLI result (120s) | `git push` or `git push -u origin <branch>` |
 | `resetToRemote(cwd, { branch })` (`git.js:280`) | opts object | CLI result; friendly stdout on success | `git rev-parse @{u}` → `git fetch origin` → `git rev-parse --verify <ref>^{commit}` → `git reset --hard <ref>` → `git clean -fd`. **Destructive**; renderer confirms first |
 | `getRemoteUrl(cwd)` (`git.js:323`) | — | URL string or `null` | `git remote get-url origin` |
-| `setRemoteOrigin(cwd, url)` (`git.js:334`) | url | CLI result | `git remote add origin <url>` or `set-url` if origin exists |
+| `setRemoteOrigin(cwd, url)` (`git.js:334`) | url (must pass `isSafeRemoteUrl`) | CLI result | `git remote add origin <url>` or `set-url` if origin exists |
 | `ghCheck()` (`git.js:346`) | none | `{ installed, authenticated, user, message }` | `gh --version`; `gh auth status` |
-| `ghCreateRepo(cwd, { name, visibility, push })` (`git.js:367`) | name may be `repo` or `owner/repo` | CLI result (120s) | `gh repo create <n> --source <cwd> --remote origin --private/--public/--internal [--push]` (push only if `HEAD` exists) |
+| `ghCreateRepo(cwd, { name, visibility, push })` (`git.js:367`) | name may be `repo` or `owner/repo`; rejects a leading `-` or any char outside `[A-Za-z0-9._-]` | CLI result (120s) | `gh repo create <n> --source <cwd> --remote origin --private/--public/--internal [--push]` (push only if `HEAD` exists) |
 | `ghListRepos({ limit })` | limit clamped 1–500 (default 100) | `{ ok, repos: [{ nameWithOwner, description, visibility, updatedAt, url }] }` or `{ ok:false, message }` | `gh repo list --limit <n> --json …` |
-| `ghClone({ target, destParent, folder })` | `target` = owner/repo or URL; `folder` a single path segment (defaults from `target`) | CLI result (300s) plus `dir` (created path, or `null` on failure) | `gh repo clone <target> <destParent>/<folder>` — refuses if the dest already exists |
+| `ghClone({ target, destParent, folder })` | `target` = owner/repo or URL (must pass `isSafeCloneTarget`); `folder` a single path segment (defaults from `target`) | CLI result (300s) plus `dir` (created path, or `null` on failure) | `gh repo clone <target> <destParent>/<folder>` — refuses if the dest already exists |
 | `aiCommit(cwd)` (`git.js:445`) | — | `{ code, message }` | `git diff --staged` (fallback `git diff`), truncated at 60 KB, piped on stdin to `claude -p "<fixed instruction>"` run in a temp scratch dir |
 | `hmInterpret(payload)` (`git.js:486`) | JSON-able payload (≤100 KB) | `{ code, message }` — one command line or `NONE` | `claude -p --model haiku "<fixed instruction>"` with the payload as stdin JSON. Lives here only because it reuses `runClaudePrompt` |
 
 Non-exported helpers worth knowing: `safeRef` (`git.js:60`) rejects ref names starting
 with `-` (blocks `-f`-style argument injection); `insideCwd` (`git.js:66`) confines
-untracked-file read/delete to the project tree; `unquotePath` (`git.js:159`) reverses
-git's C-style quoting of non-ASCII paths; `webUrlFromRemote` (`git.js:140`) maps
+untracked-file read/delete to the project tree (folds case on win32 before the prefix
+check, so case-differing in-tree paths aren't false-rejected); `realpathAllowMissing` /
+`realInside` resolve the *real* path (following symlinks) and re-verify containment
+(case-folded on win32) so a symlink can't point read/delete outside the tree — used by
+`diff`'s untracked read; `isSafeRemoteUrl` rejects `ext::`/`fd::`/`file::` and any
+`scheme::` transport helper (allowing http(s)/ssh/git URLs and scp-style `user@host:path`)
+and `isSafeCloneTarget` additionally allows `owner/repo`; `unquotePath` (`git.js:159`)
+reverses git's C-style quoting of non-ASCII paths; `webUrlFromRemote` (`git.js:140`) maps
 ssh/scp/https remote URLs to a browsable https page (or `null`).
 
 ## files.js API
 
 Every path is a project-relative, "/"-separated `rel` resolved through `safeJoin`
-(`files.js:17`), which returns `null` for anything escaping the project root.
+(`files.js:17`), which returns `null` for anything escaping the project root (folds case
+on win32 before the prefix check, so case-differing in-tree paths aren't false-rejected).
+`safeJoin` is a lexical `../` guard only; `list`, `open`, and `reveal` additionally run
+`realInside` (via `realpathAllowMissing`) to resolve real paths and re-verify containment,
+blocking symlink traversal out of the tree.
 
 | Export | Args | Returns | Does |
 |---|---|---|---|
-| `list(root, rel)` (`files.js:27`) | project root, relative dir ('' = root) | `{ ok, entries: [{ name, path, isDir }] }` or `{ ok:false, reason: 'no-dir'\|'not-found'\|'error' }` | `fs.promises.readdir` one level; symlinks-to-dirs treated as dirs; sorted folders-first then case-insensitive alpha |
+| `list(root, rel)` (`files.js:27`) | project root, relative dir ('' = root) | `{ ok, entries: [{ name, path, isDir }] }` or `{ ok:false, reason: 'no-dir'\|'not-found'\|'error' }` | `fs.promises.readdir` one level; symlinks-to-dirs whose real target stays inside the root are treated as dirs, but a symlink resolving *outside* the root is omitted entirely (via `realInside`); sorted folders-first then case-insensitive alpha |
 | `open(root, rel)` (`files.js:60`) | root, rel file | `{ ok }` or `{ ok:false, message }` | `shell.openPath` — OS default application |
 | `reveal(root, rel)` (`files.js:68`) | root, rel file | `{ ok }` | `shell.showItemInFolder` — Explorer/Finder highlight |
 
@@ -122,11 +132,18 @@ auto-refresh so expanded folders don't collapse under the user.
   (git → "Install Git for Windows…", gh → "not installed", claude → "Is Claude Code
   installed and on PATH?"). Don't treat 127 as a git error.
 - **Argument-injection guards**: branch names go through `safeRef` (no leading `-`), and
-  file paths are always passed after a `--` separator. Preserve both patterns in any new
-  operation; never interpolate user input into a shell string (only the fixed prompt
-  constants are shell-embedded in `runClaudePrompt`, `git.js:406`).
-- **Path confinement**: `insideCwd` (git) and `safeJoin` (files) stop `../` escapes.
-  Any new function that touches the filesystem from a renderer-supplied path must use one.
+  file paths are always passed after a `--` separator. Remote URLs and clone targets go
+  through `isSafeRemoteUrl` / `isSafeCloneTarget` (reject `ext::`/`fd::`/`file::` and other
+  `scheme::` transport helpers, which git would otherwise execute), and repo names through the
+  `ghCreateRepo` name check. Preserve these patterns in any new operation; never interpolate
+  user input into a shell string (only the fixed prompt constants are shell-embedded in
+  `runClaudePrompt`, `git.js:406`).
+- **Path confinement**: `insideCwd` (git) and `safeJoin` (files) are *lexical* guards
+  that stop `../` escapes; `realInside`/`realpathAllowMissing` (in both modules) additionally
+  resolve real paths to stop **symlink** traversal out of the tree. Any new function that
+  touches the filesystem from a renderer-supplied path must use the lexical guard *and*, if it
+  reads/writes/deletes a resolved target, `realInside` — a lexical check alone is fooled by a
+  symlink. Both fold case on win32.
 - **Windows path quirks**: `files.js` `rel` paths are "/"-separated even on Windows
   (built in `list`, joined with `path.join`); git output paths are also "/"-separated.
   Non-ASCII paths from `git status` arrive C-quoted and are decoded by `unquotePath` —

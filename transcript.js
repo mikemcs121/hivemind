@@ -50,6 +50,8 @@ const POLL_MS = 2000;             // fs.watch misses appends on Windows; poll to
 const EMIT_DEBOUNCE_MS = 50;
 const MAX_STRING = 50 * 1024;     // cap any single string field sent to renderer
 const LAST_SENT_MAX = 5;
+const MAX_PARTIAL = 8 * 1024 * 1024; // cap the buffered trailing line on a newline-less file
+const RETIRED_MAX = 500;          // bound the retired-files set over the process lifetime
 
 const encodeProjectDir = (cwd) => String(cwd).replace(/[^a-zA-Z0-9]/g, '-');
 const transcriptDirFor = (cwd) =>
@@ -432,6 +434,18 @@ function scanDir(dir) {
     }
   }
 
+  // Prune bind-heuristic peek caches for files under this dir that no longer
+  // exist — otherwise they accumulate one entry per session file for the whole
+  // (multi-day) process lifetime. Scoped by path prefix so a scan of one dir
+  // never drops another dir's entries; bound files were re-added above.
+  const prefix = dir + path.sep;
+  for (const f of firstUser.keys()) {
+    if (f.startsWith(prefix) && !stats.has(f)) firstUser.delete(f);
+  }
+  for (const f of codexMeta.keys()) {
+    if (f.startsWith(prefix) && !stats.has(f)) codexMeta.delete(f);
+  }
+
   // 1. Tail every bound file.
   for (const pane of dirPanes) {
     if (pane.boundFile && stats.has(pane.boundFile)) {
@@ -623,6 +637,11 @@ function claimFile(pane, file) {
   clearTimeout(pane.fallbackTimer);
   pane.timeoutTimer = pane.fallbackTimer = null;
   tails.set(file, { offset: 0, partial: Buffer.alloc(0), lineNo: 0 });
+  // Once claimed, the bind-heuristic peek caches for this file are dead weight;
+  // drop them so they don't live for the whole process. Self-heal re-reads on
+  // demand if it ever needs the first-user text of a claimed file again.
+  firstUser.delete(file);
+  codexMeta.delete(file);
   emitStatus(pane, 'bound', file);
   readAppended(pane, file, true);
 }
@@ -631,9 +650,17 @@ function releaseFile(pane) {
   if (!pane.boundFile) return;
   claims.delete(pane.boundFile);
   tails.delete(pane.boundFile);
+  firstUser.delete(pane.boundFile);
+  codexMeta.delete(pane.boundFile);
   // A released session file must never look like a fresh rollover target for
   // some other pane (e.g. closing thread B re-binding thread A to B's file).
   retired.add(pane.boundFile);
+  // Bound over the process lifetime: age out the oldest retired entries (Set
+  // preserves insertion order) once past the cap.
+  while (retired.size > RETIRED_MAX) {
+    const oldest = retired.values().next().value;
+    retired.delete(oldest);
+  }
   pane.boundFile = null;
 }
 
@@ -679,7 +706,12 @@ function readAppended(pane, file, backfill) {
     const data = Buffer.concat([tail.partial, ...chunks]);
     const lastNl = data.lastIndexOf(0x0a);
     if (lastNl === -1) {
-      tail.partial = data;
+      // No complete line yet. A pathological newline-less file would otherwise
+      // grow `partial` without bound — once a single pending line blows past
+      // the cap it can't be a real transcript line, so drop the buffered bytes
+      // (offset already advanced, so the run is simply skipped) rather than
+      // buffer forever.
+      tail.partial = data.length > MAX_PARTIAL ? Buffer.alloc(0) : data;
       return;
     }
     tail.partial = Buffer.from(data.subarray(lastNl + 1));

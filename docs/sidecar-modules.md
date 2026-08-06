@@ -46,7 +46,7 @@ by quoted text (`{ id, quote, occurrence, body, resolved, sent }`,
 | `readPlan(root, planId)` | read `.md`, returns `{ok, content, mtime}` or `reason: 'not-found'/'no-dir'` | `plan:read` |
 | `readPlanFile(root, file)` | read absolute path, root-allowlisted | `plan:readFile` |
 | `writePlan(root, planId, content)` | write `.md` (in-panel edits, checkbox toggles) | `plan:write` |
-| `readComments` / `writeComments` | sidecar JSON; corrupt read yields `[]` (comments are expendable) | `plan:comments:read` / `plan:comments:write` |
+| `readComments` / `writeComments` | sidecar JSON; a failed read is **not** treated as empty — corrupt/unreadable returns `{ok:false, reason:'corrupt'\|'unreadable'\|'error', message}` (ENOENT still returns `{ok:true, comments:[]}`), matching the todo.js/promptHistory.js discipline; the renderer blocks saving comments after a failed read so real comments aren't overwritten | `plan:comments:read` / `plan:comments:write` |
 | `clearPlan(root, planId)` | delete both files, ENOENT ok | `plan:clear` |
 | `ensureIgnored(root)` | idempotently append `.hivemind/` to the project `.gitignore` | `plan:ensureIgnored` |
 
@@ -157,7 +157,10 @@ the rule list is also the module's header comment (`transcript.js:12-38`).
    (`transcript.js:507-528`).
 
 Released files enter a `retired` set so a closed pane's file can never look like a
-rollover target for another pane (`releaseFile`, `transcript.js:630`).
+rollover target for another pane (`releaseFile`, `transcript.js:630`); the set is now
+capped (~500) rather than growing for the process lifetime. Likewise the `firstUser` /
+`codexMeta` head-peek caches are pruned (on claim/release and on a per-dir scan of
+vanished files) so they're no longer unbounded.
 
 ### Watching, tailing, parsing
 
@@ -165,7 +168,8 @@ Each transcript directory gets one ref-counted watcher: `fs.watch` (recursive fo
 codex tree) plus a 2 s poll (`POLL_MS`) because Windows drops append events and the
 directory may not exist yet (`ensureWatcher`, `transcript.js:313`). Tailing is
 byte-offset based with a `partial` buffer so a line (or multi-byte char) split across
-reads survives (`readAppended`, `transcript.js:658`). Each complete line is
+reads survives (`readAppended`, `transcript.js:658`); the `partial` buffer is capped
+(~8 MB) so a newline-less file can't grow it without bound. Each complete line is
 `JSON.parse`d and reduced: Claude lines via `slimEntry` (`transcript.js:711` — keeps
 type/uuid/parentUuid/timestamp/meta flags/message role+model+content, plus
 `message.id`/`usage`/`requestId` for the cost chip, and `toolUseResult`); codex rollout
@@ -218,12 +222,14 @@ into `limitsError` / `tokensError` without sinking the other:
 1. **Plan limits** — the same OAuth endpoint Claude Code's `/usage` screen calls
    (`https://api.anthropic.com/api/oauth/usage`), authenticated with the token in
    `~/.claude/.credentials.json` (`claudeAiOauth.accessToken`, header
-   `anthropic-beta: oauth-2025-04-20`). Returns `{kind, label, percent, resetsAt,
-   severity}` per window (session 5-hour, weekly all-models, weekly per-model). A 401
-   means the token rotated — Claude Code refreshes it whenever it runs, so using any
-   thread and retrying clears it (`usage.js:62-66`).
+   `anthropic-beta: oauth-2025-04-20`). The request (`fetchLimits`) has an 8s
+   `AbortController` timeout so a hung endpoint can't stall the readout. Returns `{kind,
+   label, percent, resetsAt, severity}` per window (session 5-hour, weekly all-models,
+   weekly per-model). A 401 means the token rotated — Claude Code refreshes it whenever it
+   runs, so using any thread and retrying clears it (`usage.js:62-66`).
 2. **Today's tokens** — no network: scans `~/.claude/projects/*/*.jsonl` **across all
-   projects**, skipping files whose mtime predates local midnight, summing the `usage`
+   projects** (async via `fs.promises` so it no longer blocks the main-process event loop),
+   skipping files whose mtime predates local midnight, summing the `usage`
    block of every assistant message timestamped today. Dedupes on
    `message.id + requestId` (a message can be re-emitted on resume) and skips model
    `<synthetic>`. Result: `tokens.byModel[model] = { messages, input, output, cacheRead,
@@ -254,8 +260,10 @@ Claude Code session transcripts and native plan files are *read* but never owned
    that state. Any new persistence must copy this — the user's own agent threads edit
    these files concurrently, and "couldn't read" mistaken for "empty" destroys data.
 2. **Atomic writes + per-file locks.** All writes are temp-file-then-rename
-   (`writeAtomic`, three private copies) and read-modify-writes are serialized per path
-   (`withLock`). Don't add a plain `fs.writeFile`.
+   (`writeAtomic`, several private copies — plan.js now among them) and read-modify-writes
+   are serialized per path (`withLock`). plan.js gained its own `withLock` too, so
+   `writePlan`, `writeComments`, and `ensureIgnored`'s gitignore read-modify-write are now
+   serialized per path like todo.js/promptHistory.js. Don't add a plain `fs.writeFile`.
 3. **Path containment everywhere.** Project-relative paths are resolved and checked to
    stay inside `.hivemind/` (or the plan-root allowlist); `readSession` accepts only a
    bare `.jsonl` basename. Renderer-supplied ids never reach the filesystem raw.
