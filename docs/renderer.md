@@ -38,10 +38,10 @@ UI says hive/thread.
 | 186–214 | Per-thread font sizing | `FONT_MIN/MAX/DEFAULT`, `clampFont`, `defaultFontSize`, `setPaneFontSize` |
 | 215–251 | Claude model list + API list prices (cost chip) | `MODELS`, `defaultModel`, `MODEL_PRICES`, `priceForModel` |
 | 253–295 | Codex (ChatGPT) models; permission modes | `CODEX_MODELS`, `defaultCodexModel`, `PERMS`, `defaultPerm` |
-| 297–436 | **Agents** (claude/codex/gemini) + per-pane setters | `AGENTS`, `agentFor`, `paneCommand`, `setPaneAgent`, `respawnPane`, `setPaneModel`, `setPaneCodexModel`, `paintPermSelect`, `setPanePerm` |
-| 438–545 | **Terminal status detection** constants | `IDLE_MS`, `STATE_LABEL`, `SELECT_FOOTER_RE`, `REVIEW_PROMPT_RE`, `MENU_PATTERNS`, `QUESTION_PATTERNS`, `ERROR_PATTERNS`, `CMD_MISSING_PATTERNS`, `stripAnsi`, `screenText`, `joinWrapped`, `menuOnScreen`, `promptVisibleOnScreen`, `PROBE_MS`, `chatHasPendingQuestion`, `syncQuestionExpiry` |
+| 297–436 | **Agents** (claude/codex/gemini) + per-pane setters | `AGENTS`, `agentFor`, `paneCommand`, `setPaneAgent`, `respawnPane`, `setPaneModel`, `setPaneCodexModel`, `paintPermSelect`, `setPanePerm`, `restartForPerm`, `applyPendingPerm` |
+| 438–545 | **Terminal status detection** constants | `IDLE_MS`, `STATE_LABEL`, `paneStatusLabel`, `SELECT_FOOTER_RE`, `REVIEW_PROMPT_RE`, `MENU_PATTERNS`, `QUESTION_PATTERNS`, `ERROR_PATTERNS`, `AUTH_PATTERNS`, `CMD_MISSING_PATTERNS`, `stripAnsi`, `screenText`, `joinWrapped`, `menuOnScreen`, `authPromptOnScreen`, `authTextFrom`, `promptVisibleOnScreen`, `PROBE_MS`, `chatHasPendingQuestion`, `syncQuestionExpiry` |
 | 547–843 | Screen-parsed question cards + attention probe | `stripBoxChrome`, `testWrapped`, `parseScreenQuestion`, `parseScreenReview`, `parsePlanScreenQuestion`, `parseCodexApproval`, `syncScreenQuestion`, `cardMenuLive`, `removeScreenQuestion`, `probeAttention`, `startAttentionProbe`, `stopAttentionProbe` |
-| 845–978 | **Pane state machine** (busy/idle/attention/error/dead) | `markActivity`, `evaluateIdle`, `setDoneGlow`, `setPaneState`, `notify` |
+| 845–978 | **Pane state machine** (busy/idle/attention/error/dead) | `markActivity`, `evaluateIdle`, `setDoneGlow`, `setNeedsAuth`, `setPaneState`, `notify` |
 | 980–1020 | Sidebar per-board status dots/badges | `boardStatus`, `updateBoardStatus` |
 | 1022–1103 | Thread captions (rebuilt from keystrokes) | `feedCaptionInput`, `REPLY_WORDS`, `isReplyLike`, `commitCaption`, `setPaneCaption`, `sendToPane` |
 | 1105–1170 | Prompt delivery to a PTY — bracketed paste, size-scaled Enter delay, screen-verified Enter retry when the submit gets swallowed as part of the paste burst | `typePrompt`, `SUBMIT_RETRY_MS`, `confirmSubmit`, `deliverPrompt` |
@@ -56,8 +56,8 @@ UI says hive/thread.
 | 2887–3007 | View toggle & chat chrome | `updateViewBtn`, `setPaneView`, `updateChatChrome`, `updateChatAvailability`, `applyChatFilters`, `resetChat`, `chatBindStatus` |
 | 3009–3124 | Past-conversation history overlay (Claude only) | `relTimeShort`, `toggleHistoryMenu`, `buildHistoryMenu`, `openHistorySession`, `exitHistory`, `updateHistoryChrome` |
 | 3126–3635 | **Chat rendering** from transcript entries | `chatIngest`, `renderChatEntries`, `renderChatEntry`, `chatKeyFor`, `upsertChatRow`, `wireCopyButton`, `addBubbleCopyBtn`, `addCodeCopyBtns`, `addUserOrMetaRow`, `setChatTopic`, `addMetaRow`, `addErrorRow`, `addSidechainRow`, `toolSummary`, `addToolRow`, `addQuestionRow`, `attachToolResult` |
-| 3637–3800 | Composer send path | `chatHistoryNav` (↑/↓ recall), `sendChatMessage`, `continueHistorySession`, `addEchoRow`, `confirmEcho` |
-| 3802–3935 | Attention prompt card + composer lock | `PROMPT_CARD_KEY`, `promptCardText`, `renderPromptCard`, `removePromptCard`, `updateComposerLock`, `updateChatBanner` |
+| 3637–3800 | Composer send path | `chatHistoryNav` (↑/↓ recall), `sendChatMessage`, `continueHistorySession`, `ECHO_STALL_MS`, `flagStalledEcho`, `addEchoRow`, `confirmEcho` |
+| 3802–3935 | Attention prompt card + composer lock | `PROMPT_CARD_KEY`, `PROMPT_LOCK_PLACEHOLDER`, `AUTH_LOCK_PLACEHOLDER`, `promptCardText`, `renderPromptCard`, `removePromptCard`, `updateComposerLock`, `updateChatBanner` |
 | 3937–3996 | `$` helper; sidebar-resizer drag; top-level DOM refs | `$`, `SIDEBAR_W_*`, `boardListEl`, `gridEl`, `emptyState`, `boardTitle`, `addTermBtn`, `buildBtn` |
 | 3998–4082 | **Layout persistence** | `persist`, `serializeLayout`, `persistLayout`, `rebuildFromLayout` |
 | 4084–4221 | Board list render + reorder; board switching | `renderBoardList`, `reorderBoards`, `selectBoard` |
@@ -110,14 +110,16 @@ Created in `createPane` (`renderer.js:~4523`). The important fields:
 | `name`, `autoName`, `captionText`, `capBuf` | thread nickname ("Leo"), legacy auto-name flag, caption + keystroke buffer |
 | `state` | `null` \| `'busy'` \| `'idle'` \| `'attention'` \| `'error'` \| `'dead'` (see `setPaneState`) |
 | `buf`, `idleTimer`, `probeTimer`, `menuMiss`, `errored`, `errorText`, `hintShown`, `doneGlow` | status-detection state |
+| `needsAuth`, `authText` | the CLI is sitting on a sign-in prompt (`setNeedsAuth`): drives the header's `sign in` label, the 🔑 chat card, and the composer-lock wording |
 | `agent`, `model`, `codexModel`, `permMode`, `fontSize` | per-thread config |
+| `permRunning`, `permPending` | permission mode the live process was spawned in, and a mode switch queued behind a running turn (see "Permission modes" below) |
 | `sessionId`, `sessionBound` | Claude session UUID (passed as `--session-id`); `sessionBound` only true once the transcript proves the file exists — **never `--resume` an unbound id** |
 | `costSeen`, `costByModel`, `costFile` | cost-estimate accumulator (Claude only) |
 | `planId`, `plan` | plan-review lifecycle (`panePlan` lazily fills `plan`: state/file/source/menu/exitIds/cardText/cardComments/…) |
 | `view`, `chatFilters`, `chat` | `'chat'`\|`'term'`, filter chips, and the chat object built by `initChatUI` |
 | `termFallback` | terminal shown only because the transcript was missing — snaps back to chat on bind |
 
-`pane.chat` (built in `initChatUI`, `renderer.js:~2309`) holds the chat DOM (`wrap, list, input, sendBtn, notice, chips, attachRow, topic, working, historyBtn/Menu/Bar`), render maps (`byKey` row-key→element, `toolByUseId`, `pendingResults`, `pendingQuestions`, `pendingEcho`), history-view state (`viewingHistory`, `historySession`), composer state (`attachments`, `history`, `histIdx`, `histDraft`, `ac`), and `pinned` (auto-scroll).
+`pane.chat` (built in `initChatUI`, `renderer.js:~2309`) holds the chat DOM (`wrap, list, input, sendBtn, notice, chips, attachRow, topic, working, historyBtn/Menu/Bar`), render maps (`byKey` row-key→element, `toolByUseId`, `pendingResults`, `pendingQuestions`, `pendingEcho` — each entry carries an `ECHO_STALL_MS` timer that marks the bubble "⚠ no response yet" if the transcript never echoes it back and the pane isn't busy, cleared by `confirmEcho`), history-view state (`viewingHistory`, `historySession`), composer state (`attachments`, `history`, `histIdx`, `histDraft`, `ac`), and `pinned` (auto-scroll).
 
 ### xterm wiring
 
@@ -129,7 +131,41 @@ Created in `createPane` (`renderer.js:~4523`). The important fields:
 
 ### Pane state machine
 
-`markActivity` (any PTY output) → `'busy'` + resets a 1 s idle timer + starts the 700 ms `probeAttention` interval. Quiet for `IDLE_MS` → `evaluateIdle`: scans the buffer for `ERROR_PATTERNS` (→ `'error'`), then the screen for `MENU_PATTERNS`/`QUESTION_PATTERNS` (→ `'attention'`), else `'idle'`. `busy→idle` sets the green "✓ done" glow (`setDoneGlow`), cleared by `focusPane`. State transitions drive OS notifications (`notify`), the sidebar badges, the zoom-tab dots, and the chat banner/composer lock.
+`markActivity` (any PTY output) → `'busy'` + resets a 1 s idle timer + starts the 700 ms `probeAttention` interval. Quiet for `IDLE_MS` → `evaluateIdle`: scans screen+buffer for `AUTH_PATTERNS` (→ `'attention'` with `needsAuth`), then the buffer for `ERROR_PATTERNS` (→ `'error'`), then the screen for `MENU_PATTERNS`/`QUESTION_PATTERNS` (→ `'attention'`), else `'idle'`. `busy→idle` sets the green "✓ done" glow (`setDoneGlow`), cleared by `focusPane`. State transitions drive OS notifications (`notify`), the sidebar badges, the zoom-tab dots, and the chat banner/composer lock.
+
+**Sign-in detection** (`AUTH_PATTERNS` → `setNeedsAuth`) is its own signal because a login screen carries neither menu chrome nor a prose question: without it the pane reads as an ordinary finished turn, so a chat-view user watches a sent message vanish with no explanation. It is checked *before* errors (an expired token usually also trips `authentication_error`) and by `probeAttention` as well as `evaluateIdle` (login screens repaint, so they never go quiet). `needsAuth` changes the header label to `sign in`, replaces the prompt card with a 🔑 "Sign in to continue" card that has no quick keys (there's nothing useful to press), and swaps the composer-lock placeholder. It is cleared by respawn, by death, and by the next scan that no longer sees it — `evaluateIdle` drops `pane.buf` when it matches there so a stale `/login` line can't re-flag a recovered thread.
+
+### Permission modes
+
+Claude Code takes the permission mode as a **startup flag** (`--permission-mode`
+/ `--dangerously-skip-permissions`) with no live slash-command equivalent, so
+`setPanePerm` applies a change to a running thread by restarting it
+(`restartForPerm` → `respawnPane` with `resume: (sessionBound && sessionId) ||
+!!captionText`).
+
+Restarting **mid-turn is destructive**: the in-flight turn never lands in the
+session file, so the resumed thread comes back at an empty composer and reads as
+"Claude stopped thinking and just sat there". So a switch made while
+`pane.state === 'busy'` is *queued* in `pane.permPending` instead:
+
+- `pane.permMode` (and the dropdown) update immediately — that's the mode the
+  next spawn uses, so any other respawn satisfies the queue (`respawnPane` clears
+  `permPending`).
+- `pane.permRunning` records the mode the live process was actually spawned in,
+  so flipping back to it cancels the queued restart.
+- `applyPendingPerm` is scheduled (on a `setTimeout(…, 0)`, since the restart
+  re-enters the state machine) from **both** `evaluateIdle` — going quiet is when
+  a queue can land, and it fires even when the pane re-settles into the state it
+  was already in — and `setPaneState`, which covers `'dead'`. It restarts on
+  `'idle'`/`'error'`, drops the queue on `'dead'`, and **waits through
+  `'attention'`**: restarting under a blocking menu would discard the question
+  the thread is asking, so the switch lands after the user answers.
+  ⚠ Don't rely on `setPaneState` alone — it early-returns on an unchanged state.
+- While queued, `paintPermSelect` adds `.perm-pending` (dashed + dimmed) and
+  retitles the dropdown; the dropdown `onchange` and the `permission-mode`
+  HM command also toast "applies when this thread finishes its turn".
+
+`.perm-bypass` (amber) marks the risky mode regardless of pending state.
 
 ## UI structure
 
@@ -243,7 +279,7 @@ Everything the renderer calls on `window.api`, grouped (names only — schemas l
 5. **`pane.id` changes on respawn** (`respawnPane`) so late data/exit events from the killed PTY can't reach the pane — always re-look-up panes via `findPane(id)` in event handlers, and call `window.api.transcript.unbind` before changing the id.
 6. **Session-resume rules**: never `--resume` a session id whose file hasn't been proven to exist (`pane.sessionBound`, set only when transcript entries arrive) — resuming an unwritten session dies with "No conversation found" and strands the pane. `'bound'` status alone does **not** prove the file exists.
 7. **Layout must be attached before spawning**: `createPane` returns a detached pane; callers must run `layout(boardId)` then `spawnPanePty` (see `addTerminal` / `rebuildFromLayout`).
-8. **Status detection is heuristic and version-pinned.** `MENU_PATTERNS`, `SELECT_FOOTER_RE`, the plan-menu regexes and the AskUserQuestion screen parsers were verified against specific Claude Code (v2.1.20x/2.1.21x) and codex-rs TUI output; when CLI wording drifts, these regexes are what to update. Screen scans are wrap-tolerant (`joinWrapped`/`testWrapped` — the TUI hard-wraps at pane width) and shed `│┃` box chrome (`stripBoxChrome`); option scans anchor on the "1." row closest above the footer and abort on out-of-sequence numbers so prose/diff lists can't become clickable options. Buttons deliberately degrade to "answer in the terminal" rather than sending blind digits.
+8. **Status detection is heuristic and version-pinned.** `MENU_PATTERNS`, `SELECT_FOOTER_RE`, `AUTH_PATTERNS`, the plan-menu regexes and the AskUserQuestion screen parsers were verified against specific Claude Code (v2.1.20x–2.1.22x) and codex-rs TUI output; when CLI wording drifts, these regexes are what to update. `AUTH_PATTERNS` in particular must stay anchored on strings the CLI really prints (they were lifted from the v2.1.221 binary) — a false positive there locks the composer on a healthy thread. Screen scans are wrap-tolerant (`joinWrapped`/`testWrapped` — the TUI hard-wraps at pane width) and shed `│┃` box chrome (`stripBoxChrome`); option scans anchor on the "1." row closest above the footer and abort on out-of-sequence numbers so prose/diff lists can't become clickable options. Buttons deliberately degrade to "answer in the terminal" rather than sending blind digits.
 8b. **Every card button re-verifies the live screen at click time before writing to the PTY.** Question-card options and Review⇥ go through `cardMenuLive` (screen cards must still match the rendered menu's question+labels; transcript cards need `menuOnScreen`); prompt-card quick keys require `state === 'attention'` plus `promptVisibleOnScreen`; single-select cards lock after one send (`card.dataset.sent`, self-expires); options ≥ 10 are disabled (two-keystroke digits would actuate option 1); `typePrompt`'s delayed Enter and `confirmSubmit` wait a menu out instead of actuating it. A stale click must never inject keys into a menu or turn it wasn't aimed at — keep this property when touching any card handler. Stranded transcript questions (a `tool_use` whose result never lands) age out via `syncQuestionExpiry` instead of pinning attention/composer-lock forever; pane death clears all pending-question state.
 9. **Never `innerHTML` user/agent text.** User strings always go through `textContent`; markdown goes through the in-house `markdownToHtml` whose `escapeHtml` escapes quotes for attribute safety. Keep it that way.
 10. **Sidebar panels are mutually exclusive** — a new docked panel must close the others in its `setXOpen` and be closed by theirs, plus toggle a `sidebar` class, disable its toggle in `showEmpty`, and refresh in `selectBoard` via an `xOnBoardChange` hook.

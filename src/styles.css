@@ -335,6 +335,14 @@ button.usage-pill.crit { color: var(--danger); }
   color: #f59e0b;
 }
 
+/* A mode switch made mid-turn waits for the turn to end before restarting the
+   thread (setPanePerm). The dropdown already reads as the new mode, so mark it
+   dashed-and-dimmed until it's really in effect. */
+.pane-header .perm-select.perm-pending {
+  border-style: dashed;
+  opacity: 0.65;
+}
+
 /* A tiled pane is often narrower than the full set of header controls, and
    .pane's overflow:hidden would clip them from the right — taking ✕/⛶ with
    it. Shed the low-priority controls first as the pane narrows so view,
@@ -455,6 +463,22 @@ button.usage-pill.crit { color: var(--danger); }
 .chat-prompt-card.error {
   border-color: var(--danger);
   background: color-mix(in srgb, var(--danger) 8%, transparent);
+}
+/* Sign-in required: the CLI is at a login prompt, so nothing typed in the chat
+   reaches the thread until the user logs back in (renderPromptCard). */
+.chat-prompt-card.auth {
+  border-color: var(--yellow);
+  background: color-mix(in srgb, var(--yellow) 10%, transparent);
+}
+.chat-prompt-head {
+  font-weight: 600;
+  font-size: calc(var(--pane-font, 13px) - 1px);
+  color: var(--text);
+}
+.chat-prompt-note {
+  font-size: calc(var(--pane-font, 13px) - 2px);
+  color: var(--muted);
+  line-height: 1.45;
 }
 .chat-prompt-text {
   margin: 0;
@@ -644,7 +668,29 @@ button.usage-pill.crit { color: var(--danger); }
   white-space: pre-wrap;
 }
 .chat-bubble.user.pending { opacity: .6; }
+/* A stalled send is a warning, not a faded in-flight message — undim it. */
+.chat-bubble.user.pending:has(.chat-echo-note.stalled) { opacity: 1; }
 .chat-echo-note { font-size: calc(var(--pane-font, 13px) - 3px); color: var(--muted); margin-top: 4px; white-space: nowrap; }
+/* The message was typed into the terminal but nothing came back (flagStalledEcho). */
+.chat-echo-note.stalled {
+  color: var(--peach);
+  white-space: normal;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+.chat-echo-note.stalled button {
+  flex: none;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  color: var(--text);
+  border-radius: 5px;
+  font-size: 11px;
+  padding: 2px 7px;
+  cursor: pointer;
+}
+.chat-echo-note.stalled button:hover { border-color: var(--accent); }
 .chat-bubble.assistant { background: transparent; padding: 0 2px; max-width: 100%; }
 
 /* Hover-revealed copy button at the end of an assistant message (VS Code style).
