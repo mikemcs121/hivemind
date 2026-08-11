@@ -1400,6 +1400,140 @@ button.usage-pill.crit { color: var(--danger); }
 .git-msgbar.ok { color: var(--accent-2); }
 .git-msgbar.hidden { display: none; }
 
+/* ---------------- Publish panel ---------------- */
+/* Docked in the sidebar like Source Control: upload the site over FTP. */
+#publish-panel {
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  background: var(--bg-alt);
+  border-top: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+}
+#publish-panel.hidden { display: none; }
+
+/* When publish is open, the board list yields its space to it. */
+#sidebar.publish-open #board-list { display: none; }
+
+#publish-body { flex: 1; overflow-y: auto; padding: 10px; display: flex; flex-direction: column; gap: 12px; }
+
+/* Target card: who we publish as, and where to. */
+.pub-target {
+  background: var(--surface); border-radius: 7px; padding: 9px 10px;
+  display: flex; flex-direction: column; gap: 3px; font-size: 12px; min-width: 0;
+}
+.pub-target .pub-host { font-size: 13px; color: var(--text); font-weight: 600; }
+.pub-target .pub-path,
+.pub-target .pub-when { color: var(--muted); }
+.pub-target .pub-host, .pub-target .pub-path {
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.pub-target-row { display: flex; align-items: center; gap: 8px; }
+.pub-target-row .pub-target { flex: 1; }
+
+/* Plain-FTP warning strip. */
+.pub-warn {
+  background: rgba(249, 226, 175, .12); border: 1px solid var(--yellow);
+  color: var(--yellow); border-radius: 6px; padding: 7px 9px; font-size: 12px; line-height: 1.4;
+}
+
+/* File list */
+.pub-files { list-style: none; margin: 0; padding: 0; }
+.pub-file {
+  display: flex; align-items: center; gap: 7px;
+  padding: 5px 6px; border-radius: 5px; font-size: 13px;
+}
+.pub-file:hover { background: var(--surface); }
+.pub-file .pstat {
+  flex: none; width: 14px; text-align: center; font-size: 12px; font-weight: 700;
+  font-family: "Cascadia Code", Consolas, monospace;
+}
+.pub-file .pstat.changed { color: var(--yellow); }
+.pub-file .pstat.same { color: var(--muted); opacity: .6; }
+.pub-file .pstat.fail { color: var(--danger); }
+.pub-file .pstat.done { color: var(--accent-2); }
+.pub-file .pname { flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.pub-file .pdir { color: var(--muted); }
+.pub-file.unchanged .pname { color: var(--muted); }
+.pub-file .psize { flex: none; color: var(--muted); font-size: 11px; }
+
+.pub-problem { color: var(--peach); font-size: 12px; padding: 3px 6px; line-height: 1.4; }
+
+/* Publish / stop action row (mirrors .git-actions). */
+.pub-actions { display: flex; gap: 6px; }
+.pub-actions button {
+  flex: 1; border: none; border-radius: 6px; padding: 9px 8px;
+  font-size: 13px; font-weight: 600; cursor: pointer;
+}
+.pub-actions button:disabled { opacity: .4; cursor: not-allowed; }
+.pub-actions .pub-secondary { background: var(--surface); color: var(--text); }
+.pub-actions .pub-secondary:hover:not(:disabled) { filter: brightness(1.15); }
+
+/* Connection form */
+.pub-form { display: flex; flex-direction: column; gap: 9px; }
+.pub-field { display: flex; flex-direction: column; gap: 4px; }
+.pub-field label { font-size: 11px; text-transform: uppercase; letter-spacing: .4px; color: var(--muted); }
+.pub-field input, .pub-field select {
+  width: 100%; box-sizing: border-box;
+  background: var(--panel); border: 1px solid var(--border); color: var(--text);
+  border-radius: 6px; padding: 7px 9px; font-size: 13px;
+  font-family: "Segoe UI", system-ui, sans-serif;
+}
+.pub-field input:focus, .pub-field select:focus { outline: none; border-color: var(--accent); }
+.pub-field .pub-hint { font-size: 11px; color: var(--muted); line-height: 1.4; }
+.pub-row { display: flex; gap: 8px; }
+.pub-row .pub-field { flex: 1; min-width: 0; }
+.pub-row .pub-field.narrow { flex: 0 0 76px; }
+.pub-check { display: flex; align-items: flex-start; gap: 7px; font-size: 12px; color: var(--muted); line-height: 1.4; }
+.pub-check input { margin-top: 2px; flex: none; }
+.pub-note {
+  font-size: 11px; color: var(--muted); line-height: 1.5;
+  border-left: 2px solid var(--border); padding-left: 8px;
+}
+
+/* File-picker modal */
+#publish-pick-backdrop {
+  position: fixed; inset: 0; background: rgba(0,0,0,.55);
+  display: flex; align-items: center; justify-content: center; z-index: 60;
+}
+#publish-pick-backdrop.hidden { display: none; }
+#publish-pick-modal {
+  background: var(--bg-alt); border: 1px solid var(--border); border-radius: 10px;
+  width: 560px; max-width: 90vw; height: 70vh; display: flex; flex-direction: column; overflow: hidden;
+}
+#publish-pick-title { font-size: 13px; font-weight: 600; }
+.pub-pick-hint {
+  padding: 10px 14px; font-size: 12px; color: var(--muted); line-height: 1.5;
+  border-bottom: 1px solid var(--border);
+}
+#publish-pick-body { flex: 1; overflow: auto; padding: 8px 10px; }
+.pub-pick-foot {
+  display: flex; align-items: center; gap: 8px;
+  padding: 10px 12px; border-top: 1px solid var(--border);
+}
+.pub-pick-count { font-size: 12px; color: var(--muted); }
+
+.pub-tree, .pub-children { list-style: none; margin: 0; padding: 0; }
+.pub-item {
+  display: flex; align-items: center; gap: 6px;
+  padding: 4px 6px; border-radius: 5px; font-size: 13px;
+  white-space: nowrap; overflow: hidden;
+}
+.pub-item:hover { background: var(--surface); }
+.pub-item input[type="checkbox"] { flex: none; margin: 0; cursor: pointer; }
+.pub-item .pub-twisty {
+  flex: none; width: 12px; text-align: center; color: var(--muted);
+  font-size: 10px; line-height: 1; cursor: pointer;
+}
+.pub-item .pub-icon { flex: none; font-size: 13px; }
+.pub-item .pub-label { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; cursor: pointer; }
+.pub-item.denied .pub-label { text-decoration: line-through; color: var(--muted); }
+.pub-item.denied { opacity: .6; }
+.pub-item .pub-why { flex: none; font-size: 11px; color: var(--muted); }
+/* A folder ticked above this row already covers it. */
+.pub-item.covered .pub-label { color: var(--accent-2); }
+
 /* ---------------- Todo panel ---------------- */
 /* Docked inside the sidebar like Explorer / Source Control: a per-hive checklist. */
 #todo-panel {

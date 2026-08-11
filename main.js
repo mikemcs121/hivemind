@@ -134,6 +134,7 @@ const files = require('./files');
 const plan = require('./plan');
 const todo = require('./todo');
 const promptHistory = require('./promptHistory');
+const publish = require('./publish');
 const build = require('./build');
 const usage = require('./usage');
 const transcript = require('./transcript');
@@ -935,6 +936,22 @@ app.whenReady().then(() => {
   ipcMain.handle('files:list', (_e, { cwd, rel }) => files.list(cwd, rel));
   ipcMain.handle('files:open', (_e, { cwd, rel }) => files.open(cwd, rel));
   ipcMain.handle('files:reveal', (_e, { cwd, rel }) => files.reveal(cwd, rel));
+
+  // -- IPC: Publish to website (FTP) ------------------------------------------
+  // Settings and the encrypted password live in userData, never in the project
+  // folder, and the plaintext password never crosses back to the renderer —
+  // `getConfig` reports `hasPassword` only. See publish.js for the reasoning.
+  ipcMain.handle('publish:config', (_e, { cwd }) => publish.getConfig(cwd));
+  ipcMain.handle('publish:setConfig', (_e, { cwd, patch }) => publish.setConfig(cwd, patch));
+  ipcMain.handle('publish:setPassword', (_e, { cwd, password }) => publish.setPassword(cwd, password));
+  ipcMain.handle('publish:forget', (_e, { cwd }) => publish.forget(cwd));
+  ipcMain.handle('publish:scan', (_e, { cwd }) => publish.scan(cwd));
+  ipcMain.handle('publish:test', (_e, { cwd }) => publish.test(cwd));
+  ipcMain.handle('publish:run', (_e, { cwd, all }) => publish.publish(cwd, { all }, (p) => {
+    if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('publish:progress', p);
+  }));
+  ipcMain.handle('publish:cancel', (_e, { cwd }) => publish.cancel(cwd));
+  ipcMain.handle('publish:deny', (_e, { rels }) => publish.denyPaths(rels));
 
   // -- IPC: Plan pane ---------------------------------------------------------
   // The thread writes its plan to `.hivemind/plans/<planId>.md`; Hivemind reads

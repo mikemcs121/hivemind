@@ -53,6 +53,20 @@
           <div id="git-msgbar" class="git-msgbar hidden"></div>
         </aside>
 
+        <!-- Publish panel — upload this hive's site to a web host over FTP.
+             Connection settings and the DPAPI-encrypted password live in
+             Hivemind's userData, never in the project folder. -->
+        <aside id="publish-panel" class="hidden">
+          <div class="git-header">
+            <span class="git-title">Publish</span>
+            <div class="spacer"></div>
+            <button id="publish-refresh" class="git-icon" title="Rescan for changed files">⟳</button>
+            <button id="publish-close" class="git-icon" title="Close">✕</button>
+          </div>
+          <div id="publish-body"></div>
+          <div id="publish-msgbar" class="git-msgbar hidden"></div>
+        </aside>
+
         <!-- Todo panel — a per-hive checklist stored in .hivemind/todos.json -->
         <aside id="todo-panel" class="hidden">
           <div class="git-header">
@@ -120,6 +134,14 @@
               <circle cx="18" cy="6" r="3" />
               <circle cx="6" cy="18" r="3" />
               <path d="M18 9a9 9 0 0 1-9 9" />
+            </svg>
+          </button>
+          <button id="publish-toggle" class="sidebar-action-btn" title="Publish to website (FTP)" aria-label="Publish to website" disabled>
+            <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor"
+                 stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M20 17.6A4 4 0 0 0 18 10h-1.3A7 7 0 1 0 5 16.3" />
+              <polyline points="9 13 12 10 15 13" />
+              <line x1="12" y1="10" x2="12" y2="21" />
             </svg>
           </button>
           <button id="todo-toggle" class="sidebar-action-btn" title="Todo" aria-label="Todo" disabled>
@@ -195,6 +217,30 @@
           <button id="diff-close" class="git-icon" title="Close">✕</button>
         </div>
         <pre id="diff-body"></pre>
+      </div>
+    </div>
+
+    <!-- "Choose files to publish" — a lazy checkbox tree of the project folder.
+         Ticking a folder publishes it recursively; files Hivemind refuses to
+         upload (secrets, .git, node_modules …) are shown struck through. -->
+    <div id="publish-pick-backdrop" class="hidden">
+      <div id="publish-pick-modal">
+        <div class="diff-head">
+          <span id="publish-pick-title">Files to publish</span>
+          <div class="spacer"></div>
+          <button id="publish-pick-close" class="git-icon" title="Close">✕</button>
+        </div>
+        <div id="publish-pick-hint" class="pub-pick-hint">
+          Tick what should go to the website. Ticking a folder publishes everything
+          inside it. Anything not ticked stays on this machine.
+        </div>
+        <div id="publish-pick-body"></div>
+        <div class="pub-pick-foot">
+          <span id="publish-pick-count" class="pub-pick-count"></span>
+          <div class="spacer"></div>
+          <button id="publish-pick-cancel" class="plan-mini-btn">Cancel</button>
+          <button id="publish-pick-save" class="primary">Save list</button>
+        </div>
       </div>
     </div>
 
@@ -486,12 +532,14 @@
                 <strong><svg class="help-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z" /></svg> Explorer</strong>
                 and
                 <strong><svg class="help-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><line x1="6" y1="3" x2="6" y2="15" /><circle cx="18" cy="6" r="3" /><circle cx="6" cy="18" r="3" /><path d="M18 9a9 9 0 0 1-9 9" /></svg> Source Control</strong>
-                buttons to browse files and manage Git, and the
+                buttons to browse files and manage Git, the
+                <strong><svg class="help-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 17.6A4 4 0 0 0 18 10h-1.3A7 7 0 1 0 5 16.3" /><polyline points="9 13 12 10 15 13" /><line x1="12" y1="10" x2="12" y2="21" /></svg> Publish</strong>
+                button to upload a website to your web host over FTP, and the
                 <strong><svg class="help-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 11l3 3L22 4" /><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11" /></svg> Todo</strong>
                 button to keep a checklist for the hive, and the
                 <strong><svg class="help-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9" /><polyline points="12 7 12 12 15.5 14" /></svg> Prompt History</strong>
                 button to see the prompts you've sent in this hive — click one to jump to that prompt in the conversation where it appears (the thread is focused and the message flashes briefly). Hover an entry for its <strong>🎤</strong> button to re-speak that prompt in voice training (read it aloud and accept dictionary fixes for anything misheard), <strong>↩</strong> to send it again to the focused thread, or <strong>🗑</strong> to remove it from the list.</li>
-              <li><strong>Drag the sidebar's right edge</strong> to make it (and the Explorer, Source Control, Todo, Prompt History and 🐝 Chat with Hivemind panels docked in it) wider or narrower. Double-click the edge to reset the width; it's remembered across restarts.</li>
+              <li><strong>Drag the sidebar's right edge</strong> to make it (and the Explorer, Source Control, Publish, Todo, Prompt History and 🐝 Chat with Hivemind panels docked in it) wider or narrower. Double-click the edge to reset the width; it's remembered across restarts.</li>
             </ol>
           </div>
 
@@ -583,6 +631,21 @@
               <li>Once the repo is connected to a remote, the <strong>GitHub</strong> icon next to the branch name opens the project's page on GitHub in your browser.</li>
               <li>The <strong>↓/↑ counters</strong> next to the branch name show commits to pull down from / push up to GitHub. Hivemind checks GitHub for new commits in the background while the panel is open (every few minutes); hit <strong>⟳</strong> to check right now.</li>
               <li><strong>Recent Commits</strong> at the bottom of the panel lists the last three commit messages on the current branch — hover one to see its hash, author and when it was made.</li>
+            </ul>
+          </div>
+
+          <div class="settings-group">
+            <div class="settings-group-title">Publish to website (FTP)</div>
+            <ul class="help-list">
+              <li>The <strong><svg class="help-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 17.6A4 4 0 0 0 18 10h-1.3A7 7 0 1 0 5 16.3" /><polyline points="9 13 12 10 15 13" /><line x1="12" y1="10" x2="12" y2="21" /></svg> Publish</strong> panel uploads this hive's website to a web host over FTP — Source Control's shape, pointed at your hosting instead of GitHub. It's per hive: each hive publishes to its own site.</li>
+              <li>First time, fill in the <strong>connection</strong>: FTP server, username, password, and the <strong>remote folder</strong> (the path from the FTP login root — often <code>public_html</code>, or something like <code>domains/example.com/public_html</code>). An optional <strong>website address</strong> adds a <strong>↗</strong> button that opens the live site. Reopen the form any time with <strong>⚙</strong>.</li>
+              <li><strong>Choose…</strong> opens a tick-box tree of the project folder — <strong>only what you tick is ever uploaded</strong>. Ticking a folder publishes everything inside it. Build sources, notes and tooling stay on your machine simply by leaving them unticked.</li>
+              <li>The file list marks each file <strong>●&nbsp;changed</strong> or <strong>·&nbsp;unchanged</strong> since the last publish, and <strong>⇧ Publish</strong> uploads only the changed ones — so a big video isn't re-sent every time. Use <strong>⋯ → Publish everything</strong> to force a full re-upload, and <strong>Stop</strong> to cancel a run in progress.</li>
+              <li><strong>⋯ → Test connection</strong> checks the host, login and remote folder without uploading anything.</li>
+              <li><strong>Your credentials stay yours.</strong> The host, username, file list and password are stored in Hivemind's own folder — never in the project directory — so they are never committed, never pushed to GitHub, and not visible to the agent threads working in that project. The password is encrypted by Windows (DPAPI) under your user account: another Windows user can't read it, and the file is useless if copied to another machine. It never leaves the main process, and it's passed to the uploader over a private channel rather than on a command line. <strong>⋯ → Forget saved password</strong> removes it; <strong>⋯ → Remove publish settings</strong> deletes everything Hivemind stores for the hive (the website itself is untouched).</li>
+              <li><strong>Connection security</strong> defaults to encrypting the login (FTPS control channel), which is what most shared hosts handle reliably. Fully-encrypted FTPS is selectable if your host supports it; plain FTP sends the password in the clear and shows a warning.</li>
+              <li>Some files are <strong>never uploaded</strong>, even inside a ticked folder: <code>.git</code>, <code>.hivemind</code>, <code>.claude</code>, <code>node_modules</code>, <code>.env</code> files, keys and certificates. They show struck through in the picker.</li>
+              <li>Say <em>“Hivemind, publish the site”</em> to open the panel and upload the changed files in one step.</li>
             </ul>
           </div>
 

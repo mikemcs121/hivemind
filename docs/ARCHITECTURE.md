@@ -54,6 +54,7 @@ one agent thread:
 | Main process, IPC hub, PTYs, security | `main.js`, `preload.js` | `docs/main-process.md` |
 | All UI (boards, panes, chat, modals, shortcuts) | `src/renderer.js`, `src/index.html`, `src/styles.css` | `docs/renderer.md` |
 | Git panel + file explorer backends | `git.js`, `files.js` | `docs/git-and-files.md` |
+| Publish panel: FTP upload + stored credentials | `publish.js` | `docs/publish.md` |
 | Per-project sidecars: plans, todos, prompt history, transcripts, usage | `plan.js`, `todo.js`, `promptHistory.js`, `transcript.js`, `usage.js` | `docs/sidecar-modules.md` |
 | Voice typing (offline STT) | `src/voice-worker.js`, `scripts/fetch-model.mjs`, `models/` | `docs/voice-dictation.md` |
 | Build, packaging, releases, auto-update | `build.js`, `updater.js`, `scripts/before-build.js`, package.json `build` | `docs/build-and-release.md` |
@@ -67,6 +68,7 @@ The complete channel-by-channel table lives in `docs/main-process.md`. Groups:
 - `pty:*` — spawn/write/resize/kill + `pty:data`/`pty:exit` pushes
 - `git:*`, `gh:*`, `hm:interpret` — source control (see `docs/git-and-files.md`)
 - `files:*`, `watch:set`/`fs:changed` — file explorer + live refresh
+- `publish:*` + `publish:progress` push — FTP publishing (see `docs/publish.md`)
 - `plan:*`, `todo:*`, `promptHistory:*`, `usage:get` — sidecars
 - `transcript:*` + `transcript:entries`/`transcript:status` pushes — chat view
 - `stt:ensureModel`/`stt:downloadProgress` — voice model downloads; `stt:nativeLoad`/`stt:nativeTranscribe`/`stt:nativeStop` — the sherpa-onnx native speech engine (`stt-native.js` utility process)
@@ -80,7 +82,7 @@ The complete channel-by-channel table lives in `docs/main-process.md`. Groups:
 
 | Location | Contents |
 |---|---|
-| userData (`%APPDATA%\hivemind`, or `HM_USER_DATA` override) | `boards.json` (boards + layouts), downloaded STT models under `models/` |
+| userData (`%APPDATA%\hivemind`, or `HM_USER_DATA` override) | `boards.json` (boards + layouts), `publish.json` (per-project FTP settings + DPAPI-encrypted password — deliberately *not* in the project), downloaded STT models under `models/` |
 | `<project>\.hivemind\` | per-project sidecars: `todos.json`, `prompt-history.json`, `plans/` (`kanban.json` is legacy — nothing reads it) |
 | `~/.claude/projects/<encoded-dir>/*.jsonl` | Claude Code session transcripts (read-only input to the chat view) |
 | `~/.codex/sessions/YYYY/MM/DD/` | Codex rollouts (same role for Codex panes) |
@@ -100,7 +102,10 @@ The complete channel-by-channel table lives in `docs/main-process.md`. Groups:
    through the PTY; the chat view is a display layered on top.
 5. **Security guards are load-bearing:** sandboxed renderer, regex-validated
    values spliced into PTY command strings, `safeRef`/`--` argument-injection
-   guards in git.js, no `innerHTML` for user/agent text.
+   guards in git.js, no `innerHTML` for user/agent text. In publish.js: the FTP
+   password is `safeStorage`-encrypted, stays in userData (never the project
+   tree), never crosses to the renderer, and reaches curl over stdin rather than
+   argv — see `docs/publish.md`.
 6. **Concurrent writers:** the user's own agent threads edit this repo and the
    `.hivemind/` JSON files in parallel — atomic writes, per-file locks, and the
    unreadable-vs-empty distinction in todo.js/promptHistory.js exist for this;

@@ -120,6 +120,28 @@ contextBridge.exposeInMainWorld('api', {
     reveal: (cwd, rel) => ipcRenderer.invoke('files:reveal', { cwd, rel }),
   },
 
+  // Publish to website (FTP). `cwd` is the active board's project directory and
+  // keys the settings, which live in Hivemind's userData — never in the project
+  // folder. `config` reports `hasPassword`; the password itself is write-only
+  // from here and never comes back across the bridge.
+  publish: {
+    config: (cwd) => ipcRenderer.invoke('publish:config', { cwd }),
+    setConfig: (cwd, patch) => ipcRenderer.invoke('publish:setConfig', { cwd, patch }),
+    setPassword: (cwd, password) => ipcRenderer.invoke('publish:setPassword', { cwd, password }),
+    forget: (cwd) => ipcRenderer.invoke('publish:forget', { cwd }),
+    scan: (cwd) => ipcRenderer.invoke('publish:scan', { cwd }),
+    test: (cwd) => ipcRenderer.invoke('publish:test', { cwd }),
+    run: (cwd, all) => ipcRenderer.invoke('publish:run', { cwd, all }),
+    cancel: (cwd) => ipcRenderer.invoke('publish:cancel', { cwd }),
+    // Which of these project-relative paths the backend refuses to upload, and why.
+    deny: (rels) => ipcRenderer.invoke('publish:deny', { rels }),
+    onProgress: (cb) => {
+      const h = (_e, payload) => cb(payload);
+      ipcRenderer.on('publish:progress', h);
+      return () => ipcRenderer.removeListener('publish:progress', h);
+    },
+  },
+
   // Plan pane. `cwd` is the active board's project directory; `planId` keys the
   // per-thread plan file the thread writes and the comments Hivemind attaches.
   plan: {

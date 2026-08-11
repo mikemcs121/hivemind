@@ -41,7 +41,7 @@ longer relying on the Electron 29 default) — it can only do what `window.api` 
 | `preload.js` | ~207 lines | Context bridge exposing `window.api` |
 | `Hivemind.cmd` | 4 lines | Launcher: runs bundled `node_modules\electron\dist\electron.exe` on the repo dir with `--disable-gpu`; no global Node needed |
 | `package.json` | ~53 lines | `"main": "main.js"`; `npm start` → `electron .`; electron-builder config (nsis + portable targets, `asarUnpack` for models and transformers.js) |
-| `git.js`, `files.js`, `plan.js`, `todo.js`, `promptHistory.js`, `build.js`, `usage.js`, `transcript.js`, `updater.js` | — | Helper modules required by `main.js:104`–`113`; each backs a family of IPC channels |
+| `git.js`, `files.js`, `plan.js`, `todo.js`, `promptHistory.js`, `publish.js`, `build.js`, `usage.js`, `transcript.js`, `updater.js` | — | Helper modules required by `main.js:104`–`113`; each backs a family of IPC channels |
 
 ## Key concepts
 
@@ -146,6 +146,15 @@ native dialogs and no renderer IPC.
 | `plan:ensureIgnored` / `todo:ensureIgnored` / `promptHistory:ensureIgnored` | `{ cwd }` | All call `plan.ensureIgnored` — add `.hivemind/` to the project `.gitignore` |
 | `todo:read` / `todo:write` | `{ cwd [, todos] }` | Per-hive checklist in `.hivemind/todos.json` |
 | `promptHistory:read` / `promptHistory:append` / `promptHistory:write` | `{ cwd [, entry \| entries] }` | Per-hive prompt log in `.hivemind/prompt-history.json` |
+| `publish:config` | `{ cwd }` | Publish settings for this project — **`hasPassword` only, never the password** (`publish.getConfig`) |
+| `publish:setConfig` | `{ cwd, patch }` | Validate + merge host/port/user/remoteDir/siteUrl/security/insecureCert/files (`password` in the patch is routed to `setPassword`) |
+| `publish:setPassword` | `{ cwd, password }` | Encrypt with `safeStorage` (DPAPI) and store; `''` clears it |
+| `publish:forget` | `{ cwd }` | Delete this project's whole publish record |
+| `publish:scan` | `{ cwd }` | Expand the allowlist to concrete files with `changed` flags + skipped-entry `problems` |
+| `publish:test` | `{ cwd }` | `NLST` the remote folder as a credential/path check |
+| `publish:run` | `{ cwd, all }` | Upload changed (or all) files; streams `publish:progress` |
+| `publish:cancel` | `{ cwd }` | Stop the running publish after the current file |
+| `publish:deny` | `{ rels }` | Which paths the denylist refuses, and why (for the picker) |
 | `open:external` | `{ url }` | `shell.openExternal` for http/https/mailto only; returns `{ ok }` |
 | `usage:get` | — | Rate-limit windows + today's token totals (`usage.getUsage`) |
 | `transcript:bind` | opts (paneId, cwd, sessionId, …) | Bind a chat pane to its Claude session JSONL; entries stream back via events |
@@ -184,6 +193,7 @@ native dialogs and no renderer IPC.
 | `transcript:status` | `{ paneId, status, file }` | Transcript binding status change (`transcript.js:921`) |
 | `stt:downloadProgress` | `{ repo, done, total, file, bytes, totalBytes }` | Speech-model download progress; byte fields update ≤4×/s so big native models show MB progress |
 | `build:progress` | `{ line }` | Portable build progress line (`main.js:897`) |
+| `publish:progress` | `{ phase, rel, index, total, ok?, message?, attempt? }` | Per-file FTP upload progress; `phase` is `start`/`file`/`retry` |
 | `gh:authStatus` | `{ phase, code?, url?, user?, message? }` | GitHub device-flow login progress (`startGhAuth`): `phase` is `starting`/`code`/`success`/`error` |
 
 ## Preload API
@@ -205,6 +215,7 @@ above). Every `on*` subscription returns an unsubscribe function.
 | `hm.interpret(payload)` | `hm:interpret` |
 | `setWatch(cwd)` / `onFsChanged(cb)` | `watch:set` / `fs:changed` event |
 | `files.list/open/reveal(cwd, rel)` | `files:*` |
+| `publish.config\setConfig\setPassword\forget\scan\test\run\cancel\deny\onProgress` | `publish:*` (`publish:progress` event) |
 | `plan.read/readFile/write/readComments/writeComments/clear/ensureIgnored` | `plan:*` (comments map to `plan:comments:read`/`write`) |
 | `todo.read/write/ensureIgnored(cwd, …)` | `todo:*` |
 | `promptHistory.read/append/write/ensureIgnored` | `promptHistory:*` |

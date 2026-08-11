@@ -2024,6 +2024,31 @@ const HM_COMMANDS = [
     },
   },
   {
+    // "publish the site" opens the Publish panel and, when it is already set up
+    // and something has changed, starts the upload. Never uploads silently from
+    // an unconfigured hive — the panel opens so the target is visible first.
+    name: 'publish-site',
+    patterns: [
+      /^(?:publish|upload|deploy)(?:\s+(?:the|my))?(?:\s+(?:site|website|web\s*site))?$/i,
+      /^(?:publish|upload|deploy)\s+to\s+(?:the\s+)?(?:web|website|ftp|host(?:ing)?)$/i,
+    ],
+    help: '<strong>publish the site</strong> — opens the Publish panel and uploads the files that changed since the last publish.',
+    async run() {
+      const dir = activeDir();
+      if (!dir) { hmToast('This hive has no project directory set.', 'err'); return; }
+      setPublishOpen(true);
+      await refreshPublish();
+      if (!pubCfg || !pubCfg.configured) {
+        hmToast('Publish opened — fill in the FTP connection first.');
+        return;
+      }
+      const changed = ((pubScan && pubScan.files) || []).filter((f) => f.changed).length;
+      if (!changed) { hmToast('Everything is already up to date on the website.'); return; }
+      hmToast(`Publishing ${changed} changed file${changed === 1 ? '' : 's'}…`);
+      doPublish(false);
+    },
+  },
+  {
     name: 'show-terminal',
     patterns: [/^(?:show|open|switch\s+to|go\s+to)\s+(?:the\s+)?terminal(?:\s+view)?$/i],
     help: '<strong>show the terminal</strong> / <strong>show the chat</strong> — flip this thread\'s view, like the <strong>&gt;_</strong> / <strong>💬</strong> button.',
@@ -2372,6 +2397,7 @@ function hmChatOpen() {
   if (typeof setFilesOpen === 'function') setFilesOpen(false);
   if (typeof setTodoOpen === 'function') setTodoOpen(false);
   if (typeof setHistoryOpen === 'function') setHistoryOpen(false);
+  if (typeof setPublishOpen === 'function') setPublishOpen(false);
   if (!hmChatSeeded) {
     hmChatSeeded = true;
     hmChatLog.push({ role: 'bee', text: 'Tell me what you need — plain English is fine, no "Hivemind" prefix needed. Try "help" for the full command list.' });
@@ -4613,6 +4639,8 @@ function selectBoard(id) {
   if (typeof todoOnBoardChange === 'function') todoOnBoardChange();
   if (typeof historyToggle !== 'undefined' && historyToggle) historyToggle.disabled = false;
   if (typeof historyOnBoardChange === 'function') historyOnBoardChange();
+  if (typeof publishToggle !== 'undefined' && publishToggle) publishToggle.disabled = false;
+  if (typeof publishOnBoardChange === 'function') publishOnBoardChange();
   fitBoard(id);
 }
 
@@ -5707,7 +5735,12 @@ function showEmpty() {
     historyToggle.classList.remove('active');
   }
   if (typeof historyPanel !== 'undefined' && historyPanel) historyPanel.classList.add('hidden');
-  const sb = $('sidebar'); if (sb) sb.classList.remove('git-open', 'files-open', 'todo-open', 'history-open');
+  if (typeof publishToggle !== 'undefined' && publishToggle) {
+    publishToggle.disabled = true;
+    publishToggle.classList.remove('active');
+  }
+  if (typeof publishPanel !== 'undefined' && publishPanel) publishPanel.classList.add('hidden');
+  const sb = $('sidebar'); if (sb) sb.classList.remove('git-open', 'files-open', 'todo-open', 'history-open', 'publish-open');
 }
 
 // ---------------------------------------------------------------------------
@@ -5792,6 +5825,13 @@ window.api.onFsChanged(({ cwd }) => {
   // menu out of the DOM mid-interaction (looks like it "disappears on hover").
   if (typeof gitPanelOpen === 'function' && gitPanelOpen() && !gitBusy && !gitMenuOpen) {
     refreshGit({ keepMsg: true });
+  }
+  // Same for Publish: a thread editing a listed file flips it to "changed".
+  // Never mid-run (the row statuses would be wiped) or mid-form (typed
+  // credentials would be thrown away).
+  if (typeof publishPanelOpen === 'function' && publishPanelOpen() &&
+      !pubBusy && !pubRunning && !pubMenuOpen && !pubForm) {
+    refreshPublish({ keepMsg: true });
   }
   // A thread may have just (re)written a `.hivemind/plans/` file — the open
   // review polls anyway, but a project-tree change gets it there sooner.
@@ -5946,6 +5986,7 @@ function setGitOpen(open) {
   if (open && typeof setTodoOpen === 'function') setTodoOpen(false);
   if (open && typeof setHistoryOpen === 'function') setHistoryOpen(false);
   if (open && typeof setHmChatOpen === 'function') setHmChatOpen(false);
+  if (open && typeof setPublishOpen === 'function') setPublishOpen(false);
   gitPanel.classList.toggle('hidden', !open);
   gitToggle.classList.toggle('active', open);
   sidebarEl.classList.toggle('git-open', open); // board list yields its space
@@ -6497,6 +6538,7 @@ function setFilesOpen(open) {
   if (open && typeof setTodoOpen === 'function') setTodoOpen(false);
   if (open && typeof setHistoryOpen === 'function') setHistoryOpen(false);
   if (open && typeof setHmChatOpen === 'function') setHmChatOpen(false);
+  if (open && typeof setPublishOpen === 'function') setPublishOpen(false);
   filesPanel.classList.toggle('hidden', !open);
   filesToggle.classList.toggle('active', open);
   sidebarEl.classList.toggle('files-open', open); // board list yields its space
@@ -6710,6 +6752,703 @@ document.addEventListener('keydown', (e) => {
 }, true);
 
 // ---------------------------------------------------------------------------
+// Publish panel (publish to website over FTP)
+//
+// Source Control's shape, pointed at a web host instead of a git remote: the
+// panel shows where this hive publishes to, an explicit allowlist of files and
+// folders, and which of them changed since the last publish. "Publish" uploads
+// only the changed ones; "Publish everything" in the ⋯ menu forces a full run.
+//
+// The connection settings — host, user, remote folder, file list — and the
+// password all live in Hivemind's userData (see publish.js), never in the
+// project folder, so they are never committed, pushed, or visible to the agent
+// threads working in that folder. The password is encrypted by Windows DPAPI
+// and never comes back across the context bridge; this renderer only ever knows
+// `hasPassword`.
+// ---------------------------------------------------------------------------
+const publishToggle = $('publish-toggle');
+const publishPanel = $('publish-panel');
+const publishBody = $('publish-body');
+const publishMsgbar = $('publish-msgbar');
+
+let pubCfg = null;       // { configured, canEncrypt, site } for the active hive
+let pubScan = null;      // { files, problems, changed }
+let pubBusy = false;     // a save/test/publish call is in flight
+let pubRunning = false;  // an upload is running (Publish becomes Stop)
+let pubMenuOpen = false; // ⋯ menu open — suppress auto-refresh so it isn't wiped
+let pubForm = false;     // showing the connection form instead of the file view
+const pubRowStatus = new Map(); // rel -> 'done' | 'fail' | 'busy' during a run
+
+function publishPanelOpen() { return publishPanel && !publishPanel.classList.contains('hidden'); }
+
+function setPublishMsg(text, kind) {
+  if (!text) { publishMsgbar.classList.add('hidden'); publishMsgbar.textContent = ''; return; }
+  publishMsgbar.textContent = text;
+  publishMsgbar.className = 'git-msgbar' + (kind ? ' ' + kind : '');
+}
+
+function setPublishOpen(open) {
+  if (open) { // one panel at a time
+    setGitOpen(false);
+    setFilesOpen(false);
+    if (typeof setTodoOpen === 'function') setTodoOpen(false);
+    if (typeof setHistoryOpen === 'function') setHistoryOpen(false);
+    if (typeof setHmChatOpen === 'function') setHmChatOpen(false);
+  }
+  publishPanel.classList.toggle('hidden', !open);
+  publishToggle.classList.toggle('active', open);
+  sidebarEl.classList.toggle('publish-open', open); // board list yields its space
+}
+
+publishToggle.onclick = () => {
+  const open = publishPanel.classList.contains('hidden');
+  setPublishOpen(open);
+  if (open) refreshPublish();
+};
+$('publish-close').onclick = () => setPublishOpen(false);
+$('publish-refresh').onclick = () => refreshPublish();
+
+function publishOnBoardChange() {
+  pubForm = false;
+  pubRowStatus.clear();
+  if (publishPanelOpen()) refreshPublish();
+}
+
+const PUB_SECURITY_LABEL = {
+  'ftps-control': 'Encrypted login (FTPS control channel)',
+  ftps: 'Fully encrypted (FTPS)',
+  plain: 'Plain FTP — no encryption',
+};
+
+function pubBytes(n) {
+  if (!(n >= 0)) return '';
+  if (n < 1024) return n + ' B';
+  if (n < 1024 * 1024) return (n / 1024).toFixed(n < 10240 ? 1 : 0) + ' KB';
+  return (n / 1048576).toFixed(n < 10485760 ? 1 : 0) + ' MB';
+}
+
+function pubAgo(ms) {
+  if (!ms) return 'never';
+  const s = Math.max(0, Math.round((Date.now() - ms) / 1000));
+  if (s < 60) return 'just now';
+  if (s < 3600) return Math.floor(s / 60) + ' min ago';
+  if (s < 86400) return Math.floor(s / 3600) + ' h ago';
+  const d = new Date(ms);
+  return d.toLocaleDateString() + ' ' + d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+}
+
+// -- Load config + scan, then repaint ---------------------------------------
+let pubRefreshGen = 0; // bumped per refresh so a stale read can't repaint another hive
+async function refreshPublish(opts = {}) {
+  if (!publishPanelOpen()) return;
+  // The connection form owns the panel while it's up; reloading underneath it
+  // would rebuild the inputs and discard half-typed credentials.
+  if (pubForm && !opts.force) return;
+  const gen = ++pubRefreshGen;
+  const dir = activeDir();
+  if (!dir) { pubCfg = null; pubScan = null; renderPublish(); return; }
+  let cfg, sc = null;
+  try {
+    cfg = await window.api.publish.config(dir);
+    if (gen !== pubRefreshGen || activeDir() !== dir) return;
+    if (cfg && cfg.ok && cfg.configured) {
+      sc = await window.api.publish.scan(dir);
+      if (gen !== pubRefreshGen || activeDir() !== dir) return;
+    }
+  } catch (e) {
+    if (gen !== pubRefreshGen || activeDir() !== dir) return;
+    setPublishMsg(String((e && e.message) || e), 'err');
+    return;
+  }
+  pubCfg = cfg && cfg.ok ? cfg : null;
+  pubScan = sc && sc.ok ? sc : null;
+  if (!opts.keepMsg) setPublishMsg('');
+  renderPublish();
+}
+
+// -- Run a publish op with a busy guard, then refresh + report ---------------
+async function pubRun(label, fn, { refresh = true, okMsg } = {}) {
+  if (pubBusy) return;
+  const dir = activeDir();
+  if (!dir) { setPublishMsg('This hive has no project directory set.', 'err'); return; }
+  pubBusy = true;
+  setPublishMsg(label + '…');
+  // Never repaint while the connection form is up — that would rebuild the
+  // inputs from the saved config and throw away what the user just typed.
+  if (!pubForm) renderPublish();
+  let res;
+  try {
+    res = await fn(dir);
+    if (res && res.ok === false) setPublishMsg((res.message || 'Failed.').trim(), 'err');
+    else if (res && res.message) setPublishMsg(res.message, res.ok === false ? 'err' : 'ok');
+    else if (okMsg) setPublishMsg(okMsg, 'ok');
+    else setPublishMsg('');
+  } catch (e) {
+    setPublishMsg(String((e && e.message) || e), 'err');
+  } finally {
+    pubBusy = false;
+    if (refresh) await refreshPublish({ keepMsg: true });
+    else if (!pubForm) renderPublish();
+  }
+  return res;
+}
+
+// -- Render -----------------------------------------------------------------
+function renderPublish() {
+  publishBody.innerHTML = '';
+  const dir = activeDir();
+
+  if (!dir) {
+    const wrap = document.createElement('div');
+    wrap.className = 'git-empty';
+    wrap.textContent = 'This hive has no project directory set. Edit the hive to choose one.';
+    publishBody.appendChild(wrap);
+    return;
+  }
+
+  if (pubForm || !pubCfg || !pubCfg.configured) {
+    // The form owns the panel until it's saved or cancelled, so nothing
+    // repaints over half-typed credentials (see refreshPublish / pubRun).
+    pubForm = true;
+    publishBody.appendChild(renderPublishForm());
+    return;
+  }
+
+  const site = pubCfg.site;
+
+  // Where this hive publishes to.
+  const targetRow = document.createElement('div');
+  targetRow.className = 'pub-target-row';
+  const target = document.createElement('div');
+  target.className = 'pub-target';
+  const host = document.createElement('div');
+  host.className = 'pub-host';
+  host.textContent = site.user + '@' + site.host + (site.port && site.port !== 21 ? ':' + site.port : '');
+  // The sidebar is narrow enough to ellipsize these, so spell them out on hover.
+  host.title = host.textContent + '\n' + (PUB_SECURITY_LABEL[site.security] || site.security);
+  const rpath = document.createElement('div');
+  rpath.className = 'pub-path';
+  rpath.textContent = '/' + (site.remoteDir || '');
+  rpath.title = 'Remote folder: /' + (site.remoteDir || '') + '\n' + (PUB_SECURITY_LABEL[site.security] || site.security);
+  const when = document.createElement('div');
+  when.className = 'pub-when';
+  when.textContent = 'Last published ' + pubAgo(site.lastPublish);
+  target.append(host, rpath, when);
+  targetRow.appendChild(target);
+
+  if (site.siteUrl) {
+    const openBtn = mkMini('↗', 'Open ' + site.siteUrl, () => window.api.openExternal(site.siteUrl));
+    openBtn.className = 'git-icon';
+    targetRow.appendChild(openBtn);
+  }
+  const editBtn = mkMini('⚙', 'Connection settings', () => { pubForm = true; renderPublish(); });
+  editBtn.className = 'git-icon';
+  targetRow.appendChild(editBtn);
+  publishBody.appendChild(targetRow);
+
+  if (site.security === 'plain') {
+    const warn = document.createElement('div');
+    warn.className = 'pub-warn';
+    warn.textContent = 'Plain FTP sends your password across the internet unencrypted. Switch to an encrypted option in ⚙ if your host supports it.';
+    publishBody.appendChild(warn);
+  }
+  if (!site.hasPassword) {
+    const warn = document.createElement('div');
+    warn.className = 'pub-warn';
+    warn.textContent = 'No password saved yet — open ⚙ and enter it before publishing.';
+    publishBody.appendChild(warn);
+  } else if (site.passwordSessionOnly) {
+    const warn = document.createElement('div');
+    warn.className = 'pub-warn';
+    warn.textContent = 'Windows would not provide encryption, so the password is held for this session only and was never written to disk.';
+    publishBody.appendChild(warn);
+  }
+
+  // Files section.
+  const section = document.createElement('div');
+  section.className = 'git-section';
+  const head = document.createElement('div');
+  head.className = 'git-section-head';
+  const title = document.createElement('span');
+  title.textContent = 'Files to publish';
+  const count = document.createElement('span');
+  count.className = 'count';
+  count.textContent = String(pubScan && pubScan.files ? pubScan.files.length : 0);
+  const spacer = document.createElement('span');
+  spacer.className = 'spacer';
+  const chooseBtn = mkMini('Choose…', 'Pick which files and folders go to the website', openPublishPicker);
+  // Saving a new list rewrites the same store record the running publish is
+  // updating with upload fingerprints — don't let the two race.
+  chooseBtn.disabled = pubRunning || pubBusy;
+  head.append(title, count, spacer, chooseBtn);
+  section.appendChild(head);
+
+  const files = (pubScan && pubScan.files) || [];
+  if (!files.length) {
+    const empty = document.createElement('div');
+    empty.className = 'git-empty';
+    empty.textContent = 'Nothing is ticked to publish yet.';
+    const btn = mkBtn('Choose files…', openPublishPicker);
+    btn.className = 'primary';
+    empty.appendChild(btn);
+    section.appendChild(empty);
+  } else {
+    const ul = document.createElement('ul');
+    ul.className = 'pub-files';
+    for (const f of files) ul.appendChild(renderPubFileRow(f));
+    section.appendChild(ul);
+  }
+
+  for (const p of (pubScan && pubScan.problems) || []) {
+    const row = document.createElement('div');
+    row.className = 'pub-problem';
+    row.textContent = '⚠ ' + p.entry + ' — ' + p.message + ' (skipped)';
+    section.appendChild(row);
+  }
+  publishBody.appendChild(section);
+
+  // Actions.
+  const changed = files.filter((f) => f.changed).length;
+  const actions = document.createElement('div');
+  actions.className = 'pub-actions';
+
+  if (pubRunning) {
+    const stop = mkBtn('Stop', doPublishCancel);
+    stop.className = 'pub-secondary';
+    stop.title = 'Cancel the rest of this publish';
+    actions.appendChild(stop);
+  } else {
+    const btn = mkBtn(changed ? `⇧ Publish ${changed} file${changed === 1 ? '' : 's'}` : 'Up to date', () => doPublish(false));
+    btn.className = 'primary';
+    btn.disabled = pubBusy || !changed || !site.hasPassword;
+    btn.title = changed
+      ? 'Upload the files that changed since the last publish'
+      : 'Nothing has changed since the last publish';
+    actions.appendChild(btn);
+  }
+
+  // ⋯ overflow: full re-upload, connection test, and the destructive resets.
+  const moreWrap = document.createElement('div');
+  moreWrap.className = 'git-more-wrap';
+  const moreBtn = mkBtn('⋯', null);
+  moreBtn.className = 'git-more-btn';
+  moreBtn.title = 'More actions';
+  moreBtn.setAttribute('aria-label', 'More actions');
+
+  const menu = document.createElement('div');
+  menu.className = 'git-more-menu hidden';
+  const items = [
+    ['Publish everything', 'Re-upload every listed file, changed or not', () => doPublish(true), false],
+    ['Test connection', 'Check the host, login and remote folder', doPublishTest, false],
+    ['Connection settings', null, () => { pubForm = true; renderPublish(); }, false],
+    ['Forget saved password', 'Remove the stored password from this machine', doPublishForgetPassword, true],
+    ['Remove publish settings', 'Delete everything Hivemind stores about publishing this hive', doPublishForget, true],
+  ];
+  for (const [label, tip, fn, danger] of items) {
+    const it = mkBtn(label, () => { closePubMenu(); fn(); });
+    it.className = 'git-more-item' + (danger ? ' danger' : '');
+    if (tip) it.title = tip;
+    if (pubRunning) it.disabled = true;
+    menu.appendChild(it);
+  }
+
+  function onOutside(e) { if (!moreWrap.contains(e.target)) closePubMenu(); }
+  function closePubMenu() {
+    pubMenuOpen = false;
+    menu.classList.add('hidden');
+    document.removeEventListener('mousedown', onOutside);
+    publishBody.removeEventListener('scroll', closePubMenu, true);
+  }
+  moreBtn.onclick = (e) => {
+    e.stopPropagation();
+    if (menu.classList.contains('hidden')) {
+      // Unhide first so the menu can be measured, then anchor it above the
+      // button. Fixed positioning keeps it clear of #publish-body's clipping.
+      pubMenuOpen = true;
+      menu.classList.remove('hidden');
+      const r = moreBtn.getBoundingClientRect();
+      menu.style.top = (r.top - menu.offsetHeight - 6) + 'px';
+      menu.style.left = (r.right - menu.offsetWidth) + 'px';
+      document.addEventListener('mousedown', onOutside);
+      publishBody.addEventListener('scroll', closePubMenu, true);
+    } else {
+      closePubMenu();
+    }
+  };
+  moreWrap.append(moreBtn, menu);
+  actions.appendChild(moreWrap);
+  publishBody.appendChild(actions);
+}
+
+function renderPubFileRow(f) {
+  const li = document.createElement('li');
+  li.className = 'pub-file' + (f.changed ? '' : ' unchanged');
+  const run = pubRowStatus.get(f.rel);
+
+  const stat = document.createElement('span');
+  if (run === 'done') { stat.className = 'pstat done'; stat.textContent = '✓'; stat.title = 'Uploaded'; }
+  else if (run === 'fail') { stat.className = 'pstat fail'; stat.textContent = '!'; stat.title = 'Upload failed'; }
+  else if (run === 'busy') { stat.className = 'pstat changed'; stat.textContent = '↑'; stat.title = 'Uploading…'; }
+  else if (f.changed) { stat.className = 'pstat changed'; stat.textContent = '●'; stat.title = 'Changed since the last publish'; }
+  else { stat.className = 'pstat same'; stat.textContent = '·'; stat.title = 'Unchanged — will be skipped'; }
+
+  const name = document.createElement('span');
+  name.className = 'pname';
+  const i = f.rel.lastIndexOf('/');
+  if (i >= 0) {
+    const d = document.createElement('span');
+    d.className = 'pdir';
+    d.textContent = f.rel.slice(0, i + 1);
+    name.append(d, document.createTextNode(f.rel.slice(i + 1)));
+  } else {
+    name.textContent = f.rel;
+  }
+  name.title = f.rel + (f.uploadedAt ? '\nLast uploaded ' + pubAgo(f.uploadedAt) : '\nNot uploaded yet');
+
+  const size = document.createElement('span');
+  size.className = 'psize';
+  size.textContent = pubBytes(f.size);
+
+  li.append(stat, name, size);
+  return li;
+}
+
+// -- Connection form --------------------------------------------------------
+function renderPublishForm() {
+  const site = (pubCfg && pubCfg.site) || null;
+  const wrap = document.createElement('div');
+  wrap.className = 'pub-form';
+
+  const field = (label, el, hint) => {
+    const f = document.createElement('div');
+    f.className = 'pub-field';
+    const l = document.createElement('label');
+    l.textContent = label;
+    f.append(l, el);
+    if (hint) {
+      const h = document.createElement('div');
+      h.className = 'pub-hint';
+      h.textContent = hint;
+      f.appendChild(h);
+    }
+    return f;
+  };
+  const input = (value, placeholder, type) => {
+    const el = document.createElement('input');
+    el.type = type || 'text';
+    el.value = value || '';
+    if (placeholder) el.placeholder = placeholder;
+    el.autocomplete = 'off';
+    el.spellcheck = false; // keep autocorrect out of host names and passwords
+    return el;
+  };
+
+  const hostEl = input(site && site.host, 'ftp.example.com or 194.164.64.227');
+  const portEl = input(site && site.port ? String(site.port) : '21', '21');
+  const userEl = input(site && site.user, 'FTP username');
+  const passEl = input('', site && site.hasPassword ? '•••••••• (saved — leave blank to keep)' : 'FTP password', 'password');
+  const remoteEl = input(site && site.remoteDir, 'public_html');
+  const urlEl = input(site && site.siteUrl, 'https://example.com/');
+
+  const secEl = document.createElement('select');
+  for (const [v, label] of Object.entries(PUB_SECURITY_LABEL)) {
+    const o = document.createElement('option');
+    o.value = v;
+    o.textContent = label;
+    secEl.appendChild(o);
+  }
+  secEl.value = (site && site.security) || 'ftps-control';
+
+  const certWrap = document.createElement('label');
+  certWrap.className = 'pub-check';
+  const certEl = document.createElement('input');
+  certEl.type = 'checkbox';
+  certEl.checked = !site || site.insecureCert !== false;
+  certWrap.append(certEl, document.createTextNode(
+    "Allow the host's shared certificate. Shared hosting usually serves a certificate for the provider rather than your account, which otherwise fails verification."
+  ));
+
+  const row = document.createElement('div');
+  row.className = 'pub-row';
+  const hf = field('FTP server', hostEl);
+  const pf = field('Port', portEl);
+  pf.classList.add('narrow');
+  row.append(hf, pf);
+
+  wrap.append(
+    row,
+    field('Username', userEl),
+    field('Password', passEl, pubCfg && pubCfg.canEncrypt === false
+      ? 'Windows encryption is unavailable, so the password will be kept for this session only and never written to disk.'
+      : 'Encrypted with Windows DPAPI under your user account and stored in Hivemind’s own folder — never in the project, never in Git.'),
+    field('Remote folder', remoteEl, 'Path from the FTP login root, e.g. public_html or domains/example.com/public_html.'),
+    field('Website address', urlEl, 'Optional — adds a ↗ button that opens the live site.'),
+    field('Connection security', secEl),
+    certWrap
+  );
+
+  const note = document.createElement('div');
+  note.className = 'pub-note';
+  note.textContent = 'Hivemind never uploads .git, .hivemind, .claude, node_modules, .env files, keys or certificates, even if a folder containing them is ticked.';
+  wrap.appendChild(note);
+
+  const actions = document.createElement('div');
+  actions.className = 'pub-actions';
+  const saveBtn = mkBtn('Save', async () => {
+    const patch = {
+      host: hostEl.value,
+      port: portEl.value.trim() || 21,
+      user: userEl.value,
+      remoteDir: remoteEl.value,
+      siteUrl: urlEl.value,
+      security: secEl.value,
+      insecureCert: certEl.checked,
+    };
+    const pass = passEl.value;
+    const res = await pubRun('Saving', async (d) => {
+      const r = await window.api.publish.setConfig(d, patch);
+      if (!r || r.ok === false) return r;
+      if (pass) return window.api.publish.setPassword(d, pass);
+      return r;
+    }, { refresh: false });
+    if (res && res.ok !== false) {
+      pubForm = false;
+      setPublishMsg(res.warning || 'Connection settings saved.', res.warning ? 'err' : 'ok');
+      await refreshPublish({ keepMsg: true });
+    }
+  });
+  saveBtn.className = 'primary';
+  saveBtn.disabled = pubBusy;
+  actions.appendChild(saveBtn);
+
+  if (pubCfg && pubCfg.configured) {
+    const cancelBtn = mkBtn('Cancel', () => { pubForm = false; setPublishMsg(''); renderPublish(); });
+    cancelBtn.className = 'pub-secondary';
+    actions.appendChild(cancelBtn);
+  }
+  wrap.appendChild(actions);
+  return wrap;
+}
+
+// -- Operations -------------------------------------------------------------
+async function doPublish(all) {
+  const dir = activeDir();
+  if (!dir || pubBusy || pubRunning) return;
+  const site = pubCfg && pubCfg.site;
+  if (!site) return;
+  if (!site.hasPassword) { setPublishMsg('No password saved — open ⚙ and enter it first.', 'err'); return; }
+  if (all && !confirm('Re-upload every listed file to ' + site.host + ', including files that have not changed?')) return;
+
+  pubRowStatus.clear();
+  pubRunning = true;
+  setPublishMsg('Publishing…');
+  renderPublish();
+  let res;
+  try {
+    res = await window.api.publish.run(dir, !!all);
+  } catch (e) {
+    res = { ok: false, message: String((e && e.message) || e) };
+  }
+  pubRunning = false;
+  const failed = res && res.failed && res.failed.length;
+  // Drop the per-row ✓ marks now the run is over — otherwise every row stays
+  // ticked and hides the real changed/unchanged state on the next scan. Keep
+  // the failures visible until that file publishes successfully.
+  pubRowStatus.clear();
+  for (const f of (res && res.failed) || []) pubRowStatus.set(f.rel, 'fail');
+  setPublishMsg((res && res.message) || 'Publish finished.', res && res.ok ? 'ok' : (failed || (res && res.ok === false) ? 'err' : ''));
+  if (res && res.uploaded) {
+    window.api.notify({
+      title: 'Hivemind',
+      body: failed
+        ? `Published ${res.uploaded} file(s) to ${site.host}, ${failed} failed.`
+        : `Published ${res.uploaded} file(s) to ${site.host}.`,
+    });
+  }
+  await refreshPublish({ keepMsg: true });
+}
+
+function doPublishCancel() {
+  const dir = activeDir();
+  if (!dir) return;
+  setPublishMsg('Stopping after the current file…');
+  window.api.publish.cancel(dir);
+}
+
+function doPublishTest() {
+  pubRun('Testing the connection', (d) => window.api.publish.test(d), { refresh: false });
+}
+
+function doPublishForgetPassword() {
+  if (!confirm('Remove the saved FTP password from this machine? You will be asked for it again before the next publish.')) return;
+  pubRun('Removing the saved password', (d) => window.api.publish.setPassword(d, ''), { okMsg: 'Saved password removed.' });
+}
+
+async function doPublishForget() {
+  if (!confirm('Delete the host, username, password and file list Hivemind stores for this hive? The website itself is not touched.')) return;
+  await pubRun('Removing the publish settings', (d) => window.api.publish.forget(d), { refresh: false });
+  pubForm = false;
+  pubScan = null;
+  setPublishMsg('Publish settings removed.', 'ok');
+  await refreshPublish({ keepMsg: true });
+}
+
+// Live per-file progress from the main process during a run.
+if (window.api.publish && window.api.publish.onProgress) {
+  window.api.publish.onProgress((p) => {
+    if (!p || !pubRunning) return;
+    if (p.phase === 'start') pubRowStatus.set(p.rel, 'busy');
+    else if (p.phase === 'file') pubRowStatus.set(p.rel, p.ok ? 'done' : 'fail');
+    else if (p.phase === 'retry') { setPublishMsg(`Retrying ${p.rel} (attempt ${p.attempt + 1})…`); return; }
+    if (p.total) setPublishMsg(`Publishing ${p.index}/${p.total} — ${p.rel}`);
+    if (publishPanelOpen() && !pubMenuOpen) renderPublish();
+  });
+}
+
+// -- "Choose files" picker ---------------------------------------------------
+// A lazy checkbox tree of the project folder. Ticking a folder publishes it
+// recursively, so its descendants render as already-covered.
+const pubPickBackdrop = $('publish-pick-backdrop');
+const pubPickBody = $('publish-pick-body');
+const pubPickCount = $('publish-pick-count');
+let pubPickSet = new Set(); // entries: "index.html" or "assets/" for a folder
+
+function pubCoveredBy(rel) {
+  const parts = rel.split('/');
+  for (let i = 1; i <= parts.length - 1; i++) {
+    const anc = parts.slice(0, i).join('/') + '/';
+    if (pubPickSet.has(anc)) return anc;
+  }
+  return null;
+}
+
+function pubPickPaint() {
+  const n = pubPickSet.size;
+  pubPickCount.textContent = n ? `${n} item${n === 1 ? '' : 's'} selected` : 'Nothing selected';
+}
+
+async function openPublishPicker() {
+  const dir = activeDir();
+  if (!dir) return;
+  pubPickSet = new Set(((pubCfg && pubCfg.site && pubCfg.site.files) || []));
+  pubPickBody.innerHTML = '';
+  pubPickBackdrop.classList.remove('hidden');
+  pubPickPaint();
+  const ul = await buildPubPickLevel(dir, '', 0);
+  pubPickBody.appendChild(ul);
+}
+
+function closePublishPicker() { pubPickBackdrop.classList.add('hidden'); }
+
+$('publish-pick-close').onclick = closePublishPicker;
+$('publish-pick-cancel').onclick = closePublishPicker;
+pubPickBackdrop.addEventListener('mousedown', (e) => { if (e.target === pubPickBackdrop) closePublishPicker(); });
+$('publish-pick-save').onclick = async () => {
+  closePublishPicker();
+  const files = Array.from(pubPickSet).sort();
+  await pubRun('Saving the file list', (d) => window.api.publish.setConfig(d, { files }), { okMsg: 'File list saved.' });
+};
+
+// Build one directory level. `deny` comes from the backend so the refused-file
+// rules live in exactly one place (publish.js).
+async function buildPubPickLevel(dir, rel, depth) {
+  const ul = document.createElement('ul');
+  ul.className = depth ? 'pub-children' : 'pub-tree';
+  const res = await window.api.files.list(dir, rel);
+  if (!res || !res.ok) {
+    const li = document.createElement('li');
+    li.className = 'pub-item';
+    li.textContent = (res && res.message) || 'Could not read this folder.';
+    ul.appendChild(li);
+    return ul;
+  }
+  const deny = await window.api.publish.deny(res.entries.map((e) => e.path));
+  for (const entry of res.entries) ul.appendChild(buildPubPickRow(dir, entry, depth, deny[entry.path]));
+  return ul;
+}
+
+function buildPubPickRow(dir, entry, depth, denyWhy) {
+  const li = document.createElement('li');
+  const row = document.createElement('div');
+  row.className = 'pub-item';
+  row.style.paddingLeft = (6 + depth * 14) + 'px';
+
+  const key = entry.isDir ? entry.path + '/' : entry.path;
+  const covered = pubCoveredBy(entry.path);
+
+  const twisty = document.createElement('span');
+  twisty.className = 'pub-twisty';
+  twisty.textContent = entry.isDir ? '▸' : '';
+
+  const cb = document.createElement('input');
+  cb.type = 'checkbox';
+  cb.checked = pubPickSet.has(key) || !!covered;
+  cb.disabled = !!denyWhy || !!covered;
+  cb.title = denyWhy
+    ? 'Never published: ' + denyWhy
+    : covered ? 'Already covered by ' + covered : (entry.isDir ? 'Publish this whole folder' : 'Publish this file');
+
+  const icon = document.createElement('span');
+  icon.className = 'pub-icon';
+  icon.textContent = entry.isDir ? '📁' : '📄';
+
+  const label = document.createElement('span');
+  label.className = 'pub-label';
+  label.textContent = entry.name;
+  label.title = entry.path;
+
+  row.append(twisty, cb, icon, label);
+  if (denyWhy) {
+    row.classList.add('denied');
+    const why = document.createElement('span');
+    why.className = 'pub-why';
+    why.textContent = denyWhy;
+    row.appendChild(why);
+  } else if (covered) {
+    row.classList.add('covered');
+  }
+  li.appendChild(row);
+
+  cb.onchange = () => {
+    if (cb.checked) {
+      // A ticked folder supersedes anything already ticked inside it.
+      if (entry.isDir) {
+        for (const e of Array.from(pubPickSet)) {
+          if (e.startsWith(entry.path + '/')) pubPickSet.delete(e);
+        }
+      }
+      pubPickSet.add(key);
+    } else {
+      pubPickSet.delete(key);
+    }
+    pubPickPaint();
+    // Descendants' covered state changed — repaint the open subtree.
+    if (entry.isDir && childUl) { childUl.remove(); childUl = null; twisty.textContent = '▸'; expand(); }
+  };
+
+  let childUl = null; // null = collapsed
+  async function expand() {
+    if (!entry.isDir) return;
+    childUl = await buildPubPickLevel(dir, entry.path, depth + 1);
+    li.appendChild(childUl);
+    twisty.textContent = '▾';
+  }
+
+  if (entry.isDir) {
+    const toggle = async (e) => {
+      e.stopPropagation();
+      if (childUl) { childUl.remove(); childUl = null; twisty.textContent = '▸'; return; }
+      await expand();
+    };
+    twisty.onclick = toggle;
+    label.onclick = toggle;
+  } else {
+    label.onclick = () => { if (!cb.disabled) { cb.checked = !cb.checked; cb.onchange(); } };
+  }
+  return li;
+}
+
+// ---------------------------------------------------------------------------
 // Todo panel
 //
 // A per-hive checklist, docked in the sidebar like Source Control / Explorer.
@@ -6744,6 +7483,7 @@ function setTodoOpen(open) {
     setFilesOpen(false);
     if (typeof setHistoryOpen === 'function') setHistoryOpen(false);
     if (typeof setHmChatOpen === 'function') setHmChatOpen(false);
+    if (typeof setPublishOpen === 'function') setPublishOpen(false);
   }
   todoPanel.classList.toggle('hidden', !open);
   todoToggle.classList.toggle('active', open);
@@ -7140,6 +7880,7 @@ function setHistoryOpen(open) {
     setFilesOpen(false);
     setTodoOpen(false);
     setHmChatOpen(false);
+    if (typeof setPublishOpen === 'function') setPublishOpen(false);
   }
   historyPanel.classList.toggle('hidden', !open);
   historyToggle.classList.toggle('active', open);
