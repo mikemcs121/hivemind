@@ -362,6 +362,10 @@ function setPaneAgent(pane, agent) {
 // string to resume that specific past conversation. An initialPrompt rides
 // along as claude's CLI argument (see spawnPty).
 function respawnPane(pane, { resume, initialPrompt } = {}) {
+  // Any restart re-reads pane.permMode when it spawns, so a queued permission
+  // switch (setPanePerm) is satisfied by this one — drop the pending marker.
+  pane.permPending = null;
+  paintPermSelect(pane);
   window.api.killPty(pane.id);
   window.api.transcript.unbind(pane.id); // release before the id changes
   pane.id = nextId('term');
@@ -371,6 +375,8 @@ function respawnPane(pane, { resume, initialPrompt } = {}) {
   pane.buf = '';
   pane.errored = false;
   pane.errorText = '';
+  pane.needsAuth = false;
+  pane.authText = '';
   pane.hintShown = false;
   try { pane.term.reset(); } catch (_) { /* ignore */ }
   // The new process starts a fresh live session — drop any history view so
@@ -414,10 +420,40 @@ function setPaneCodexModel(pane, model) {
   if (changed && pane.agent === 'codex' && pane.state !== 'dead') respawnPane(pane);
 }
 
+const permLabel = (v) => (PERMS.find((p) => p.value === v) || {}).label || v;
+
+const PERM_SELECT_TITLE =
+  'Permission mode for this thread — changing it restarts the thread ' +
+  '(a thread that\'s mid-turn restarts once the turn ends)';
+
 // Highlight the permission dropdown when it's in a risky mode (bypass), so the
-// thread's mode is obvious at a glance instead of buried in Claude's TUI.
+// thread's mode is obvious at a glance instead of buried in Claude's TUI, and
+// when a switch is queued behind a running turn (permPending) — the dropdown
+// already reads as the new mode, so without this the wait looks like nothing
+// happened.
 function paintPermSelect(pane) {
-  if (pane.permSelect) pane.permSelect.classList.toggle('perm-bypass', pane.permMode === 'bypass');
+  const sel = pane.permSelect;
+  if (!sel) return;
+  sel.classList.toggle('perm-bypass', pane.permMode === 'bypass');
+  sel.classList.toggle('perm-pending', !!pane.permPending);
+  sel.title = pane.permPending
+    ? `${permLabel(pane.permPending)} mode applies when this thread finishes its turn — ` +
+      'switching restarts Claude, so the work in progress isn\'t thrown away'
+    : PERM_SELECT_TITLE;
+}
+
+// Restart a thread so Claude Code picks up pane.permMode. Resume this pane's
+// own session (`--resume <id>`) so a mid-session mode switch doesn't throw the
+// work away — and doesn't `--continue` into another thread's more recent
+// conversation. Resume only once the session file provably exists
+// (sessionBound): fresh threads pre-generate their id for --session-id, but
+// claude doesn't create the conversation until the first message, so `--resume`
+// on an unused thread dies with "No conversation found" and strands the pane in
+// the bare shell. A used thread that never bound (has a caption) falls back to
+// --continue; a fresh, unused thread restarts clean.
+function restartForPerm(pane) {
+  pane.permSetAt = Date.now(); // let the restart settle before trusting the screen
+  respawnPane(pane, { resume: (pane.sessionBound && pane.sessionId) || !!pane.captionText });
 }
 
 function setPanePerm(pane, mode) {
@@ -428,21 +464,34 @@ function setPanePerm(pane, mode) {
   defaultPerm = mode;
   localStorage.setItem('hm.perm', mode);
   if (pane.permSelect && pane.permSelect.value !== mode) pane.permSelect.value = mode;
-  paintPermSelect(pane);
   // Permission mode is a startup flag with no live slash-command equivalent, so
-  // apply a change to a running Claude thread by restarting it. Resume this
-  // pane's own session (`--resume <id>`) so a mid-session mode switch doesn't
-  // throw the work away — and doesn't `--continue` into another thread's more
-  // recent conversation. Resume only once the session file provably exists
-  // (sessionBound): fresh threads pre-generate their id for --session-id, but
-  // claude doesn't create the conversation until the first message, so
-  // `--resume` on an unused thread dies with "No conversation found" and
-  // strands the pane in the bare shell. A used thread that never bound (has a
-  // caption) falls back to --continue; a fresh, unused thread restarts clean.
+  // apply a change to a running Claude thread by restarting it (restartForPerm).
   if (changed && pane.agent === 'claude' && pane.state !== 'dead') {
-    pane.permSetAt = Date.now(); // let the restart settle before trusting the screen
-    respawnPane(pane, { resume: (pane.sessionBound && pane.sessionId) || !!pane.captionText });
+    // …but never mid-turn. Killing a thread while it's working discards the
+    // in-flight turn — it never lands in the session file, so the resumed
+    // thread comes back at an empty composer and reads as "Claude stopped
+    // thinking and just sat there". Queue the switch instead and let
+    // applyPendingPerm fire it once the turn goes quiet. Flipping back to the
+    // mode the process is already running cancels the queued restart.
+    if (pane.state === 'busy') pane.permPending = mode === pane.permRunning ? null : mode;
+    else restartForPerm(pane); // stamps permSetAt so permScreenCheck ignores the dying frame
   }
+  paintPermSelect(pane);
+}
+
+// Fire a permission switch that setPanePerm queued behind a running turn.
+// Attention states wait too: restarting under a blocking menu would throw away
+// the question the thread is asking, so the switch lands after the user answers
+// and that follow-up turn goes quiet.
+function applyPendingPerm(pane) {
+  if (pane.disposed || !pane.permPending) return;
+  if (pane.agent !== 'claude' || pane.state === 'dead') {
+    pane.permPending = null;
+    paintPermSelect(pane);
+    return;
+  }
+  if (pane.state !== 'idle' && pane.state !== 'error') return;
+  restartForPerm(pane); // clears permPending and repaints
 }
 
 // --- Live permission mode ----------------------------------------------------
@@ -481,6 +530,11 @@ function permScreenCheck(pane, screen) {
   // read absence as a mode change.
   if (!mode || mode === pane.permMode) return;
   pane.permMode = mode;
+  // The live process really is in this mode now, so it's also what a queued
+  // switch would be restarting *into* — drop a permPending that just came true
+  // rather than restarting a thread that's already where the user wanted it.
+  pane.permRunning = mode;
+  if (pane.permPending === mode) pane.permPending = null;
   if (pane.permSelect && pane.permSelect.value !== mode) pane.permSelect.value = mode;
   paintPermSelect(pane);
   persistLayout(pane.board.id); // a restart should come back in the mode it ended in
@@ -507,6 +561,12 @@ const STATE_LABEL = {
   idle: 'ready',
   dead: 'exited',
 };
+
+// A thread blocked on a sign-in is "needs you" with a specific cause worth
+// naming in the header — nothing the user does in the chat view will work
+// until they log the CLI back in (see AUTH_PATTERNS / setNeedsAuth).
+const paneStatusLabel = (pane, state) =>
+  (state === 'attention' && pane.needsAuth) ? 'sign in' : (STATE_LABEL[state] || '');
 
 // Interactive menu prompts a CLI is blocked on — Claude Code's permission
 // menus ("❯ 1. Yes") and the Codex CLI's approval modals. These are TUI
@@ -564,6 +624,41 @@ const ERROR_PATTERNS = [
   /\b(401|403)\b[^\n]{0,40}(unauthorized|forbidden|invalid api key)/i,
 ];
 
+// The CLI is blocked on you signing in again — an expired OAuth token, a
+// "run /login" nudge, or the agent booting straight into its login chooser.
+// This needs its own signal: those screens carry no permission-menu chrome and
+// no prose question, so the attention scan reads the thread as an ordinary
+// finished turn — a chat-view user just watches the message they sent go
+// nowhere, with the real prompt hidden in the terminal underneath.
+// Anchored on the CLIs' own chrome (verbatim strings from Claude Code v2.1.22x
+// — "Not logged in · Run /login", "Login expired · Please run /login",
+// "Session expired. Please run /login to sign in again.", "OAuth token revoked
+// · Please run /login", the "Select login method:" chooser) rather than loose
+// phrases like "authentication failed", which an agent could print while
+// working on someone else's auth code. False positives cost a wrongly locked
+// composer, so the bar for adding a pattern here is a string the CLI actually
+// prints — where that string is generic, keep the "·" separator in it.
+const AUTH_PATTERNS = [
+  /\brun \/login\b/i,
+  /\/login\b[^\n]{0,40}\bto (log|sign) ?in\b/i,
+  /Select login method/i,
+  /Claude account with subscription/i,
+  /Anthropic Console account/i,
+  /\bNot logged in\s*[·⋅•]/i,
+  /\bLogin expired\b/i,
+  /\bInvalid API key\s*[·⋅•]/i,
+  /OAuth token (has been |has |was )?(expired|revoked)/i,
+  /(Session|Credentials?) (has |have )?expired/i,
+  /You(?:'re| are) not (logged|signed) in/i,
+  /\bNot signed in to Claude\b/i,
+  /Not authenticated with a claude\.ai account/i,
+  /Authentication (error|failed)\s*[·⋅•]/i,
+  // codex / gemini equivalents
+  /Sign in with ChatGPT/i,
+  /\bcodex login\b/i,
+  /Login with Google/i,
+];
+
 // The shell couldn't launch the startup command — usually `claude` isn't on PATH.
 const CMD_MISSING_PATTERNS = [
   /is not recognized as (an internal or external command|the name of a cmdlet)/i,
@@ -616,10 +711,27 @@ function menuOnScreen(screen) {
     MENU_PATTERNS.some((re) => re.test(joinWrapped(screen.split('\n'))));
 }
 
-// "Something on screen is waiting for the user" — a blocking menu or a
-// finished-turn prose question.
+// AUTH_PATTERNS against the screen, with the same one-hard-wrap tolerance.
+function authPromptOnScreen(screen) {
+  return AUTH_PATTERNS.some((re) => re.test(screen)) ||
+    AUTH_PATTERNS.some((re) => re.test(joinWrapped(screen.split('\n'))));
+}
+
+// The sign-in lines worth quoting on the card: the first matching screen line
+// and the few below it (the login chooser's options, a device code, the URL).
+function authTextFrom(screen) {
+  const lines = screen.split('\n').map((s) => s.trim()).filter(Boolean);
+  const i = lines.findIndex((l, j) =>
+    AUTH_PATTERNS.some((re) => re.test(l) || re.test(l + ' ' + (lines[j + 1] || ''))));
+  if (i < 0) return '';
+  return lines.slice(i, i + 6).join('\n');
+}
+
+// "Something on screen is waiting for the user" — a blocking menu, a
+// finished-turn prose question, or a sign-in the CLI can't get past.
 function promptVisibleOnScreen(screen) {
-  return menuOnScreen(screen) || QUESTION_PATTERNS.some((re) => re.test(screen));
+  return menuOnScreen(screen) || authPromptOnScreen(screen) ||
+    QUESTION_PATTERNS.some((re) => re.test(screen));
 }
 
 const PROBE_MS = 700; // how often a busy pane's screen is checked for a menu
@@ -1043,7 +1155,12 @@ function probeAttention(pane) {
   syncScreenQuestion(pane, screen);
   planScreenCheck(pane, screen);
   permScreenCheck(pane, screen);
-  if (menuOnScreen(screen) || chatHasPendingQuestion(pane)) {
+  // Login screens repaint (a device-code countdown, a spinner while the browser
+  // round-trips), so a thread waiting on a sign-in never goes quiet and would
+  // sit on 'busy' forever — probe for it exactly like a blocking menu.
+  const auth = authPromptOnScreen(screen);
+  setNeedsAuth(pane, auth, auth ? authTextFrom(screen) : '');
+  if (auth || menuOnScreen(screen) || chatHasPendingQuestion(pane)) {
     pane.menuMiss = 0;
     setPaneState(pane, 'attention');
   } else if (pane.state === 'attention' && ++pane.menuMiss >= 2) {
@@ -1079,6 +1196,12 @@ function markActivity(pane, data) {
 
 function evaluateIdle(pane) {
   if (pane.disposed || pane.state === 'dead') return;
+  // Going quiet is exactly when a permission switch queued mid-turn can land
+  // (setPanePerm). Scheduled up front but run a tick later, so it sees the
+  // state this call is about to settle on — and so it still fires when the pane
+  // re-settles into the state it was already in, which `setPaneState`
+  // early-returns on without reaching its own copy of this check.
+  if (pane.permPending) setTimeout(() => applyPendingPerm(pane), 0);
   stopAttentionProbe(pane); // output is quiet — the screen won't change now
   const buf = pane.buf || '';
 
@@ -1113,6 +1236,27 @@ function evaluateIdle(pane) {
       if (i > 0) b = b.slice(i);
       return b.length > 300 ? b.slice(0, 300) + '…' : b;
     }))];
+  // Sign-in prompts are judged before errors: an expired token usually trips an
+  // API-error pattern too (authentication_error), and "log in again" is by far
+  // the more actionable of the two things to tell the user.
+  const authScreen = screenText(pane);
+  const authOnScreen = authPromptOnScreen(authScreen);
+  const authInBuf = blocks.filter((b) => AUTH_PATTERNS.some((re) => re.test(b)));
+  if (authOnScreen || authInBuf.length) {
+    pane.errored = false;
+    pane.errorText = '';
+    // Drop the consumed stream tail: signing in successfully doesn't rewrite
+    // it, so a stale "/login" line would re-flag the thread on every quiet.
+    pane.buf = '';
+    setNeedsAuth(pane, true,
+      (authOnScreen && authTextFrom(authScreen)) || authInBuf.slice(-2).join('\n'));
+    syncScreenQuestion(pane, authScreen);
+    planScreenCheck(pane, authScreen);
+    setPaneState(pane, 'attention');
+    return;
+  }
+  setNeedsAuth(pane, false);
+
   if (errLines.length) {
     pane.errored = true;
     // Keep the matched line for the prompt card (the buffer's tail is usually
@@ -1168,6 +1312,25 @@ function setDoneGlow(pane, on) {
   refreshZoomTabs(pane.board.id);
 }
 
+// "This thread can't do anything until you sign in again." Tracked apart from
+// the generic attention state so the chat view can say exactly that — a login
+// screen has no options for the prompt card's quick keys to press, and a
+// locked composer with no explanation is what sent the user hunting through
+// the terminal view in the first place.
+function setNeedsAuth(pane, on, text) {
+  on = !!on;
+  const changed = !!pane.needsAuth !== on;
+  pane.needsAuth = on;
+  pane.authText = on ? (text || pane.authText || '') : '';
+  if (!changed) return;
+  // The state itself may not be changing (a menu-driven 'attention' that turns
+  // out to be a login screen), so repaint the header and the card from here.
+  if (pane.statusEl && pane.state === 'attention') {
+    pane.statusEl.textContent = paneStatusLabel(pane, 'attention');
+  }
+  updateChatBanner(pane);
+}
+
 function setPaneState(pane, state) {
   if (pane.state === state) return;
   const prev = pane.state;
@@ -1176,14 +1339,18 @@ function setPaneState(pane, state) {
   // The process is gone — no menu can be waiting. Drop the live question
   // chrome so the exit card isn't suppressed by an unanswerable question
   // (the probe is stopped on death; nothing else would clean these up).
-  if (state === 'dead' && pane.chat) {
-    removeScreenQuestion(pane);
-    pane.chat.pendingQuestions.clear();
+  if (state === 'dead') {
+    pane.needsAuth = false;
+    pane.authText = '';
+    if (pane.chat) {
+      removeScreenQuestion(pane);
+      pane.chat.pendingQuestions.clear();
+    }
   }
 
   pane.dot.className = 'dot ' + state;
   if (pane.statusEl) {
-    pane.statusEl.textContent = STATE_LABEL[state] || '';
+    pane.statusEl.textContent = paneStatusLabel(pane, state);
     pane.statusEl.className = 'status ' + state;
   }
   if (state === 'idle' && prev === 'busy') setDoneGlow(pane, true);
@@ -1192,6 +1359,13 @@ function setPaneState(pane, state) {
   refreshZoomTabs(pane.board.id);
   updateChatBanner(pane);
 
+  // The thread is quiet (or gone) — a permission switch queued mid-turn by
+  // setPanePerm can restart it now (`evaluateIdle` schedules the same check;
+  // this one also catches 'dead', which never goes through a quiet period).
+  // Deferred a tick because the restart re-enters setPaneState, and this call
+  // hasn't finished painting yet.
+  if (pane.permPending) setTimeout(() => applyPendingPerm(pane), 0);
+
   // Notify on the transitions that pull a human back: a terminal asking for
   // input, hitting an error, or finishing a turn while the window is backgrounded.
   const focusedHere = pane === focusedPane && document.hasFocus();
@@ -1199,7 +1373,7 @@ function setPaneState(pane, state) {
   if (state === 'error') {
     notify(pane, 'hit an error');
   } else if (state === 'attention') {
-    notify(pane, 'needs your input');
+    notify(pane, pane.needsAuth ? 'needs you to sign in again' : 'needs your input');
   } else if (state === 'idle' && prev === 'busy' && !document.hasFocus()) {
     notify(pane, 'finished its turn');
   }
@@ -1948,7 +2122,7 @@ const HM_COMMANDS = [
       /^(?:set\s+)?(?:the\s+)?permissions?(?:\s+mode)?\s+(?:to\s+)?(.+)$/i,
       /^(?:enter\s+|go\s+to\s+|switch\s+to\s+)?(plan|bypass|auto|accept\s*edits|default)\s+mode$/i,
     ],
-    help: '<strong>plan / auto / bypass / accept edits / default mode</strong> — this Claude thread\'s permission mode (restarts it, resuming the conversation).',
+    help: '<strong>plan / auto / bypass / accept edits / default mode</strong> — this Claude thread\'s permission mode (restarts it, resuming the conversation; a thread that\'s mid-turn switches once the turn ends).',
     run(m, { pane }) {
       if (!pane) { hmToast('No thread to change.', 'err'); return; }
       if (pane.agent !== 'claude') { hmToast('Permission modes only apply to Claude threads.', 'err'); return; }
@@ -1959,12 +2133,16 @@ const HM_COMMANDS = [
         : /^bypass/.test(q) ? 'bypass'
         : /^accept/.test(q) ? 'acceptEdits' : null;
       if (!v) { hmToast('Permission modes: Default, Accept Edits, Auto, Plan, Bypass.', 'err'); return; }
-      const label = (PERMS.find((p) => p.value === v) || {}).label || v;
+      const label = permLabel(v);
       if (pane.permMode === v) { hmToast('Already in ' + label + ' mode.'); return; }
+      const wasBusy = pane.state === 'busy';
       const restarting = pane.state !== 'dead';
       setPanePerm(pane, v);
       persistLayout(pane.board.id);
-      hmToast('Permission mode: ' + label + (restarting ? ' — restarting and resuming this conversation.' : '.'));
+      hmToast('Permission mode: ' + label + (
+        !restarting ? '.'
+        : wasBusy ? ' — takes effect when this thread finishes its turn.'
+        : ' — restarting and resuming this conversation.'));
     },
   },
   {
@@ -4164,6 +4342,38 @@ function continueHistorySession(pane, sess, text) {
   respawnPane(pane, { resume: id, initialPrompt: text });
 }
 
+// A sent message can go nowhere at all — a login screen swallowed the
+// keystrokes, the TUI is wedged behind something the screen scans don't
+// recognize, the process is a zombie. Nothing else in the chat view would say
+// so: the bubble just sits there looking sent, which is exactly the "I hit
+// enter and it sat there" case. So if the transcript hasn't echoed the message
+// back and the thread isn't working on it, mark the bubble and point at the
+// terminal. A busy pane is answering (however slowly) and is never flagged.
+const ECHO_STALL_MS = 12000;
+
+function flagStalledEcho(pane, p) {
+  const c = pane.chat;
+  if (pane.disposed || !c || c.viewingHistory || !c.pendingEcho.includes(p)) return;
+  if (pane.state === 'busy') return;
+  const row = c.byKey.get(p.key);
+  const bubble = row && row.querySelector('.chat-bubble');
+  if (!bubble) return;
+  let note = bubble.querySelector('.chat-echo-note');
+  if (!note) {
+    note = document.createElement('div');
+    note.className = 'chat-echo-note';
+    bubble.appendChild(note);
+  }
+  note.classList.add('stalled');
+  note.textContent = pane.needsAuth
+    ? '⚠ not delivered — this thread needs you to sign in again'
+    : '⚠ no response yet — the thread may be waiting on something in the terminal';
+  const btn = document.createElement('button');
+  btn.textContent = 'Open terminal';
+  btn.onclick = (e) => { e.stopPropagation(); setPaneView(pane, 'term'); };
+  note.appendChild(btn);
+}
+
 // Optimistic echo: show the message immediately; the transcript's real user
 // line replaces it (confirmEcho) when it lands.
 function addEchoRow(pane, text) {
@@ -4179,7 +4389,9 @@ function addEchoRow(pane, text) {
       row.firstChild.appendChild(note);
     }
   });
-  c.pendingEcho.push({ key, text });
+  const p = { key, text, timer: null };
+  p.timer = setTimeout(() => { p.timer = null; flagStalledEcho(pane, p); }, ECHO_STALL_MS);
+  c.pendingEcho.push(p);
   c.pinned = true;
   c.list.scrollTop = c.list.scrollHeight;
 }
@@ -4191,6 +4403,7 @@ function confirmEcho(pane, text) {
   if (i === -1) i = 0; // the TUI can reshape the text slightly — this real user
                        // line still corresponds to the oldest unconfirmed send
   const [p] = c.pendingEcho.splice(i, 1);
+  clearTimeout(p.timer);
   const row = c.byKey.get(p.key);
   if (row) row.remove();
   c.byKey.delete(p.key);
@@ -4203,6 +4416,8 @@ function confirmEcho(pane, text) {
 const PROMPT_CARD_KEY = 'attn-prompt';
 const PROMPT_LOCK_PLACEHOLDER =
   'Answer the prompt above to continue — open the terminal to type a custom reply';
+const AUTH_LOCK_PLACEHOLDER =
+  'Sign in again in the terminal to continue — messages sent from here can\'t reach the thread yet';
 
 // The text shown in the inline prompt card: the process-exit note, the last
 // error lines, or the prompt scraped from the visible screen (starting at the
@@ -4211,6 +4426,10 @@ const PROMPT_LOCK_PLACEHOLDER =
 // is the select-menu footer itself, where the content sits above it).
 function promptCardText(pane, state) {
   if (state === 'dead') return 'The process behind this thread exited.';
+  if (state === 'attention' && pane.needsAuth) {
+    return pane.authText || authTextFrom(screenText(pane)) ||
+      'The terminal is waiting for you to sign in.';
+  }
   if (state === 'error') {
     if (pane.errorText) return pane.errorText;
     const lines = (pane.buf || '').split('\n').map((s) => s.trim()).filter(Boolean).slice(-3);
@@ -4241,19 +4460,36 @@ function promptCardText(pane, state) {
 function renderPromptCard(pane, state) {
   const c = pane.chat;
   const isErr = state === 'error' || state === 'dead';
+  const needsAuth = state === 'attention' && !!pane.needsAuth;
   const text = promptCardText(pane, state);
   const row = upsertChatRow(pane, PROMPT_CARD_KEY, 'prompt', (r) => {
     r.innerHTML = '';
     const card = document.createElement('div');
-    card.className = 'chat-prompt-card' + (isErr ? ' error' : '');
+    card.className = 'chat-prompt-card' + (isErr ? ' error' : '') + (needsAuth ? ' auth' : '');
+    if (needsAuth) {
+      const head = document.createElement('div');
+      head.className = 'chat-prompt-head';
+      head.textContent = '🔑 Sign in to continue';
+      card.appendChild(head);
+    }
     const body = document.createElement('pre');
     body.className = 'chat-prompt-text';
     body.textContent = text;
     card.appendChild(body);
+    if (needsAuth) {
+      const note = document.createElement('div');
+      note.className = 'chat-prompt-note';
+      note.textContent =
+        `${agentFor(pane.agent).label} is asking you to sign in again. Open the ` +
+        'terminal to finish signing in — messages sent from the chat stay in the ' +
+        'composer until this thread is back.';
+      card.appendChild(note);
+    }
     const foot = document.createElement('div');
     foot.className = 'chat-prompt-foot';
-    // Errors and process exits have nothing to answer — only offer the terminal.
-    if (!isErr) {
+    // Errors, process exits and sign-in screens have nothing the quick keys can
+    // usefully press — only offer the terminal.
+    if (!isErr && !needsAuth) {
       const keys = document.createElement('span');
       keys.className = 'chat-prompt-keys';
       // Digit keys only make sense on a numbered menu — a prose "(y/n)" or
@@ -4285,7 +4521,7 @@ function renderPromptCard(pane, state) {
     }
     const openTerm = document.createElement('button');
     openTerm.className = 'chat-prompt-open';
-    openTerm.textContent = 'Open terminal';
+    openTerm.textContent = needsAuth ? 'Open terminal to sign in' : 'Open terminal';
     openTerm.onclick = (e) => { e.stopPropagation(); setPaneView(pane, 'term'); };
     foot.appendChild(openTerm);
     card.appendChild(foot);
@@ -4315,7 +4551,9 @@ function updateComposerLock(pane) {
   c.sendBtn.disabled = locked;
   c.wrap.classList.toggle('composer-locked', locked);
   if (c.viewingHistory) return;
-  c.input.placeholder = locked ? PROMPT_LOCK_PLACEHOLDER : CHAT_PLACEHOLDER;
+  c.input.placeholder = locked
+    ? (pane.needsAuth ? AUTH_LOCK_PLACEHOLDER : PROMPT_LOCK_PLACEHOLDER)
+    : CHAT_PLACEHOLDER;
 }
 
 // Mirror the pane's heuristic state into the chat view: when the hidden TUI is
@@ -4343,11 +4581,17 @@ function updateChatBanner(pane) {
   // The exited-process card must never be suppressed by a question that can
   // no longer be answered (death also clears pendingQuestions — this is
   // belt-and-braces for ordering).
-  if (!show || (state !== 'dead' && chatHasPendingQuestion(pane))) { removePromptCard(pane); return; }
+  // A sign-in card outranks a pending question the same way the exit card does:
+  // the question can't be answered until the CLI is logged back in.
+  if (!show || (state !== 'dead' && !pane.needsAuth && chatHasPendingQuestion(pane))) {
+    removePromptCard(pane);
+    return;
+  }
   // In the two-tick window after a menu leaves the screen the state still
   // reads 'attention' but there's nothing to answer — a card rendered now
-  // would show spinner chrome with live keys.
-  if (state === 'attention' && !promptVisibleOnScreen(screenText(pane))) {
+  // would show spinner chrome with live keys. (A sign-in can be detected off
+  // the output buffer with nothing left on screen, so it skips this check.)
+  if (state === 'attention' && !pane.needsAuth && !promptVisibleOnScreen(screenText(pane))) {
     removePromptCard(pane);
     return;
   }
@@ -4906,6 +5150,9 @@ function spawnPanePty(pane, { resume, initialPrompt } = {}) {
     // (onEntries) flip this on once claude writes it.
     pane.sessionBound = isSessionId(resume);
   }
+  // The mode this process is actually started in — pane.permMode can run ahead
+  // of it while a switch waits for a turn to end (see setPanePerm).
+  pane.permRunning = pane.agent === 'claude' ? pane.permMode : 'default';
   window.api.spawnPty({
     id: pane.id,
     cwd: pane.board.dir,
@@ -4915,7 +5162,7 @@ function spawnPanePty(pane, { resume, initialPrompt } = {}) {
     model: pane.agent === 'claude' ? pane.model
          : pane.agent === 'codex' ? pane.codexModel
          : 'default',
-    permissionMode: pane.agent === 'claude' ? pane.permMode : 'default',
+    permissionMode: pane.permRunning,
     resume: resume || false, // true → --continue, session-id string → --resume <id>
     initialPrompt: ((pane.agent === 'claude' || pane.agent === 'codex') && initialPrompt) || undefined,
     sessionId: (pane.agent === 'claude' && !resume && pane.sessionId) || undefined,
@@ -5027,7 +5274,7 @@ function createPane(board, col, opts = {}) {
   // Permission mode this thread starts Claude Code in (see setPanePerm).
   const permSelect = document.createElement('select');
   permSelect.className = 'model-select perm-select';
-  permSelect.title = 'Permission mode for this thread — changing it restarts the thread';
+  permSelect.title = PERM_SELECT_TITLE;
   for (const p of PERMS) {
     const opt = document.createElement('option');
     opt.value = p.value;
@@ -5114,6 +5361,9 @@ function createPane(board, col, opts = {}) {
     findBar, findInput, viewBtn, flex: opts.flex || 1, col, board, disposed: false,
     name: startName, state: null, buf: '', idleTimer: null, probeTimer: null, menuMiss: 0,
     fontSize: startFont, agent: startAgent, model: startModel, codexModel: startCodexModel, permMode: startPerm, captionText: '', capBuf: '',
+    // permRunning: mode the live process was spawned in; permPending: a mode
+    // switch waiting for the current turn to end (see setPanePerm).
+    permRunning: null, permPending: null,
     errored: false, hintShown: false,
     // Cost-estimate accumulator (see costIngest). Rebuilt from transcript
     // backfill on every bind; costFile detects /clear session rollovers.
@@ -5204,7 +5454,17 @@ function createPane(board, col, opts = {}) {
 
   // Permission dropdown: change the mode Claude starts in (restarts the thread).
   permSelect.addEventListener('mousedown', (e) => e.stopPropagation());
-  permSelect.onchange = (e) => { e.stopPropagation(); setPanePerm(pane, permSelect.value); persistLayout(board.id); focusPane(pane); };
+  permSelect.onchange = (e) => {
+    e.stopPropagation();
+    setPanePerm(pane, permSelect.value);
+    // The switch restarts the thread, so say so when it can't happen yet —
+    // a dashed dropdown alone doesn't explain why the mode isn't live.
+    if (pane.permPending) {
+      hmToast(permLabel(pane.permPending) + ' mode applies when this thread finishes its turn.');
+    }
+    persistLayout(board.id);
+    focusPane(pane);
+  };
 
   // Drag-and-drop / paste an image into the pane. We can't feed raw image bytes
   // through the PTY, so instead we drop the image to a file and type its path
