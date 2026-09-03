@@ -94,8 +94,10 @@ The complete channel-by-channel table lives in `docs/main-process.md`. Groups:
 1. **Help modal sync:** any user-facing feature/shortcut/button change must
    update `#help-modal` in `src/index.html` in the same change (CLAUDE.md
    rule). Exception: `#hm-cmd-list` is auto-generated from `HM_COMMANDS`.
-2. **The user's live instance is usually running — never kill electron.exe by
-   name.** Isolate tests with `HM_USER_DATA` (see `docs/development.md`).
+2. **The user's live instance is usually running — never kill Hivemind.exe or
+   electron.exe by name.** It runs as `Hivemind.exe` (a hard link to the bundled
+   electron.exe) precisely so other hives' by-name Electron kills miss it.
+   Isolate tests with `HM_USER_DATA` (see `docs/development.md`).
 3. **Renderer reload vs full relaunch:** main-process files (main.js,
    transcript.js, git.js, …) only take effect after a full app relaunch.
 4. **Mis-bound transcript ≠ mis-delivered prompt.** Prompt delivery goes

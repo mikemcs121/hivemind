@@ -7,15 +7,21 @@ a specific area.
 ## Running the app
 
 - Dev: `npm start` (runs `electron .` from `C:\Projects\hivemind`).
-- End-user launch: `Hivemind.cmd` or the Desktop shortcut — uses the bundled
-  Electron runtime, no global Node needed.
+- End-user launch: `Hivemind.cmd` or the Desktop shortcut — runs the bundled
+  Electron runtime as `node_modules\electron\dist\Hivemind.exe`, no global Node
+  needed. `Hivemind.exe` is a hard link to `electron.exe` that `Hivemind.cmd`
+  (re)creates whenever it is missing or its size no longer matches. It exists so
+  the app has its own image name: other hives building Electron apps kill
+  Electron by name (`taskkill /IM electron.exe`, `Get-Process electron |
+  Stop-Process`), and that took the live instance down twice on 2026-09-03.
 - The packaged portable exe lives in `dist/` after a build (see
   `docs/build-and-release.md`).
 
 ## The user's live instance — never kill it
 
-The user usually has a live Hivemind running (`electron "C:\Projects\hivemind"`,
-userData in `%APPDATA%\hivemind`). **Never kill electron.exe by name.** Multiple
+The user usually has a live Hivemind running (`Hivemind.exe "C:\Projects\hivemind"`,
+userData in `%APPDATA%\hivemind`). **Never kill Hivemind.exe or electron.exe by
+name.** Multiple
 Hivemind threads (the user's own agents) may also be editing this repo in
 parallel — check `git status` and file mtimes, and re-read files between your
 edits so you don't clobber concurrent changes.
@@ -64,7 +70,8 @@ be compiled from source:
   binaries must be fetched manually:
   - PTY: `cd node_modules\@homebridge\node-pty-prebuilt-multiarch` then
     `node ..\..\prebuild-install\bin.js --runtime electron --target 29.4.6 --arch x64`
-  - Electron itself: `node node_modules\electron\install.js`
+  - Electron itself: `node node_modules\electron\install.js`, then run
+    `Hivemind.cmd` once so `dist\Hivemind.exe` is re-linked to the new binary
 
 ## Project conventions
 

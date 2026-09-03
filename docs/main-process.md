@@ -39,7 +39,7 @@ longer relying on the Electron 29 default) — it can only do what `window.api` 
 |---|---|---|
 | `main.js` | ~970 lines | Main process: window, PTYs, IPC, protocol, autocorrect |
 | `preload.js` | ~207 lines | Context bridge exposing `window.api` |
-| `Hivemind.cmd` | 4 lines | Launcher: runs bundled `node_modules\electron\dist\electron.exe` on the repo dir with `--disable-gpu`; no global Node needed |
+| `Hivemind.cmd` | ~35 lines | Launcher: hard-links bundled `electron.exe` to `dist\Hivemind.exe` (own image name, so by-name Electron kills miss the app) and runs it on the repo dir with `--disable-gpu`; no global Node needed |
 | `package.json` | ~53 lines | `"main": "main.js"`; `npm start` → `electron .`; electron-builder config (nsis + portable targets, `asarUnpack` for models and transformers.js) |
 | `git.js`, `files.js`, `plan.js`, `todo.js`, `promptHistory.js`, `publish.js`, `build.js`, `usage.js`, `transcript.js`, `updater.js` | — | Helper modules required by `main.js:104`–`113`; each backs a family of IPC channels |
 

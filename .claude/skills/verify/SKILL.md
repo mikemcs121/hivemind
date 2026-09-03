@@ -5,9 +5,10 @@ description: Launch an isolated Hivemind instance and drive its UI over CDP to v
 
 # Verifying Hivemind changes live
 
-The user's live instance is usually running (`electron "C:\Projects\hivemind"`,
-userData in `%APPDATA%\hivemind`). **Never kill it.** Test runs are isolated via
-`HM_USER_DATA`.
+The user's live instance is usually running (`Hivemind.exe "C:\Projects\hivemind"`
+— a hard link to the bundled electron.exe, userData in `%APPDATA%\hivemind`).
+**Never kill it, and never kill Hivemind.exe or electron.exe by name.** Test runs
+are isolated via `HM_USER_DATA`.
 
 ## Launch an isolated instance
 
@@ -45,3 +46,6 @@ Kill only the test instance — match on the debug port, never by name alone:
 `Get-CimInstance Win32_Process -Filter "Name='electron.exe'" | Where-Object { $_.CommandLine -match '9223' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force }`
 Child processes (gpu/renderer) die with the main; verify the live instance
 (`--user-data-dir=%APPDATA%\hivemind` in its children's command lines) survived.
+`npx electron .` test instances are `electron.exe`; the live one is `Hivemind.exe`,
+so it never matches that filter — keep the port match anyway, other hives' test
+Electrons are electron.exe too.

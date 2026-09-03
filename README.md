@@ -31,7 +31,7 @@ context.
 
 Double-click **`Hivemind.cmd`**, or the **Hivemind** shortcut on your Desktop.
 (No global Node install is needed to *run* it — it uses the bundled Electron
-runtime.)
+runtime, launched as `Hivemind.exe` so the app has its own name in Task Manager.)
 
 From a terminal you can also do:
 
