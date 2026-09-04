@@ -55,6 +55,8 @@ one agent thread:
 | All UI (boards, panes, chat, modals, shortcuts) | `src/renderer.js`, `src/index.html`, `src/styles.css` | `docs/renderer.md` |
 | Git panel + file explorer backends | `git.js`, `files.js` | `docs/git-and-files.md` |
 | Publish panel: FTP upload + stored credentials | `publish.js` | `docs/publish.md` |
+| ChatGPT accounts: one Codex CLI home per login, chosen per thread | `codex.js` | `docs/main-process.md` |
+| Agent model discovery: installed CLI catalogs + safe fallbacks | `agent-models.js` | `docs/main-process.md` |
 | Per-project sidecars: plans, todos, prompt history, transcripts, usage | `plan.js`, `todo.js`, `promptHistory.js`, `transcript.js`, `usage.js` | `docs/sidecar-modules.md` |
 | Voice typing (offline STT) | `src/voice-worker.js`, `scripts/fetch-model.mjs`, `models/` | `docs/voice-dictation.md` |
 | Build, packaging, releases, auto-update | `build.js`, `updater.js`, `scripts/before-build.js`, package.json `build` | `docs/build-and-release.md` |
@@ -69,6 +71,8 @@ The complete channel-by-channel table lives in `docs/main-process.md`. Groups:
 - `git:*`, `gh:*`, `hm:interpret` — source control (see `docs/git-and-files.md`)
 - `files:*`, `watch:set`/`fs:changed` — file explorer + live refresh
 - `publish:*` + `publish:progress` push — FTP publishing (see `docs/publish.md`)
+- `codex:*` — named ChatGPT accounts (Codex CLI homes; see `docs/main-process.md`)
+- `agents:models` — sanitized Claude/Codex/Grok model catalogs from the installed CLIs
 - `plan:*`, `todo:*`, `promptHistory:*`, `usage:get` — sidecars
 - `transcript:*` + `transcript:entries`/`transcript:status` pushes — chat view
 - `stt:ensureModel`/`stt:downloadProgress` — voice model downloads; `stt:nativeLoad`/`stt:nativeTranscribe`/`stt:nativeStop` — the sherpa-onnx native speech engine (`stt-native.js` utility process)
@@ -82,10 +86,10 @@ The complete channel-by-channel table lives in `docs/main-process.md`. Groups:
 
 | Location | Contents |
 |---|---|
-| userData (`%APPDATA%\hivemind`, or `HM_USER_DATA` override) | `boards.json` (boards + layouts), `publish.json` (per-project FTP settings + DPAPI-encrypted password — deliberately *not* in the project), downloaded STT models under `models/` |
+| userData (`%APPDATA%\hivemind`, or `HM_USER_DATA` override) | `boards.json` (boards + layouts), `publish.json` (per-project FTP settings + DPAPI-encrypted password — deliberately *not* in the project), `codex-accounts.json` + `codex-homes/<id>/` (one Codex CLI home per named ChatGPT account — same reasoning: credentials never in the project tree), downloaded STT models under `models/` |
 | `<project>\.hivemind\` | per-project sidecars: `todos.json`, `prompt-history.json`, `plans/` (`kanban.json` is legacy — nothing reads it) |
 | `~/.claude/projects/<encoded-dir>/*.jsonl` | Claude Code session transcripts (read-only input to the chat view) |
-| `~/.codex/sessions/YYYY/MM/DD/` | Codex rollouts (same role for Codex panes) |
+| `<codex home>/sessions/YYYY/MM/DD/` | Codex rollouts (same role for Codex panes). The home is `~/.codex` unless the thread runs on a named ChatGPT account, which has its own (`codex.js`) |
 | `models/` (repo / asar-unpacked) | bundled Moonshine + Silero VAD ONNX models |
 | `dist/` | build artifacts (`Hivemind <ver> portable.exe`) |
 

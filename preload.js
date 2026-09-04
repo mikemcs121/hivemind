@@ -142,6 +142,22 @@ contextBridge.exposeInMainWorld('api', {
     },
   },
 
+  // ChatGPT accounts: named Codex CLI homes, one signed-in account each. A
+  // thread names the account by id; main resolves it to a CODEX_HOME path.
+  codex: {
+    accounts: () => ipcRenderer.invoke('codex:accounts'),
+    addAccount: (label) => ipcRenderer.invoke('codex:addAccount', { label }),
+    renameAccount: (id, label) => ipcRenderer.invoke('codex:renameAccount', { id, label }),
+    removeAccount: (id) => ipcRenderer.invoke('codex:removeAccount', { id }),
+    signOutAccount: (id) => ipcRenderer.invoke('codex:signOutAccount', { id }),
+  },
+
+  // Provider-owned model catalogs (sanitized to ids and display labels in
+  // main). Codex discovery is account-aware because plans can expose different
+  // models; `force` bypasses the short cache when the user refreshes settings.
+  agentModels: (provider, codexAccount, force) =>
+    ipcRenderer.invoke('agents:models', { provider, codexAccount, force: !!force }),
+
   // Plan pane. `cwd` is the active board's project directory; `planId` keys the
   // per-thread plan file the thread writes and the comments Hivemind attaches.
   plan: {

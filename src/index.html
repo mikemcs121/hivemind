@@ -351,12 +351,36 @@
               <label>ChatGPT model
                 <select id="set-default-codex-model"></select>
               </label>
+              <label>ChatGPT account
+                <select id="set-default-codex-account"></select>
+              </label>
+              <label>Grok model
+                <select id="set-default-grok-model"></select>
+              </label>
               <label>Font size
                 <input id="set-default-font" type="number" min="8" max="32" step="1" />
               </label>
               <small>Applies to threads you open from now on. Existing threads keep
                 their own model and size — change those from the thread header, or with
                 A−/A+ and Ctrl+scroll.</small>
+              <button id="refresh-agent-models" class="pill-btn">Refresh agent models</button>
+              <small id="agent-model-status">Checking installed agents…</small>
+            </div>
+
+            <div class="settings-group">
+              <div class="settings-group-title">ChatGPT accounts</div>
+              <div id="codex-accounts-list" class="acct-list"></div>
+              <div class="acct-add">
+                <input id="codex-account-name" type="text" maxlength="40" placeholder="Account name (e.g. Work)" />
+                <button id="codex-account-add" class="pill-btn">Add account</button>
+              </div>
+              <small>Each account is a separate ChatGPT login. Pick one per thread from
+                the <strong>account dropdown</strong> in a ChatGPT thread's header — two threads
+                can run two different accounts at once. To sign a new account in, start a
+                ChatGPT thread on it and follow Codex's sign-in screen; the browser you're
+                signed into that ChatGPT account with is the one to approve it in.
+                <em>Default</em> is whatever <code>codex login</code> put in <code>~/.codex</code>
+                and can't be removed.</small>
             </div>
 
             <div class="settings-group">
@@ -538,7 +562,7 @@
                 <strong><svg class="help-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 11l3 3L22 4" /><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11" /></svg> Todo</strong>
                 button to keep a checklist for the hive, and the
                 <strong><svg class="help-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9" /><polyline points="12 7 12 12 15.5 14" /></svg> Prompt History</strong>
-                button to see the prompts you've sent in this hive — click one to jump to that prompt in the conversation where it appears (the thread is focused and the message flashes briefly). Hover an entry for its <strong>🎤</strong> button to re-speak that prompt in voice training (read it aloud and accept dictionary fixes for anything misheard), <strong>↩</strong> to send it again to the focused thread, or <strong>🗑</strong> to remove it from the list.</li>
+                button to see the prompts you've sent in this hive — click one to jump to that prompt in the conversation where it appears (the thread is focused and the message flashes briefly). Use the visible <strong>➤</strong> button to send it again to the focused thread. Hover an entry for <strong>🎤</strong> to re-speak that prompt in voice training (read it aloud and accept dictionary fixes for anything misheard), or <strong>🗑</strong> to remove it from the list.</li>
               <li><strong>Drag the sidebar's right edge</strong> to make it (and the Explorer, Source Control, Publish, Todo, Prompt History and 🐝 Chat with Hivemind panels docked in it) wider or narrower. Double-click the edge to reset the width; it's remembered across restarts.</li>
             </ol>
           </div>
@@ -549,8 +573,9 @@
               <li><strong>🎤 Voice typing</strong> — dictate into the focused thread; speech is transcribed on-device (English, fully offline) and typed at the cursor when you pause. Toggle with the <kbd>~</kbd> key. You can start speaking right away — words spoken while the model loads are kept, and toggling off still types what you had just said. If the HUD says “Didn’t catch that”, the model heard you but couldn’t make out words. In <strong>⚙ Settings → Voice</strong> you can pick the <strong>recognition model</strong> (the default Moonshine model is bundled; others download once, then run offline — <strong>Parakeet</strong>, by far the most accurate, is a ~630&nbsp;MB one-time download that runs natively on your CPU) and use the user dictionary to fix words it mishears. Hivemind also <strong>learns from your fixes</strong>: when you edit dictated text in a composer before sending and make the same fix twice, a small offer appears to add that correction to the dictionary with one click (✕ declines it for good). You can also <strong>train the dictionary proactively</strong>: click <strong>🎓 Train dictionary</strong> in <strong>⚙ Settings → Voice</strong> (or say <em>“Hivemind, train dictionary”</em>) to read short practice sentences built from your own prompt history — Hivemind compares what it heard with the sentence and proposes corrections you can add with one click.</li>
               <li>Every new thread gets a short random <strong>name</strong> — <em>Leo</em>, <em>Nina</em>, … — shown as its header title. Use it to address the thread in Hivemind commands: <em>“Hivemind, run the tests in Leo”</em> or <em>“Hivemind, tell Leo to fix the login bug”</em>. Double-click the name to rename a thread.</li>
               <li>Just below the header, the chat view's top bar shows a <strong>caption</strong> built from the last prompt you send the thread (to the left of <strong>🕘 History</strong>), so you can see what every thread is working on at a glance. Short replies like <em>yes</em>, <em>no</em> or a menu number don't replace the caption, so answering a prompt keeps the real task on show.</li>
-              <li>Each thread can run a different <strong>agent</strong> — pick <em>Claude</em>, <em>ChatGPT</em>, <em>Gemini</em>, or <em>Grok</em> from the dropdown in the thread header. One hive can mix them (e.g. three Claude threads and one ChatGPT thread). Switching a running thread restarts it with the new agent. ChatGPT needs OpenAI's Codex CLI (<code>npm install -g @openai/codex</code>), Gemini needs Google's Gemini CLI (<code>npm install -g @google/gemini-cli</code>) and Grok needs xAI's Grok CLI (<code>npm install -g @xai-official/grok</code>) installed and signed in.</li>
-              <li>Claude and ChatGPT threads each have a <strong>model</strong> dropdown in the header. On a Claude thread, switching a running thread changes the model live (via <code>/model</code>); on a ChatGPT thread the model is a Codex startup flag, so switching a running thread <strong>restarts it</strong> with a fresh conversation. The last choice is remembered as the default for new threads of that agent (also settable in <strong>⚙ Settings → General</strong>). Gemini and Grok threads have no model dropdown.</li>
+              <li>Each thread can run a different <strong>agent</strong> — pick <em>Claude</em>, <em>ChatGPT</em>, <em>Gemini</em>, or <em>Grok</em> from the dropdown in the thread header. One hive can mix them (e.g. three Claude threads and one ChatGPT thread). Switching a running thread restarts it with the new agent. ChatGPT needs OpenAI's Codex CLI (<code>npm install -g @openai/codex</code>), Gemini needs Google's Gemini CLI (<code>npm install -g @google/gemini-cli</code>), and Grok needs the official Grok Build installer from <code>https://x.ai/cli</code>. Launch each CLI once and complete its sign-in flow.</li>
+              <li>Claude, ChatGPT, and Grok threads have a <strong>model</strong> dropdown. Hivemind refreshes models from the installed CLIs at startup and when Settings opens; use <strong>Refresh agent models</strong> after a new release or login. Claude's rolling aliases automatically track their latest family versions. Grok switches live via <code>/model</code>; ChatGPT restarts with a fresh conversation because its model is selected at startup. Gemini currently has no model dropdown.</li>
+              <li>ChatGPT threads also have an <strong>account</strong> dropdown, so different threads can run as <strong>different ChatGPT logins at the same time</strong>. Add accounts in <strong>⚙ Settings → General → ChatGPT accounts</strong> — each one gets its own private Codex home, seeded with a copy of your Codex settings but no credentials. To sign a new account in, pick it on a ChatGPT thread and follow Codex's sign-in screen (approve it in a browser signed into that ChatGPT account); an account with no stored login is marked <em>(sign in)</em> and its dropdown is highlighted. The account is read when Codex starts, so switching it <strong>restarts the thread</strong> with a fresh conversation. <em>Default</em> is whatever <code>codex login</code> put in <code>~/.codex</code>. Settings also has <em>Sign out</em> (drops the stored login, keeps the account) and <em>Remove</em> (deletes the account's Codex home from this machine; the ChatGPT account itself is untouched).</li>
               <li>Each Claude thread has a <strong>permission mode</strong> dropdown in its header — <em>Default</em>, <em>Accept&nbsp;Edits</em>, <em>Auto</em>, <em>Plan</em>, or <em>Bypass&nbsp;⚠</em> — so you can see and set the mode without hunting for it in Claude's own display. It's handed to Claude Code as a startup flag (<em>Bypass</em> skips the accept-permissions screen entirely). Since Claude has no command to change mode mid-session, switching a running thread restarts it (resuming the conversation when there is one). If the thread is <strong>mid-turn</strong>, the switch waits until the turn ends rather than killing the work in flight — the dropdown goes dashed and dimmed while it's pending, and the restart happens as soon as the thread is done (or as soon as you've answered, if it stops to ask you something). The dropdown also <strong>follows the thread</strong>: if the mode changes inside Claude — you press <kbd>Shift</kbd>+<kbd>Tab</kbd> in the terminal, or approving a plan moves the thread to auto/manual — the dropdown updates to match, without restarting anything. <em>Bypass</em> turns the dropdown amber as a reminder that permissions are being skipped. The choice is remembered as the default for new threads.</li>
               <li>When a thread <strong>finishes its turn</strong>, its whole pane pulses green and the header status shows <strong>✓ done</strong> until you click into that thread — so completed work stands out across a busy hive. The hive list's status dot and the maximize tab strip's dots pulse green too. (Threads that need an answer or hit an error still pulse amber/red as before.)</li>
               <li>Each Claude thread's header shows a <strong>~$ cost estimate</strong>: what the conversation so far would have cost at Claude API list prices if it weren't covered by your plan (it's informational — nothing is billed). Hover it for a per-model breakdown of tokens and cost. It counts the whole conversation (including what happened before a restart or resume), resets when <code>/clear</code> starts a new session, and doesn't appear on ChatGPT, Gemini or Grok threads.</li>
@@ -734,7 +759,8 @@
 
           <div class="settings-group">
             <div class="settings-group-title">More</div>
-            <p class="help-note">Open <strong>⚙ Settings</strong> for the theme, defaults, notifications, and voice options.
+            <p class="help-note">Open <strong>⚙ Settings</strong> for the theme, defaults, ChatGPT accounts,
+              notifications, and voice options.
               The <strong>General</strong> tab's <strong>About</strong> section shows the Hivemind version you're running.</p>
           </div>
         </div>

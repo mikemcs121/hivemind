@@ -41,7 +41,7 @@ longer relying on the Electron 29 default) — it can only do what `window.api` 
 | `preload.js` | ~207 lines | Context bridge exposing `window.api` |
 | `Hivemind.cmd` | ~35 lines | Launcher: hard-links bundled `electron.exe` to `dist\Hivemind.exe` (own image name, so by-name Electron kills miss the app) and runs it on the repo dir with `--disable-gpu`; no global Node needed |
 | `package.json` | ~53 lines | `"main": "main.js"`; `npm start` → `electron .`; electron-builder config (nsis + portable targets, `asarUnpack` for models and transformers.js) |
-| `git.js`, `files.js`, `plan.js`, `todo.js`, `promptHistory.js`, `publish.js`, `build.js`, `usage.js`, `transcript.js`, `updater.js` | — | Helper modules required by `main.js:104`–`113`; each backs a family of IPC channels |
+| `git.js`, `files.js`, `plan.js`, `todo.js`, `promptHistory.js`, `publish.js`, `codex.js`, `agent-models.js`, `build.js`, `usage.js`, `transcript.js`, `updater.js` | — | Helper modules required together near the top of `main.js`; each backs a family of IPC channels |
 
 ## Key concepts
 
@@ -66,20 +66,54 @@ PTY. The command is built by string surgery on the configured `startupCommand`
 - `resume` → `--resume <sessionId>` (validated id) or `--continue` (boolean).
 - `sessionId` (fresh sessions only, strict UUID check) → `--session-id <uuid>` so
   the transcript file name is known up front. Never combined with resume.
+- `codexAccount` → not a flag at all. The id is resolved by `codex.js` to that
+  account's Codex home and exported as **`CODEX_HOME`** in the PTY's environment
+  (see "ChatGPT accounts" below). The renderer sends an id, never a path.
 - `initialPrompt` → appended as a shell-quoted positional argument (control chars
   stripped; PowerShell `''` vs POSIX `'\''` escaping). This is the only safe
   delivery — typing it later could hand it to the shell if the CLI is slow.
 
-**Environment variables.** The PTY inherits `process.env` unchanged. The one env
-var `main.js` itself honors is **`HM_USER_DATA`** (`main.js:12`): if set *before*
-launch, `app.setPath('userData', ...)` redirects the entire userData tree. This is
-the sanctioned way to run a test instance without touching the user's real
+**Environment variables.** The PTY inherits a copy of `process.env` with one
+possible edit: **`CODEX_HOME`**, set for a ChatGPT thread that names a non-default
+account (see "ChatGPT accounts"). The one env var `main.js` itself honors is
+**`HM_USER_DATA`** (`main.js:12`): if set *before* launch,
+`app.setPath('userData', ...)` redirects the entire userData tree. This is the
+sanctioned way to run a test instance without touching the user's real
 `boards.json`/models — the user's live instance is usually running, so always
 isolate dev runs with it.
+
+**ChatGPT accounts.** The Codex CLI stores one signed-in account per *home
+directory* (`auth.json`, `config.toml`, sessions — all under `~/.codex`) and has
+no per-invocation account flag: `--profile` layers config only, not credentials.
+So a second ChatGPT account means a second home, and `codex.js` owns those:
+each named account is a directory `<userData>/codex-homes/<id>`, listed in
+`<userData>/codex-accounts.json`. `spawnPty` resolves the pane's `codexAccount`
+id through `codexAccounts.homeFor(id)` and puts the result in the PTY's
+`CODEX_HOME`, so two panes can run two different ChatGPT logins side by side.
+Notes that matter:
+
+- **Ids are validated, not trusted** (`isSafeId`: `[a-z0-9][a-z0-9-]{0,31}`, and
+  never `default`) because an id *is* a directory name under the accounts root.
+  `remove` re-derives the path and re-checks containment before deleting.
+- **`null` means "no override".** The built-in `default` account, an unknown id,
+  and an account whose store entry is gone all resolve to null, leaving whatever
+  `CODEX_HOME` Hivemind itself inherited — the CLI's normal behaviour.
+- **A new home is seeded with the default home's `config.toml`** so the user's
+  Codex settings (approval policy, MCP servers, …) carry over. Credentials never
+  are; signing in is a separate step the user does in a thread. Managed homes
+  force `cli_auth_credentials_store = "file"`, because `CODEX_HOME` isolates
+  `auth.json` but an OS keyring can otherwise make separate homes share a login.
+- **Sign-in state is read, never written, here.** `describeHome` reports whether
+  `auth.json` exists and decodes the ID token's payload for the account's email
+  and plan (a label, not an authorization decision). Tokens never cross to the
+  renderer.
 
 **userData layout** (default `%APPDATA%\hivemind`, or `HM_USER_DATA`):
 
 - `boards.json` — the board array (see Persistence).
+- `codex-accounts.json` — the named ChatGPT accounts (id + label only).
+- `codex-homes/<id>/` — one Codex CLI home per account: its `auth.json`,
+  `config.toml`, sessions. Deleted when the account is removed.
 - `models/<repo>/…` — speech models downloaded on demand by `stt:ensureModel`;
   shadows the bundled `models/` dir via the `hm://models` root ordering.
 
@@ -116,7 +150,7 @@ native dialogs and no renderer IPC.
 | `image:saveTemp` | `{ bytes, ext }` | Writes pasted/dropped image bytes to `os.tmpdir()/hivemind-images/`; returns path or null |
 | `image:fromClipboard` | — | Reads a native clipboard bitmap, saves as PNG in the same temp dir; returns path or null |
 | `attach:stage` | `{ cwd, srcPath }` | Copies a file into `<cwd>/.hivemind/attachments/` (sweeps >1-week-old copies); returns staged path or null. Rejects (before any fs write) unless `cwd` is a known board directory (`isKnownBoardDir`, backed by `loadBoards()`) |
-| `pty:spawn` | `{ id, cwd, cols, rows, startupCommand, model, resume, permissionMode, initialPrompt, sessionId }` | Spawns a shell PTY, auto-types the composed agent command; returns `{ id }` |
+| `pty:spawn` | `{ id, cwd, cols, rows, startupCommand, model, resume, permissionMode, initialPrompt, sessionId, codexAccount }` | Spawns a shell PTY, auto-types the composed agent command; returns `{ id }` |
 | `git:status` | `{ cwd }` | `git.status` — status object for the Source Control panel |
 | `git:diff` | `{ cwd, file, staged, untracked }` | Diff text for one file |
 | `git:stage` / `git:unstage` / `git:discard` | `{ cwd, files }` | Stage/unstage/discard listed files |
@@ -155,6 +189,12 @@ native dialogs and no renderer IPC.
 | `publish:run` | `{ cwd, all }` | Upload changed (or all) files; streams `publish:progress` |
 | `publish:cancel` | `{ cwd }` | Stop the running publish after the current file |
 | `publish:deny` | `{ rels }` | Which paths the denylist refuses, and why (for the picker) |
+| `codex:accounts` | — | ChatGPT accounts: `{ id, label, home, builtin, signedIn, email, plan, method }` each, Default first. No tokens |
+| `codex:addAccount` | `{ label }` | Creates a Codex home for a new account (seeded with the default home's `config.toml`); returns `{ ok, id, accounts }` or `{ ok: false, error }` |
+| `codex:renameAccount` | `{ id, label }` | Relabels an account; the home is untouched, so live threads keep working |
+| `codex:removeAccount` | `{ id }` | Forgets an account and deletes its Codex home. Refuses `default` and anything outside the accounts root |
+| `codex:signOutAccount` | `{ id }` | Signs out while keeping the account/settings. Managed homes delete their isolated `auth.json`; Default runs `codex logout` so OS-keyring credentials are cleared too |
+| `agents:models` | `{ provider, codexAccount?, force? }` | Sanitized `{value,label}` model choices discovered from the installed CLI. Codex uses `codex debug models` with the selected account's `CODEX_HOME`; Grok uses `grok models`; Claude merges rolling aliases advertised by `claude --help` with stable fallbacks. Results cache for five minutes and never expose raw CLI output |
 | `open:external` | `{ url }` | `shell.openExternal` for http/https/mailto only; returns `{ ok }` |
 | `usage:get` | — | Rate-limit windows + today's token totals (`usage.getUsage`) |
 | `transcript:bind` | opts (paneId, cwd, sessionId, …) | Bind a chat pane to its Claude session JSONL; entries stream back via events |

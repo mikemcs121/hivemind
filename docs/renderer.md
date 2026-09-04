@@ -36,9 +36,10 @@ UI says hive/thread.
 | 1–28 | Top-level state; Claude session-id helpers | `boards`, `activeBoardId`, `grids` (Map boardId→grid), `nextId`, `SESSION_ID_RE`, `isSessionId`, `newSessionId` |
 | 30–185 | **Themes** — registry colours both CSS vars and xterm palette | `THEMES`, `DEFAULT_THEME`, `currentTheme`, `THEME` (mutated in place), `applyTheme` |
 | 186–214 | Per-thread font sizing | `FONT_MIN/MAX/DEFAULT`, `clampFont`, `defaultFontSize`, `setPaneFontSize` |
-| 215–251 | Claude model list + API list prices (cost chip) | `MODELS`, `defaultModel`, `MODEL_PRICES`, `priceForModel` |
-| 253–295 | Codex (ChatGPT) models; permission modes | `CODEX_MODELS`, `defaultCodexModel`, `PERMS`, `defaultPerm`, `permLabel` |
-| 297–436 | **Agents** (claude/codex/gemini/grok) + per-pane setters | `AGENTS`, `agentFor`, `paneCommand`, `setPaneAgent`, `respawnPane`, `setPaneModel`, `setPaneCodexModel`, `paintPermSelect`, `setPanePerm`, `restartForPerm`, `applyPendingPerm` |
+| 215–251 | Claude model fallbacks + API list prices (cost chip) | `MODELS`, `defaultModel`, `MODEL_PRICES`, `priceForModel` |
+| 253–305 | Codex and Grok model fallbacks/defaults | `CODEX_MODELS`, `CODEX_MODELS_BY_ACCOUNT`, `GROK_MODELS`, `defaultCodexModel`, `defaultGrokModel` |
+| (after the models) | **ChatGPT accounts** — the list is owned by the main process; only the default-for-new-threads is local | `codexAccounts`, `defaultCodexAccount`, `isValidCodexAccount`, `codexAccountFor`, `codexAccountDetail`, `fillCodexAccountSelect`, `refreshCodexAccounts` |
+| 297–450 | **Agents** (claude/codex/gemini/grok) + per-pane setters | `AGENTS`, `agentFor`, `paneCommand`, `setPaneAgent`, `respawnPane`, `setPaneModel`, `setPaneCodexModel`, `setPaneGrokModel`, `setPaneCodexAccount`, `paintCodexAccountSelect`, `paintPermSelect`, `setPanePerm`, `restartForPerm`, `applyPendingPerm` |
 | 500–540 | **Live permission mode** — reads the footer hint back into the dropdown | `PERM_SCREEN_RE`, `PERM_SCREEN_MODES`, `PERM_SETTLE_MS`, `permScreenCheck` |
 | 542–545+ | **Terminal status detection** constants | `IDLE_MS`, `STATE_LABEL`, `paneStatusLabel`, `SELECT_FOOTER_RE`, `REVIEW_PROMPT_RE`, `MENU_PATTERNS`, `QUESTION_PATTERNS`, `ERROR_PATTERNS`, `AUTH_PATTERNS`, `CMD_MISSING_PATTERNS`, `stripAnsi`, `screenText`, `joinWrapped`, `menuOnScreen`, `authPromptOnScreen`, `authTextFrom`, `promptVisibleOnScreen`, `PROBE_MS`, `chatHasPendingQuestion`, `syncQuestionExpiry` |
 | 547–843 | Screen-parsed question cards + attention probe | `stripBoxChrome`, `testWrapped`, `parseScreenQuestion`, `parseScreenReview`, `parsePlanScreenQuestion`, `parseCodexApproval`, `syncScreenQuestion`, `cardMenuLive`, `removeScreenQuestion`, `probeAttention`, `startAttentionProbe`, `stopAttentionProbe` |
@@ -107,13 +108,13 @@ Created in `createPane` (`renderer.js:~4523`). The important fields:
 | `id` | PTY id (`term-<ts>-<n>`); **changes on every respawn** (`respawnPane`) so stale PTY events can't reach the pane |
 | `el`, `term`, `fitAddon`, `searchAddon` | pane DOM root, xterm `Terminal`, fit + search addons |
 | `dot`, `statusEl`, `costEl`, `planChip`, `title`, `caption`, `viewBtn`, `findBar`, `findInput` | header/find DOM refs |
-| `agentSelect`, `modelSelect`, `codexModelSelect`, `permSelect` | header dropdowns |
+| `agentSelect`, `modelSelect`, `codexModelSelect`, `grokModelSelect`, `codexAccountSelect`, `permSelect` | header dropdowns |
 | `board`, `col`, `flex`, `disposed` | back-refs, split size, tombstone flag |
 | `name`, `autoName`, `captionText`, `capBuf` | thread nickname ("Leo"), legacy auto-name flag, caption + keystroke buffer |
 | `state` | `null` \| `'busy'` \| `'idle'` \| `'attention'` \| `'error'` \| `'dead'` (see `setPaneState`) |
 | `buf`, `idleTimer`, `probeTimer`, `menuMiss`, `errored`, `errorText`, `hintShown`, `doneGlow` | status-detection state |
 | `needsAuth`, `authText` | the CLI is sitting on a sign-in prompt (`setNeedsAuth`): drives the header's `sign in` label, the 🔑 chat card, and the composer-lock wording |
-| `agent`, `model`, `codexModel`, `permMode`, `fontSize` | per-thread config |
+| `agent`, `model`, `codexModel`, `grokModel`, `codexAccount`, `permMode`, `fontSize` | per-thread config. `codexAccount` is an account id resolved to a `CODEX_HOME` by main (see `docs/main-process.md`); a saved layout may name one that has since been removed, and the dropdown says so rather than silently switching |
 | `permRunning`, `permPending` | permission mode the live process was spawned in, and a mode switch queued behind a running turn (see "Permission modes" below) |
 | `sessionId`, `sessionBound` | Claude session UUID (passed as `--session-id`); `sessionBound` only true once the transcript proves the file exists — **never `--resume` an unbound id** |
 | `costSeen`, `costByModel`, `costFile` | cost-estimate accumulator (Claude only) |
@@ -227,6 +228,8 @@ All persistence is `localStorage` (renderer-local) except boards/layouts (JSON v
 | `hm.fontSize` | Default font size for new threads (8–32); updated on *every* per-pane change | `setPaneFontSize`, Settings `set-default-font` |
 | `hm.model` | Default Claude model (`default`/`fable`/`opus`/`sonnet`/`haiku`); updated on every per-pane pick | `setPaneModel`, Settings |
 | `hm.codexModel` | Default ChatGPT/Codex model | `setPaneCodexModel`, Settings |
+| `hm.grokModel` | Default Grok Build model | `setPaneGrokModel`, Settings |
+| `hm.codexAccount` | Default ChatGPT account id for new threads. **The account list itself is not here** — it lives in userData (`codex.js`); this is only the default, reset to `default` when it names an account that's gone | `setPaneCodexAccount`, `refreshCodexAccounts`, Settings |
 | `hm.perm` | Default permission mode (`default`/`acceptEdits`/`auto`/`plan`/`bypass`) | `setPanePerm` |
 | `hm.muteNotifications` | `'1'` mutes OS notifications | `notifyMuted`, Settings `set-notify` (inverted) |
 | `hm.chatFilters` | JSON `{tool,thinking,meta,subagent}` — default filter chips for new panes | `globalChatFilters`, chip clicks |
@@ -241,7 +244,11 @@ All persistence is `localStorage` (renderer-local) except boards/layouts (JSON v
 | `hm.voiceModel` | STT model id (must be in `STT_MODELS`) | `sttModelId` |
 | `hm.voiceLearn` | JSON map of learned correction candidates `{key:{from,to,n,dismissed}}` | `loadVoiceLearn` (`VOICE_LEARN_KEY`) |
 
-Non-persisted per-pane choices (view, chatFilters, model, font…) ride in the board **layout** instead (`serializeLayout`).
+Non-persisted per-pane choices (view, chatFilters, model, codexModel, grokModel, codexAccount, font…) ride in the board **layout** instead (`serializeLayout`).
+
+Model selectors begin with safe fallbacks so startup never waits on a CLI. `refreshAgentModels` then asks main for the installed providers' current catalogs at startup, whenever Settings opens, and on manual refresh. Codex catalogs are kept per ChatGPT account; saved selections missing from a temporary catalog remain visible as `(saved)`. Claude and Grok switch live with `/model`; Codex restarts because Hivemind supplies its model at startup.
+
+The **ChatGPT accounts** list in Settings → General is the one settings block backed by the main process rather than localStorage: `renderCodexAccountSettings` rebuilds it from the cached `codexAccounts`, and `refreshCodexAccounts` re-reads it on startup, whenever Settings opens, after every add/rename/remove/sign-out, and when a ChatGPT thread stops asking to sign in (`setNeedsAuth`, which is when a `codex login` has just landed). Account labels are user text, so rows are built with `textContent`, never `innerHTML`.
 
 ## Preload API usage
 

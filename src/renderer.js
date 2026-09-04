@@ -221,14 +221,15 @@ function setPaneFontSize(pane, size) {
 // into it so it changes mid-session. The last model chosen is remembered as the
 // default for new threads (persisted across sessions).
 // ---------------------------------------------------------------------------
-const MODELS = [
+let MODELS = [
   { value: 'default', label: 'Default' },
   { value: 'fable', label: 'Fable' },
   { value: 'opus', label: 'Opus' },
   { value: 'sonnet', label: 'Sonnet' },
   { value: 'haiku', label: 'Haiku' },
 ];
-const isValidModel = (m) => MODELS.some((x) => x.value === m);
+const isValidModel = (m) => typeof m === 'string' &&
+  (m === 'default' || /^[a-z0-9][a-z0-9._:/-]{0,159}$/i.test(m));
 
 let defaultModel = localStorage.getItem('hm.model') || 'default';
 if (!isValidModel(defaultModel)) defaultModel = 'default';
@@ -259,7 +260,7 @@ const priceForModel = (model) =>
 // interactive picker), so changing a running thread restarts it. The last
 // choice is remembered as the default for new ChatGPT threads.
 // ---------------------------------------------------------------------------
-const CODEX_MODELS = [
+let CODEX_MODELS = [
   { value: 'default', label: 'Default' },
   { value: 'gpt-5.6-sol', label: 'GPT-5.6 Sol' },
   { value: 'gpt-5.6-terra', label: 'GPT-5.6 Terra' },
@@ -269,10 +270,101 @@ const CODEX_MODELS = [
   { value: 'gpt-5.4', label: 'GPT-5.4' },
   { value: 'gpt-5.4-mini', label: 'GPT-5.4 Mini' },
 ];
-const isValidCodexModel = (m) => CODEX_MODELS.some((x) => x.value === m);
+const safeDiscoveredModel = (m) => typeof m === 'string' &&
+  (m === 'default' || /^[a-z0-9][a-z0-9._:/-]{0,159}$/i.test(m));
+const isValidCodexModel = (m) => safeDiscoveredModel(m);
+const CODEX_MODELS_BY_ACCOUNT = new Map();
+const codexModelsFor = (account) => CODEX_MODELS_BY_ACCOUNT.get(account || 'default') || CODEX_MODELS;
 
 let defaultCodexModel = localStorage.getItem('hm.codexModel') || 'default';
 if (!isValidCodexModel(defaultCodexModel)) defaultCodexModel = 'default';
+
+// Grok Build publishes its account-aware catalog through `grok models` and
+// accepts both `--model` at startup and `/model` in a live TUI. The main
+// process discovers that catalog; Default remains usable while Grok is absent,
+// signed out, or too old to expose the command.
+let GROK_MODELS = [{ value: 'default', label: 'Default' }];
+const isValidGrokModel = (m) => safeDiscoveredModel(m);
+let defaultGrokModel = localStorage.getItem('hm.grokModel') || 'default';
+if (!/^[a-z0-9][a-z0-9._:/-]{0,159}$/i.test(defaultGrokModel)) defaultGrokModel = 'default';
+
+// ---------------------------------------------------------------------------
+// Per-thread ChatGPT account
+//
+// The Codex CLI stores one signed-in account per home directory and has no
+// account flag, so Hivemind gives each extra ChatGPT account its own home and
+// picks between them with CODEX_HOME at spawn time (see codex.js / main.js).
+// That makes the account a per-thread choice like the model: two threads can
+// run two different ChatGPT logins side by side. Codex reads its credentials
+// at startup only, so switching a running thread restarts it.
+//
+// The list is owned by the main process (userData), not localStorage — the
+// homes are real directories it creates. Only the *default for new threads*
+// lives here. Until the first refresh lands, the built-in Default account is
+// the whole list, so a thread can always spawn.
+// ---------------------------------------------------------------------------
+let codexAccounts = [{ id: 'default', label: 'Default', builtin: true, signedIn: true }];
+let defaultCodexAccount = localStorage.getItem('hm.codexAccount') || 'default';
+
+const isValidCodexAccount = (id) => codexAccounts.some((a) => a.id === id);
+const codexAccountFor = (id) => codexAccounts.find((a) => a.id === id) || codexAccounts[0];
+
+// A one-line description of who an account is signed in as, for dropdown
+// titles and the Settings list ("mike@example.com · pro", or the sign-in nudge).
+function codexAccountDetail(acc) {
+  if (!acc) return '';
+  if (acc.signedIn === false) return 'not signed in';
+  if (acc.signedIn == null) return 'login stored in OS credential manager';
+  if (acc.method === 'apikey') return 'API key';
+  const bits = [];
+  if (acc.email) bits.push(acc.email);
+  if (acc.plan) bits.push(acc.plan);
+  return bits.join(' · ') || 'signed in';
+}
+
+// Rebuild one account dropdown's options in place, keeping `value` selected
+// even when it names an account that has since been removed — the pane keeps
+// running on whatever it spawned with until the user picks something else.
+function fillCodexAccountSelect(sel, value) {
+  if (!sel) return;
+  sel.innerHTML = '';
+  const known = codexAccounts.some((a) => a.id === value);
+  // The 👤 prefix is load-bearing: in a thread header this dropdown sits right
+  // next to the model dropdown, and an unmarked account named "Default" reads
+  // as a second copy of the model's "Default".
+  for (const acc of codexAccounts) {
+    const opt = document.createElement('option');
+    opt.value = acc.id;
+    opt.textContent = '👤 ' + acc.label + (acc.signedIn === false ? ' (sign in)' : '');
+    sel.appendChild(opt);
+  }
+  if (!known && value) {
+    const opt = document.createElement('option');
+    opt.value = value;
+    opt.textContent = '👤 ' + value + ' (removed)';
+    sel.appendChild(opt);
+  }
+  sel.value = value;
+}
+
+// Pull the account list from the main process and repaint everything showing
+// it: every thread's dropdown and the Settings list.
+async function refreshCodexAccounts() {
+  try {
+    const list = await window.api.codex.accounts();
+    if (Array.isArray(list) && list.length) codexAccounts = list;
+  } catch (_) { /* keep the last known list — the dropdowns stay usable */ }
+  if (!isValidCodexAccount(defaultCodexAccount)) {
+    defaultCodexAccount = 'default';
+    localStorage.setItem('hm.codexAccount', defaultCodexAccount);
+  }
+  for (const pane of allPanes()) {
+    fillCodexAccountSelect(pane.codexAccountSelect, pane.codexAccount);
+    paintCodexAccountSelect(pane);
+  }
+  fillCodexAccountSelect($('set-default-codex-account'), defaultCodexAccount);
+  renderCodexAccountSettings();
+}
 
 // ---------------------------------------------------------------------------
 // Per-thread permission mode
@@ -309,14 +401,14 @@ if (!isValidPerm(defaultPerm)) defaultPerm = 'default';
 // one hive can mix e.g. three Claude threads and one ChatGPT thread. A Claude
 // thread keeps the hive's custom startup command (extra flags etc.); other
 // agents run their own command. Switching a live thread kills its process and
-// starts the new agent in the same pane. Claude and ChatGPT threads each show
-// their own model dropdown; Gemini and Grok threads show none.
+// starts the new agent in the same pane. Claude, ChatGPT, and Grok threads each
+// show their own model dropdown; Gemini has none.
 // ---------------------------------------------------------------------------
 const AGENTS = [
   { value: 'claude', label: 'Claude',  command: 'claude', install: null },
   { value: 'codex',  label: 'ChatGPT', command: 'codex',  install: 'npm install -g @openai/codex' },
   { value: 'gemini', label: 'Gemini',  command: 'gemini', install: 'npm install -g @google/gemini-cli' },
-  { value: 'grok',   label: 'Grok',    command: 'grok',   install: 'npm install -g @xai-official/grok' },
+  { value: 'grok',   label: 'Grok',    command: 'grok',   install: 'https://x.ai/cli' },
 ];
 const isValidAgent = (a) => AGENTS.some((x) => x.value === a);
 const agentFor = (v) => AGENTS.find((x) => x.value === v) || AGENTS[0];
@@ -339,6 +431,9 @@ function setPaneAgent(pane, agent) {
   // them there. ChatGPT threads get their own model dropdown instead.
   if (pane.modelSelect) pane.modelSelect.style.display = agent === 'claude' ? '' : 'none';
   if (pane.codexModelSelect) pane.codexModelSelect.style.display = agent === 'codex' ? '' : 'none';
+  if (pane.grokModelSelect) pane.grokModelSelect.style.display = agent === 'grok' ? '' : 'none';
+  if (pane.codexAccountSelect) pane.codexAccountSelect.style.display = agent === 'codex' ? '' : 'none';
+  paintCodexAccountSelect(pane); // the sign-in warning only means anything on a ChatGPT thread
   if (pane.permSelect) pane.permSelect.style.display = agent === 'claude' ? '' : 'none';
   // Claude and ChatGPT are transcript-backed; Gemini/Grok stay terminal-only.
   updateChatAvailability(pane);
@@ -418,6 +513,57 @@ function setPaneCodexModel(pane, model) {
   // thread by restarting it. Codex rollouts aren't resumable here (see
   // rebuildFromLayout), so the restart begins a fresh conversation.
   if (changed && pane.agent === 'codex' && pane.state !== 'dead') respawnPane(pane);
+}
+
+function setPaneGrokModel(pane, model) {
+  if (pane.disposed) return;
+  if (!isValidGrokModel(model)) model = 'default';
+  pane.grokModel = model;
+  defaultGrokModel = model;
+  localStorage.setItem('hm.grokModel', model);
+  if (pane.grokModelSelect && pane.grokModelSelect.value !== model) pane.grokModelSelect.value = model;
+  // Grok Build supports a named /model command, so it can switch without
+  // throwing away the current terminal session.
+  if (pane.agent === 'grok' && pane.state !== 'dead') {
+    if (model === 'default') respawnPane(pane);
+    else {
+      window.api.writePty(pane.id, `/model ${model}\r`);
+      markActivity(pane, '');
+    }
+  }
+}
+
+function setPaneCodexAccount(pane, id) {
+  if (pane.disposed) return;
+  if (!isValidCodexAccount(id)) id = 'default';
+  const changed = pane.codexAccount !== id;
+  pane.codexAccount = id;
+  defaultCodexAccount = id;
+  localStorage.setItem('hm.codexAccount', id);
+  if (pane.codexAccountSelect && pane.codexAccountSelect.value !== id) {
+    fillCodexAccountSelect(pane.codexAccountSelect, id);
+  }
+  fillModelSelect(pane.codexModelSelect, codexModelsFor(id), pane.codexModel);
+  refreshOneModelCatalog('codex', id, false);
+  paintCodexAccountSelect(pane);
+  // Codex reads its credentials from CODEX_HOME when it boots, and that is
+  // fixed for the life of the process — so a running thread has to restart to
+  // change accounts. Codex rollouts aren't resumable here (see
+  // rebuildFromLayout), so the restart begins a fresh conversation.
+  if (changed && pane.agent === 'codex' && pane.state !== 'dead') respawnPane(pane);
+}
+
+// Flag a thread whose ChatGPT account has no stored login — the thread will
+// come up on Codex's sign-in screen, and the dropdown is the only place that
+// is knowable before it does.
+function paintCodexAccountSelect(pane) {
+  const sel = pane.codexAccountSelect;
+  if (!sel) return;
+  const acc = codexAccountFor(pane.codexAccount);
+  const out = !!acc && acc.signedIn === false;
+  sel.classList.toggle('acct-signed-out', out);
+  sel.title = 'ChatGPT account for this thread (' + codexAccountDetail(acc) + ')' +
+    ' — changing it restarts the thread';
 }
 
 const permLabel = (v) => (PERMS.find((p) => p.value === v) || {}).label || v;
@@ -657,6 +803,8 @@ const AUTH_PATTERNS = [
   /Sign in with ChatGPT/i,
   /\bcodex login\b/i,
   /Login with Google/i,
+  /\bgrok login\b/i,
+  /You are not authenticated\./i,
 ];
 
 // The shell couldn't launch the startup command — usually `claude` isn't on PATH.
@@ -1211,7 +1359,9 @@ function evaluateIdle(pane) {
     const cmd = paneCommand(pane);
     const install = agentFor(pane.agent).install;
     const fix = install
-      ? `Install it with \`${install}\` (then sign in by running \`${cmd}\` once)`
+      ? (/^https?:/.test(install)
+        ? `Install it from ${install} (then sign in by running \`${cmd}\` once)`
+        : `Install it with \`${install}\` (then sign in by running \`${cmd}\` once)`)
       : `Install it (or fix the hive's startup command in ✎ Edit hive)`;
     try {
       pane.term.write(
@@ -1329,6 +1479,11 @@ function setNeedsAuth(pane, on, text) {
     pane.statusEl.textContent = paneStatusLabel(pane, 'attention');
   }
   updateChatBanner(pane);
+  // A ChatGPT thread that just stopped asking to sign in almost certainly
+  // finished a `codex login` — which is what writes auth.json into the
+  // account's home. Re-read the accounts so the dropdowns drop their
+  // "(sign in)" tag and Settings shows who the account belongs to.
+  if (!on && pane.agent === 'codex') refreshCodexAccounts();
 }
 
 function setPaneState(pane, state) {
@@ -1705,6 +1860,93 @@ function boardPanes(board) {
   return out;
 }
 
+// Every live pane in every board, including boards that aren't on screen —
+// switching boards only hides their grid, so their panes are still running and
+// still need repainting when something app-wide changes (see
+// refreshCodexAccounts).
+function allPanes() {
+  const out = [];
+  for (const g of grids.values()) {
+    for (const col of g.columns) for (const p of col.panes) if (!p.disposed) out.push(p);
+  }
+  return out;
+}
+
+function fillModelSelect(sel, models, value) {
+  if (!sel) return;
+  sel.innerHTML = '';
+  for (const model of models) {
+    const opt = document.createElement('option');
+    opt.value = model.value;
+    opt.textContent = model.label;
+    sel.appendChild(opt);
+  }
+  if (value && !models.some((m) => m.value === value)) {
+    const opt = document.createElement('option');
+    opt.value = value;
+    opt.textContent = value + ' (saved)';
+    sel.appendChild(opt);
+  }
+  sel.value = value || 'default';
+}
+
+const modelCatalogState = new Map();
+
+function renderAgentModelStatus() {
+  const el = $('agent-model-status');
+  if (!el) return;
+  const specs = [
+    ['Claude', modelCatalogState.get('claude:default')],
+    ['ChatGPT', modelCatalogState.get('codex:' + (defaultCodexAccount || 'default'))],
+    ['Grok', modelCatalogState.get('grok:default')],
+  ];
+  el.textContent = specs.map(([label, state]) => {
+    if (!state) return label + ': checking…';
+    if (!state.installed) return label + ': not installed';
+    if (state.source !== 'cli') return label + ': sign in or refresh';
+    return label + ': ' + Math.max(0, state.models.length - 1) + ' models';
+  }).join(' · ');
+  el.title = specs.map(([label, state]) => state && state.error ? label + ': ' + state.error : '').filter(Boolean).join('\n');
+}
+
+async function refreshOneModelCatalog(provider, account, force) {
+  if (!window.api.agentModels) return;
+  const key = provider + ':' + (account || 'default');
+  try {
+    const result = await window.api.agentModels(provider, account, force);
+    if (!result || !Array.isArray(result.models) || !result.models.length) return;
+    modelCatalogState.set(key, result);
+    renderAgentModelStatus();
+    if (provider === 'claude') MODELS = result.models;
+    if (provider === 'grok') GROK_MODELS = result.models;
+    if (provider === 'codex') {
+      CODEX_MODELS_BY_ACCOUNT.set(account || 'default', result.models);
+      if (!account || account === 'default') CODEX_MODELS = result.models;
+    }
+    for (const pane of allPanes()) {
+      if (provider === 'claude') fillModelSelect(pane.modelSelect, MODELS, pane.model);
+      if (provider === 'grok') fillModelSelect(pane.grokModelSelect, GROK_MODELS, pane.grokModel);
+      if (provider === 'codex' && (pane.codexAccount || 'default') === (account || 'default')) {
+        fillModelSelect(pane.codexModelSelect, result.models, pane.codexModel);
+      }
+    }
+    fillModelSelect($('set-default-model'), MODELS, defaultModel);
+    fillModelSelect($('set-default-grok-model'), GROK_MODELS, defaultGrokModel);
+    fillModelSelect($('set-default-codex-model'), codexModelsFor(defaultCodexAccount), defaultCodexModel);
+    return result;
+  } catch (_) { renderAgentModelStatus(); return null; /* fallbacks remain usable */ }
+}
+
+async function refreshAgentModels(force = false) {
+  const accountIds = codexAccounts.map((a) => a.id);
+  if (!accountIds.includes('default')) accountIds.unshift('default');
+  return Promise.all([
+    refreshOneModelCatalog('claude', null, force),
+    refreshOneModelCatalog('grok', null, force),
+    ...accountIds.map((id) => refreshOneModelCatalog('codex', id, force)),
+  ]);
+}
+
 // Find a thread by what the user calls it: exact name, then partial name,
 // then caption — all case-insensitive, so dictated names match.
 function findPaneByName(board, name) {
@@ -1764,7 +2006,7 @@ function hmFontPanes(board, pane, rest) {
   return pane ? [pane] : [];
 }
 
-// Resolve a spoken/typed model name against a MODELS/CODEX_MODELS list: exact
+// Resolve a spoken/typed model name against an agent model list: exact
 // value, exact label, then substring — all case-insensitive.
 function hmResolveModel(list, q) {
   q = String(q || '').trim().toLowerCase().replace(/\s+model$/, '');
@@ -2073,29 +2315,63 @@ const HM_COMMANDS = [
       /^(?:switch|change|set)\s+(?:the\s+)?model\s+(?:to\s+)?(.+)$/i,
       /^use\s+(?:the\s+)?(.+?)\s+model$/i,
     ],
-    help: '<strong>switch model to &lt;model&gt;</strong> — live on a Claude thread; restarts a ChatGPT thread with a fresh conversation.',
+    help: '<strong>switch model to &lt;model&gt;</strong> — live on Claude and Grok; restarts ChatGPT with a fresh conversation.',
     run(m, { pane }) {
       if (!pane) { hmToast('No thread to switch models on.', 'err'); return; }
-      if (pane.agent !== 'claude' && pane.agent !== 'codex') {
+      if (pane.agent !== 'claude' && pane.agent !== 'codex' && pane.agent !== 'grok') {
         hmToast(agentFor(pane.agent).label + ' threads have no model picker.', 'err');
         return;
       }
       const codex = pane.agent === 'codex';
-      const list = codex ? CODEX_MODELS : MODELS;
+      const grok = pane.agent === 'grok';
+      const list = codex ? codexModelsFor(pane.codexAccount) : grok ? GROK_MODELS : MODELS;
       const hit = hmResolveModel(list, m[1]);
       if (!hit) {
-        hmToast('No ' + (codex ? 'ChatGPT' : 'Claude') + ' model matches "' + m[1].trim() + '" — options: ' + list.map((x) => x.label).join(', ') + '.', 'err');
+        hmToast('No ' + (codex ? 'ChatGPT' : grok ? 'Grok' : 'Claude') + ' model matches "' + m[1].trim() + '" — options: ' + list.map((x) => x.label).join(', ') + '.', 'err');
         return;
       }
       if (codex) {
         const restarting = pane.codexModel !== hit.value && pane.state !== 'dead';
         setPaneCodexModel(pane, hit.value);
         hmToast('Model: ' + hit.label + (restarting ? ' — restarting this thread; the conversation starts fresh.' : '.'));
+      } else if (grok) {
+        setPaneGrokModel(pane, hit.value);
+        hmToast('Model: ' + hit.label + ' — switched live.');
       } else {
         setPaneModel(pane, hit.value);
         hmToast('Model: ' + hit.label + ' — switched live.');
       }
       persistLayout(pane.board.id);
+    },
+  },
+  {
+    name: 'chatgpt-account',
+    patterns: [
+      /^(?:switch|change|set)\s+(?:the\s+)?(?:chat\s*gpt\s+|codex\s+)?account\s+(?:to\s+)?(.+)$/i,
+      /^use\s+(?:the\s+)?(.+?)\s+(?:chat\s*gpt\s+|codex\s+)?account$/i,
+    ],
+    help: '<strong>use the &lt;name&gt; chatgpt account</strong> — switches which ChatGPT login this thread runs as (restarts it with a fresh conversation).',
+    run(m, { pane }) {
+      if (!pane) { hmToast('No thread to switch accounts on.', 'err'); return; }
+      if (pane.agent !== 'codex') {
+        hmToast('ChatGPT accounts only apply to ChatGPT threads.', 'err');
+        return;
+      }
+      const q = m[1].trim().toLowerCase().replace(/\s+/g, '');
+      const hit = codexAccounts.find((a) => a.label.toLowerCase().replace(/\s+/g, '') === q) ||
+                  codexAccounts.find((a) => a.label.toLowerCase().replace(/\s+/g, '').startsWith(q)) ||
+                  codexAccounts.find((a) => a.id === q);
+      if (!hit) {
+        hmToast('No ChatGPT account matches "' + m[1].trim() + '" — you have: ' +
+          codexAccounts.map((a) => a.label).join(', ') + '. Add one in Settings → General.', 'err');
+        return;
+      }
+      const restarting = pane.codexAccount !== hit.id && pane.state !== 'dead';
+      setPaneCodexAccount(pane, hit.id);
+      persistLayout(pane.board.id);
+      hmToast('ChatGPT account: ' + hit.label +
+        (hit.signedIn === false ? ' — not signed in yet, so this thread will open Codex\'s sign-in screen' : '') +
+        (restarting ? ' — restarting this thread; the conversation starts fresh.' : '.'));
     },
   },
   {
@@ -2426,7 +2702,8 @@ async function hmInterpretRequest(c, ctxPane) {
       threads: boardPanes(board).map((p) => p.name).filter(Boolean),
       hives: boards.map((b) => b.name).filter(Boolean),
       themes: Object.keys(THEMES),
-      models: MODELS.map((x) => x.label).concat(CODEX_MODELS.map((x) => x.label)),
+      models: MODELS.map((x) => x.label)
+        .concat(CODEX_MODELS.map((x) => x.label), GROK_MODELS.map((x) => x.label)),
     };
     const res = await window.api.hm.interpret(payload);
     if (!res || res.code !== 0) {
@@ -4681,7 +4958,9 @@ function serializeLayout(boardId) {
   const cols = g.columns.map((col) => ({
     flex: col.flex,
     panes: col.panes.filter((p) => !p.disposed).map((p) => ({
-      name: p.name, agent: p.agent, model: p.model, codexModel: p.codexModel, perm: p.permMode, fontSize: p.fontSize,
+      name: p.name, agent: p.agent, model: p.model, codexModel: p.codexModel,
+      grokModel: p.grokModel,
+      codexAccount: p.codexAccount, perm: p.permMode, fontSize: p.fontSize,
       flex: p.flex, caption: p.captionText || '', autoName: !!p.autoName,
       planId: p.planId || undefined, // stable per-thread key for ⟳-requested plans
       planFile: (p.plan && p.plan.file) || undefined,     // last known plan file (plan review)
@@ -4720,7 +4999,9 @@ function rebuildFromLayout(board) {
       const looksAuto = new RegExp('^' + cmd.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + ' \\d+$').test(pd.name || '');
       const autoName = pd.autoName !== undefined ? pd.autoName : looksAuto;
       const pane = createPane(board, colObj, {
-        name: pd.name, agent, model: pd.model, codexModel: pd.codexModel, perm: pd.perm, fontSize: pd.fontSize,
+        name: pd.name, agent, model: pd.model, codexModel: pd.codexModel,
+        grokModel: pd.grokModel,
+        codexAccount: pd.codexAccount, perm: pd.perm, fontSize: pd.fontSize,
         flex: pd.flex, caption: pd.caption, autoName, planId: pd.planId,
         planFile: pd.planFile, planSource: pd.planSource,
         sessionId: pd.sessionId, view: pd.view, chatFilters: pd.chatFilters,
@@ -5161,8 +5442,13 @@ function spawnPanePty(pane, { resume, initialPrompt } = {}) {
     startupCommand: paneCommand(pane),
     model: pane.agent === 'claude' ? pane.model
          : pane.agent === 'codex' ? pane.codexModel
+         : pane.agent === 'grok' ? pane.grokModel
          : 'default',
     permissionMode: pane.permRunning,
+    // Which ChatGPT login this thread runs as. Main turns the id into a
+    // CODEX_HOME for the PTY's environment (see codex.js); 'default' and
+    // unknown ids leave the CLI's own home alone.
+    codexAccount: (pane.agent === 'codex' && pane.codexAccount) || undefined,
     resume: resume || false, // true → --continue, session-id string → --resume <id>
     initialPrompt: ((pane.agent === 'claude' || pane.agent === 'codex') && initialPrompt) || undefined,
     sessionId: (pane.agent === 'claude' && !resume && pane.sessionId) || undefined,
@@ -5177,6 +5463,9 @@ function spawnPanePty(pane, { resume, initialPrompt } = {}) {
       agent: pane.agent,
       resume: pane.agent === 'claude' && !!resume,
       sessionId: (pane.agent === 'claude' && pane.sessionId) || undefined,
+      // Codex writes its rollout under the home CODEX_HOME points at, so the
+      // binder has to watch the same account's tree this thread runs in.
+      codexAccount: (pane.agent === 'codex' && pane.codexAccount) || undefined,
     });
     // An initial prompt reaches claude as a CLI argument, not via the composer,
     // so report it to the binder ourselves — otherwise the new session file
@@ -5198,6 +5487,10 @@ function createPane(board, col, opts = {}) {
     (startAgent === 'claude' ? (board.startupCommand || 'claude') : agentFor(startAgent).command);
   const startModel = isValidModel(opts.model) ? opts.model : defaultModel;
   const startCodexModel = isValidCodexModel(opts.codexModel) ? opts.codexModel : defaultCodexModel;
+  const startGrokModel = isValidGrokModel(opts.grokModel) ? opts.grokModel : defaultGrokModel;
+  // A saved layout can name an account that has since been removed; keep the
+  // name so the dropdown can say so rather than silently switching accounts.
+  const startCodexAccount = opts.codexAccount || defaultCodexAccount;
   const startPerm = isValidPerm(opts.perm) ? opts.perm : defaultPerm;
   const startFont = opts.fontSize ? clampFont(opts.fontSize) : defaultFontSize;
   const el = document.createElement('div');
@@ -5251,26 +5544,27 @@ function createPane(board, col, opts = {}) {
   const modelSelect = document.createElement('select');
   modelSelect.className = 'model-select';
   modelSelect.title = 'Claude model for this thread';
-  for (const m of MODELS) {
-    const opt = document.createElement('option');
-    opt.value = m.value;
-    opt.textContent = m.label;
-    modelSelect.appendChild(opt);
-  }
-  modelSelect.value = startModel;
+  fillModelSelect(modelSelect, MODELS, startModel);
   if (startAgent !== 'claude') modelSelect.style.display = 'none';
   // ChatGPT model this thread runs Codex with (see setPaneCodexModel).
   const codexModelSelect = document.createElement('select');
   codexModelSelect.className = 'model-select';
   codexModelSelect.title = 'ChatGPT model for this thread — changing it restarts the thread';
-  for (const m of CODEX_MODELS) {
-    const opt = document.createElement('option');
-    opt.value = m.value;
-    opt.textContent = m.label;
-    codexModelSelect.appendChild(opt);
-  }
-  codexModelSelect.value = startCodexModel;
+  fillModelSelect(codexModelSelect, codexModelsFor(startCodexAccount), startCodexModel);
   if (startAgent !== 'codex') codexModelSelect.style.display = 'none';
+  // Grok Build model (discovered from `grok models`).
+  const grokModelSelect = document.createElement('select');
+  grokModelSelect.className = 'model-select';
+  grokModelSelect.title = 'Grok model for this thread';
+  fillModelSelect(grokModelSelect, GROK_MODELS, startGrokModel);
+  if (startAgent !== 'grok') grokModelSelect.style.display = 'none';
+  // ChatGPT account this thread signs in as (see setPaneCodexAccount). Options
+  // are filled from the account list, which arrives asynchronously — every
+  // dropdown is refilled by refreshCodexAccounts when it does.
+  const codexAccountSelect = document.createElement('select');
+  codexAccountSelect.className = 'model-select acct-select';
+  fillCodexAccountSelect(codexAccountSelect, startCodexAccount);
+  if (startAgent !== 'codex') codexAccountSelect.style.display = 'none';
   // Permission mode this thread starts Claude Code in (see setPanePerm).
   const permSelect = document.createElement('select');
   permSelect.className = 'model-select perm-select';
@@ -5300,7 +5594,7 @@ function createPane(board, col, opts = {}) {
   // Chat/terminal view toggle (Claude threads only — see initChatUI).
   const viewBtn = document.createElement('button');
   viewBtn.className = 'font-btn view-btn';
-  header.append(dot, titleWrap, planChip, costEl, statusEl, agentSelect, modelSelect, codexModelSelect, permSelect, viewBtn, fontDownBtn, fontUpBtn, zoomBtn, closeBtn);
+  header.append(dot, titleWrap, planChip, costEl, statusEl, agentSelect, modelSelect, codexAccountSelect, codexModelSelect, grokModelSelect, permSelect, viewBtn, fontDownBtn, fontUpBtn, zoomBtn, closeBtn);
 
   const termWrap = document.createElement('div');
   termWrap.className = 'pane-term';
@@ -5357,10 +5651,11 @@ function createPane(board, col, opts = {}) {
   term.open(termWrap);
 
   const pane = {
-    id, el, term, fitAddon, searchAddon, dot, statusEl, costEl, planChip, agentSelect, modelSelect, codexModelSelect, permSelect, title, caption,
+    id, el, term, fitAddon, searchAddon, dot, statusEl, costEl, planChip, agentSelect, modelSelect, codexModelSelect, grokModelSelect, codexAccountSelect, permSelect, title, caption,
     findBar, findInput, viewBtn, flex: opts.flex || 1, col, board, disposed: false,
     name: startName, state: null, buf: '', idleTimer: null, probeTimer: null, menuMiss: 0,
-    fontSize: startFont, agent: startAgent, model: startModel, codexModel: startCodexModel, permMode: startPerm, captionText: '', capBuf: '',
+    fontSize: startFont, agent: startAgent, model: startModel, codexModel: startCodexModel, grokModel: startGrokModel,
+    codexAccount: startCodexAccount, permMode: startPerm, captionText: '', capBuf: '',
     // permRunning: mode the live process was spawned in; permPending: a mode
     // switch waiting for the current turn to end (see setPanePerm).
     permRunning: null, permPending: null,
@@ -5404,6 +5699,7 @@ function createPane(board, col, opts = {}) {
 
   if (opts.caption) setPaneCaption(pane, opts.caption, { persist: false });
   paintPermSelect(pane);
+  paintCodexAccountSelect(pane);
   initChatUI(pane, body);
 
   // Wire IO
@@ -5451,6 +5747,24 @@ function createPane(board, col, opts = {}) {
   // ChatGPT model dropdown: switch the Codex model (restarts a running thread).
   codexModelSelect.addEventListener('mousedown', (e) => e.stopPropagation());
   codexModelSelect.onchange = (e) => { e.stopPropagation(); setPaneCodexModel(pane, codexModelSelect.value); persistLayout(board.id); focusPane(pane); };
+
+  grokModelSelect.addEventListener('mousedown', (e) => e.stopPropagation());
+  grokModelSelect.onchange = (e) => { e.stopPropagation(); setPaneGrokModel(pane, grokModelSelect.value); persistLayout(board.id); focusPane(pane); };
+
+  // ChatGPT account dropdown: switch which ChatGPT login this thread runs as
+  // (restarts a running thread — see setPaneCodexAccount).
+  codexAccountSelect.addEventListener('mousedown', (e) => e.stopPropagation());
+  codexAccountSelect.onchange = (e) => {
+    e.stopPropagation();
+    const id = codexAccountSelect.value;
+    const acc = codexAccountFor(id);
+    setPaneCodexAccount(pane, id);
+    persistLayout(board.id);
+    focusPane(pane);
+    if (acc && acc.signedIn === false) {
+      hmToast('The ' + acc.label + ' account isn\'t signed in yet — this thread will open Codex\'s sign-in screen.');
+    }
+  };
 
   // Permission dropdown: change the mode Claude starts in (restarts the thread).
   permSelect.addEventListener('mousedown', (e) => e.stopPropagation());
@@ -8225,7 +8539,8 @@ function renderHistory() {
     const send = document.createElement('button');
     send.className = 'history-row-send';
     send.title = 'Send again to the focused thread';
-    send.textContent = '↩';
+    send.setAttribute('aria-label', 'Send this prompt again to the focused thread');
+    send.textContent = '➤';
     send.onclick = (e) => {
       e.stopPropagation();
       repostPrompt(entry);
@@ -11264,23 +11579,10 @@ function syncGeneralFields() {
   }
   if (st) st.value = currentTheme;
   const sm = $('set-default-model');
-  if (sm && !sm.options.length) {
-    for (const m of MODELS) {
-      const opt = document.createElement('option');
-      opt.value = m.value; opt.textContent = m.label;
-      sm.appendChild(opt);
-    }
-  }
-  if (sm) sm.value = defaultModel;
+  fillModelSelect(sm, MODELS, defaultModel);
   const scm = $('set-default-codex-model');
-  if (scm && !scm.options.length) {
-    for (const m of CODEX_MODELS) {
-      const opt = document.createElement('option');
-      opt.value = m.value; opt.textContent = m.label;
-      scm.appendChild(opt);
-    }
-  }
-  if (scm) scm.value = defaultCodexModel;
+  fillModelSelect(scm, codexModelsFor(defaultCodexAccount), defaultCodexModel);
+  fillModelSelect($('set-default-grok-model'), GROK_MODELS, defaultGrokModel);
   const sf = $('set-default-font');
   if (sf) sf.value = String(defaultFontSize);
   const sn = $('set-notify');
@@ -11291,11 +11593,103 @@ function syncGeneralFields() {
   if (sa) sa.checked = autocorrectEnabled;
   const sv = $('set-app-version');
   if (sv) sv.textContent = window.api.appVersion ? `v${window.api.appVersion}` : 'unknown';
+  fillCodexAccountSelect($('set-default-codex-account'), defaultCodexAccount);
+  renderCodexAccountSettings();
+}
+
+// ---------------------------------------------------------------------------
+// Settings → General → ChatGPT accounts
+//
+// One row per account: its name, who it's signed in as, and the destructive
+// actions. Labels are user text, so every row is built from DOM nodes and
+// textContent — never innerHTML.
+// ---------------------------------------------------------------------------
+function acctBtn(text, title, onclick) {
+  const b = document.createElement('button');
+  b.className = 'acct-btn';
+  b.textContent = text;
+  b.title = title;
+  b.onclick = onclick;
+  return b;
+}
+
+function renderCodexAccountSettings() {
+  const host = $('codex-accounts-list');
+  if (!host) return;
+  host.innerHTML = '';
+  for (const acc of codexAccounts) {
+    const row = document.createElement('div');
+    row.className = 'acct-row' + (acc.signedIn === false ? ' out' : '');
+
+    const name = document.createElement('span');
+    name.className = 'acct-name';
+    name.textContent = acc.label;
+
+    const detail = document.createElement('span');
+    detail.className = 'acct-detail';
+    detail.textContent = codexAccountDetail(acc);
+    detail.title = acc.home || '';
+
+    const spacer = document.createElement('span');
+    spacer.className = 'spacer';
+    row.append(name, detail, spacer);
+
+    // Renaming an account never touches its home directory, so threads
+    // already running on it keep working — only the label changes.
+    if (!acc.builtin) {
+      const ren = acctBtn('Rename', 'Change this account\'s name in Hivemind', async () => {
+        const next = prompt('Rename this ChatGPT account:', acc.label);
+        if (next === null) return;
+        const res = await window.api.codex.renameAccount(acc.id, next);
+        if (!res || !res.ok) { hmToast((res && res.error) || 'Could not rename the account.', 'err'); return; }
+        await refreshCodexAccounts();
+      });
+      row.append(ren);
+    }
+
+    if (acc.signedIn !== false) {
+      row.append(acctBtn('Sign out', 'Delete this machine\'s stored login for the account', async () => {
+        if (!confirm('Sign out of the ' + acc.label + ' ChatGPT account? Threads using it will ask you to sign in again.')) return;
+        const res = await window.api.codex.signOutAccount(acc.id);
+        if (!res || !res.ok) { hmToast((res && res.error) || 'Could not sign out.', 'err'); return; }
+        await refreshCodexAccounts();
+        hmToast('Signed out of ' + acc.label + '.');
+      }));
+    }
+
+    if (!acc.builtin) {
+      row.append(acctBtn('Remove', 'Forget this account and delete its Codex home', async () => {
+        if (!confirm('Remove the ChatGPT account "' + acc.label + '"? Its saved login and Codex settings are deleted from this machine. The ChatGPT account itself is not touched.')) return;
+        const res = await window.api.codex.removeAccount(acc.id);
+        if (!res || !res.ok) { hmToast((res && res.error) || 'Could not remove the account.', 'err'); return; }
+        await refreshCodexAccounts();
+        hmToast('Removed ' + acc.label + '.');
+      }));
+    }
+
+    host.appendChild(row);
+  }
+}
+
+async function addCodexAccountFromSettings() {
+  const input = $('codex-account-name');
+  if (!input) return;
+  const label = input.value.trim();
+  if (!label) { hmToast('Give the account a name first.', 'err'); return; }
+  const res = await window.api.codex.addAccount(label);
+  if (!res || !res.ok) { hmToast((res && res.error) || 'Could not add the account.', 'err'); return; }
+  input.value = '';
+  await refreshCodexAccounts();
+  hmToast('Added ' + label + ' — start a ChatGPT thread on it to sign in.');
 }
 
 function openSettings(tab) {
   syncGeneralFields();
   syncVoiceFields();
+  // Sign-in state changes outside Hivemind (a `codex login` in a thread, or in
+  // any terminal), so re-read it every time the list is shown.
+  refreshCodexAccounts();
+  refreshAgentModels(false);
   // Reveal the "Build portable copy" group only when the active hive is the
   // Hivemind source checkout (the group is not per-board, so check on open).
   updateBuildButton(activeBoard());
@@ -11948,6 +12342,41 @@ if (setCodexModelSel) setCodexModelSel.addEventListener('change', () => {
     localStorage.setItem('hm.codexModel', defaultCodexModel);
   }
 });
+const setGrokModelSel = $('set-default-grok-model');
+if (setGrokModelSel) setGrokModelSel.addEventListener('change', () => {
+  if (isValidGrokModel(setGrokModelSel.value)) {
+    defaultGrokModel = setGrokModelSel.value;
+    localStorage.setItem('hm.grokModel', defaultGrokModel);
+  }
+});
+const refreshModelsBtn = $('refresh-agent-models');
+if (refreshModelsBtn) refreshModelsBtn.addEventListener('click', async () => {
+  refreshModelsBtn.disabled = true;
+  refreshModelsBtn.textContent = 'Refreshing…';
+  const results = await refreshAgentModels(true);
+  refreshModelsBtn.disabled = false;
+  refreshModelsBtn.textContent = 'Refresh agent models';
+  const unavailable = (results || []).filter((r) => !r || r.source !== 'cli');
+  hmToast(unavailable.length
+    ? 'Model refresh finished; unavailable or signed-out agents are using fallback choices.'
+    : 'Agent model lists refreshed.');
+});
+const setCodexAcctSel = $('set-default-codex-account');
+if (setCodexAcctSel) setCodexAcctSel.addEventListener('change', () => {
+  if (isValidCodexAccount(setCodexAcctSel.value)) {
+    defaultCodexAccount = setCodexAcctSel.value;
+    localStorage.setItem('hm.codexAccount', defaultCodexAccount);
+    fillModelSelect($('set-default-codex-model'), codexModelsFor(defaultCodexAccount), defaultCodexModel);
+    refreshOneModelCatalog('codex', defaultCodexAccount, false);
+    renderAgentModelStatus();
+  }
+});
+const addAcctBtn = $('codex-account-add');
+if (addAcctBtn) addAcctBtn.addEventListener('click', addCodexAccountFromSettings);
+const addAcctInput = $('codex-account-name');
+if (addAcctInput) addAcctInput.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') { e.preventDefault(); addCodexAccountFromSettings(); }
+});
 const setFontInput = $('set-default-font');
 if (setFontInput) setFontInput.addEventListener('change', () => {
   defaultFontSize = clampFont(parseInt(setFontInput.value, 10) || FONT_DEFAULT);
@@ -12019,8 +12448,14 @@ if (window.api.onSttDownloadProgress) window.api.onSttDownloadProgress((p) => {
 // Init
 // ---------------------------------------------------------------------------
 (async function init() {
+  // Before any pane is built: panes fill their ChatGPT account dropdown from
+  // this list, and a saved default that no longer exists is reset here.
+  await refreshCodexAccounts();
   boards = (await window.api.listBoards()) || [];
   renderBoardList();
   if (boards.length) selectBoard(boards[0].id);
   else showEmpty();
+  // Render immediately with safe fallbacks, then replace them with each
+  // installed CLI's current, account-aware catalog without delaying startup.
+  refreshAgentModels(false);
 })();

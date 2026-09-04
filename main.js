@@ -135,6 +135,8 @@ const plan = require('./plan');
 const todo = require('./todo');
 const promptHistory = require('./promptHistory');
 const publish = require('./publish');
+const codexAccounts = require('./codex');
+const agentModels = require('./agent-models');
 const build = require('./build');
 const usage = require('./usage');
 const transcript = require('./transcript');
@@ -198,7 +200,7 @@ function defaultShell() {
   return process.env.SHELL || 'bash';
 }
 
-function spawnPty({ id, cwd, cols, rows, startupCommand, model, resume, permissionMode, initialPrompt, sessionId }, win) {
+function spawnPty({ id, cwd, cols, rows, startupCommand, model, resume, permissionMode, initialPrompt, sessionId, codexAccount }, win) {
   const shell = defaultShell();
   let safeCwd = cwd;
   try {
@@ -207,12 +209,23 @@ function spawnPty({ id, cwd, cols, rows, startupCommand, model, resume, permissi
     safeCwd = os.homedir();
   }
 
+  // ChatGPT threads can each run as a different ChatGPT account. The Codex CLI
+  // has no account flag — one login per home directory — so the account is
+  // selected by pointing CODEX_HOME at that account's own home (see codex.js).
+  // The renderer sends an account *id*, never a path: codex.js resolves it, so
+  // no renderer-supplied directory ever reaches the environment. An unknown id
+  // (or the built-in "default") resolves to null and leaves any inherited
+  // CODEX_HOME alone, which is the CLI's normal behaviour.
+  const env = Object.assign({}, process.env);
+  const codexHome = codexAccount ? codexAccounts.homeFor(codexAccount) : null;
+  if (codexHome) env.CODEX_HOME = codexHome;
+
   const proc = pty.spawn(shell, [], {
     name: 'xterm-color',
     cols: cols || 80,
     rows: rows || 24,
     cwd: safeCwd,
-    env: Object.assign({}, process.env),
+    env,
     useConpty: true,
   });
 
@@ -230,11 +243,11 @@ function spawnPty({ id, cwd, cols, rows, startupCommand, model, resume, permissi
   // Auto-run the startup command (defaults to `claude`) inside the board's dir.
   let cmd = (startupCommand && startupCommand.trim()) || 'claude';
   // When a specific model is chosen, hand it to the agent CLI via `--model` by
-  // inserting the flag right after the `claude`/`codex` token (so flags like
+  // inserting the flag right after the `claude`/`codex`/`grok` token (so flags like
   // `claude --resume` still work). Skip for "default" and for other commands.
   // Codex model ids contain dots (e.g. gpt-5.1-codex), hence the [a-z0-9.-].
   if (model && model !== 'default' && /^[a-z0-9.-]+$/i.test(model)) {
-    cmd = cmd.replace(/^(claude|codex)(\.exe|\.cmd)?\b/i, (m) => `${m} --model ${model}`);
+    cmd = cmd.replace(/^(claude|codex|grok)(\.exe|\.cmd)?\b/i, (m) => `${m} --model ${model}`);
   }
   // Permission mode: hand the choice to Claude Code as a startup flag. "default"
   // adds nothing (the CLI calls that mode "manual"); "bypass" uses the dedicated
@@ -953,6 +966,25 @@ app.whenReady().then(() => {
   ipcMain.handle('publish:cancel', (_e, { cwd }) => publish.cancel(cwd));
   ipcMain.handle('publish:deny', (_e, { rels }) => publish.denyPaths(rels));
 
+  // -- IPC: ChatGPT accounts --------------------------------------------------
+  // Named Codex CLI homes, one signed-in ChatGPT account each (see codex.js).
+  // `accounts` reports labels, sign-in state and the account's email/plan —
+  // never the stored tokens.
+  ipcMain.handle('codex:accounts', () => codexAccounts.list());
+  ipcMain.handle('codex:addAccount', (_e, { label }) => codexAccounts.add(label));
+  ipcMain.handle('codex:renameAccount', (_e, { id, label }) => codexAccounts.rename(id, label));
+  ipcMain.handle('codex:removeAccount', (_e, { id }) => codexAccounts.remove(id));
+  ipcMain.handle('codex:signOutAccount', (_e, { id }) => codexAccounts.signOut(id));
+
+  // Model catalogs come from the installed CLIs, so provider rollouts and
+  // account entitlements can appear without a Hivemind release. Only reduced
+  // ids/labels cross IPC; raw CLI output (which can be large) stays in main.
+  ipcMain.handle('agents:models', (_e, { provider, codexAccount, force } = {}) =>
+    agentModels.discover(provider, {
+      codexHome: provider === 'codex' && codexAccount ? codexAccounts.homeFor(codexAccount) : null,
+      force: !!force,
+    }));
+
   // -- IPC: Plan pane ---------------------------------------------------------
   // The thread writes its plan to `.hivemind/plans/<planId>.md`; Hivemind reads
   // it and stores highlight-comments in a sidecar JSON alongside it.
@@ -1004,8 +1036,14 @@ app.whenReady().then(() => {
   // -- IPC: transcript tailing (chat wrapper) --------------------------------
   // Each chat-view pane binds to its Claude Code session transcript; parsed
   // JSONL entries stream back over transcript:entries / transcript:status.
+  // A ChatGPT thread on a non-default account runs with its own CODEX_HOME, so
+  // its rollout is written under that home — resolve the account id here, the
+  // same way spawnPty does, or the chat view would tail the wrong tree and
+  // never bind. The renderer never sends a path.
   ipcMain.handle('transcript:bind', (_e, opts) =>
-    transcript.bind(opts, (channel, payload) => {
+    transcript.bind(Object.assign({}, opts, {
+      codexHome: (opts && opts.codexAccount) ? codexAccounts.homeFor(opts.codexAccount) : null,
+    }), (channel, payload) => {
       if (mainWindow && !mainWindow.isDestroyed()) {
         mainWindow.webContents.send(channel, payload);
       }

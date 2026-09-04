@@ -1701,18 +1701,23 @@ button.usage-pill.crit { color: var(--danger); }
 }
 .history-row-time { font-size: 11px; color: var(--muted); margin-top: 2px; }
 .history-row-del,
-.history-row-send,
 .history-row-speak {
   flex: none; display: none;
   background: transparent; border: none; color: var(--muted);
   cursor: pointer; font-size: 13px; padding: 1px 4px; border-radius: 4px;
 }
+.history-row-send {
+  flex: none; display: grid; place-items: center;
+  width: 26px; height: 26px; margin-top: 1px;
+  background: transparent; border: 1px solid var(--border); color: var(--accent);
+  cursor: pointer; font-size: 12px; padding: 0; border-radius: 6px;
+}
 .history-row:hover .history-row-del,
-.history-row:hover .history-row-send,
 .history-row:hover .history-row-speak { display: block; }
 .history-row-del:hover { color: var(--danger); background: var(--bg); }
-.history-row-send:hover,
 .history-row-speak:hover { color: var(--accent); background: var(--bg); }
+.history-row-send:hover { border-color: var(--accent); background: var(--bg); }
+.history-row-send:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
 
 .history-empty { color: var(--muted); padding: 12px; font-size: 12px; }
 
@@ -2563,6 +2568,36 @@ mark.plan-cmt {
 .settings-about #set-app-version { color: var(--text); font-variant-numeric: tabular-nums; }
 #build-group .pill-btn { align-self: flex-start; }
 .settings-check span { line-height: 1.4; }
+
+/* -- Settings → ChatGPT accounts -------------------------------------------
+   One row per Codex CLI home: name, who it's signed in as, and its actions.
+   A row with no stored login is dimmed and its status accented, so the ones
+   still needing a `codex login` stand out. */
+.acct-list { display: flex; flex-direction: column; gap: 6px; }
+.acct-row {
+  display: flex; align-items: center; gap: 8px;
+  background: var(--panel); border: 1px solid var(--border);
+  border-radius: 6px; padding: 7px 10px; font-size: 13px;
+}
+.acct-row .spacer { flex: 1; }
+.acct-name { color: var(--text); font-weight: 600; }
+.acct-detail { color: var(--muted); font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 45%; }
+.acct-row.out .acct-detail { color: var(--accent); }
+.acct-btn {
+  background: transparent; border: 1px solid var(--border); color: var(--muted);
+  border-radius: 5px; padding: 3px 8px; font-size: 11px; cursor: pointer; flex: none;
+}
+.acct-btn:hover { border-color: var(--accent); color: var(--text); }
+.acct-add { display: flex; gap: 8px; align-items: center; }
+.acct-add input {
+  flex: 1; background: var(--panel); border: 1px solid var(--border); color: var(--text);
+  border-radius: 6px; padding: 7px 10px; font-size: 13px;
+}
+.acct-add input:focus { outline: none; border-color: var(--accent); }
+.acct-add .pill-btn { flex: none; }
+/* A thread whose ChatGPT account has no stored login — it will come up on
+   Codex's sign-in screen, and this is the only warning available before it does. */
+.pane-header .acct-select.acct-signed-out { border-color: var(--accent); color: var(--accent); }
 
 .hidden { display: none !important; }
 

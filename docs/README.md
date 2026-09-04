@@ -16,6 +16,8 @@ subsystem doc that covers the files you're about to touch.
 | Any UI: boards, panes, chat view, status dots, modals, shortcuts, settings, themes | `renderer.md` | `src/renderer.js`, `src/index.html`, `src/styles.css` |
 | Source Control panel, diffs, commits, push/pull, GitHub wizard, file explorer | `git-and-files.md` | `git.js`, `files.js` |
 | Publish panel, FTP upload, stored credentials, the file allowlist | `publish.md` | `publish.js` |
+| ChatGPT accounts (multiple Codex logins, `CODEX_HOME` per thread) | `main-process.md` + `renderer.md` | `codex.js` |
+| Agent model discovery (Claude/Codex/Grok CLI catalogs and fallbacks) | `main-process.md` + `renderer.md` | `agent-models.js` |
 | Chat-view transcripts, session binding, plans, todos, prompt history, usage pill | `sidecar-modules.md` | `transcript.js`, `plan.js`, `todo.js`, `promptHistory.js`, `usage.js` |
 | Voice typing, STT models, mic/VAD, Settings → Voice | `voice-dictation.md` | `src/voice-worker.js`, `scripts/fetch-model.mjs` |
 | Building, packaging, releasing, auto-update | `build-and-release.md` | `build.js`, `updater.js`, `scripts/before-build.js` |

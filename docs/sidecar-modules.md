@@ -84,7 +84,8 @@ Backs the **Prompt History panel** (renderer `src/renderer.js:6627-6839`): a per
 of prompts actually delivered to threads. Recorded by `recordPromptHistory`
 (`src/renderer.js:6832`) after Hivemind-command / todo-prefix interception, so app
 commands never appear in it. Each row offers: click → jump to that bubble in an open
-chat; ↩ → repost to the focused thread; 🎤 → re-speak the prompt in voice training.
+chat; the always-visible ➤ button → repost to the focused thread; 🎤 → re-speak the
+prompt in voice training.
 
 | Export | Does | IPC channel (`main.js:811-814`) |
 |---|---|---|
@@ -113,12 +114,16 @@ in-memory state (claims, tails, watchers) lives in main and old code keeps runni
   `~/.claude/projects/<encoded-project-dir>/<session-uuid>.jsonl`, where the encoding
   replaces every non-alphanumeric character of the cwd with `-`
   (`encodeProjectDir`, `transcript.js:54`).
-- **Codex CLI ("ChatGPT")**: `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl` — one
+- **Codex CLI ("ChatGPT")**: `<codex home>/sessions/YYYY/MM/DD/rollout-*.jsonl` — one
   date-partitioned tree shared by *all* projects. A rollout's owning cwd is read from its
   first line (`session_meta.payload.cwd`, `codexCwd`, `transcript.js:589`), and binding
   filters on it. Only today's and yesterday's date dirs are scanned for new candidates
   (`codexRecentDateDirs`, `transcript.js:399`); already-bound files are tailed wherever
-  they live.
+  they live. The home is `~/.codex` **unless the thread runs on a named ChatGPT
+  account**, which relocates the whole home via `CODEX_HOME` (see `codex.js`) — `bind`
+  takes a `codexHome`, resolved in main from the pane's account id, so panes on
+  different accounts watch different roots. Forgetting to pass it doesn't break the
+  thread; it silently leaves the chat view searching forever.
 
 ### The pane→file binding heuristic (rules in priority order)
 
@@ -250,7 +255,7 @@ This module is machine-global (not per-project) and writes nothing.
 
 Claude Code session transcripts and native plan files are *read* but never owned:
 `~/.claude/projects/…` (transcript.js, usage.js), `~/.claude/plans/…` (plan.js),
-`~/.codex/sessions/…` (transcript.js). `.hivemind/` itself is kept out of Git by
+`<codex home>/sessions/…` (transcript.js). `.hivemind/` itself is kept out of Git by
 `plan.ensureIgnored` — called opportunistically before nearly every write.
 
 ## Invariants & gotchas

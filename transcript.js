@@ -3,7 +3,9 @@
 // Transcript tailing for the chat wrapper. Claude Code writes a JSONL
 // transcript per session under ~/.claude/projects/<encoded-project-dir>/;
 // OpenAI's Codex CLI ("ChatGPT") writes a rollout JSONL per session under
-// ~/.codex/sessions/YYYY/MM/DD/. Each chat-view pane binds to "its" session
+// <codex home>/sessions/YYYY/MM/DD/ — normally ~/.codex, but a thread running
+// on a named ChatGPT account has its own home (see codex.js), so the root is
+// per-pane. Each chat-view pane binds to "its" session
 // file and receives every appended line as a parsed entry, which the renderer
 // classifies into chat rows. Codex lines are normalized here into the same
 // entry shape Claude produces, so one chat renderer serves both agents. The
@@ -56,7 +58,12 @@ const RETIRED_MAX = 500;          // bound the retired-files set over the proces
 const encodeProjectDir = (cwd) => String(cwd).replace(/[^a-zA-Z0-9]/g, '-');
 const transcriptDirFor = (cwd) =>
   path.join(os.homedir(), '.claude', 'projects', encodeProjectDir(cwd));
-const codexSessionsRoot = () => path.join(os.homedir(), '.codex', 'sessions');
+// Codex writes its rollouts under its *home* directory, which a ChatGPT thread
+// on a named account relocates via CODEX_HOME (see codex.js). `home` is that
+// resolved directory, or null for the CLI's own home — so panes on different
+// ChatGPT accounts tail different trees.
+const codexSessionsRoot = (home) =>
+  path.join(home || path.join(os.homedir(), '.codex'), 'sessions');
 
 // Codex rollouts for every project share one date-partitioned tree, so panes
 // can't be scoped by directory — each rollout's session_meta line carries the
@@ -83,11 +90,11 @@ const codexMeta = new Map(); // filePath -> { sizeChecked, cwd } (session_meta p
 
 const SESSION_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
-function bind({ paneId, cwd, resume, sessionId, agent }, sendFn) {
+function bind({ paneId, cwd, resume, sessionId, agent, codexHome }, sendFn) {
   if (sendFn) send = sendFn;
   unbind(paneId); // re-bind safely (respawn under the same id, defensive)
   const kind = agent === 'codex' ? 'codex' : 'claude';
-  const dir = kind === 'codex' ? codexSessionsRoot() : transcriptDirFor(cwd);
+  const dir = kind === 'codex' ? codexSessionsRoot(codexHome) : transcriptDirFor(cwd);
   const pane = {
     paneId,
     agent: kind,
@@ -419,8 +426,9 @@ function codexRecentDateDirs(root) {
 function scanDir(dir) {
   const dirPanes = [...panes.values()].filter((p) => p.dir === dir);
   if (!dirPanes.length) return;
-  // A watched dir is either one Claude project dir or the shared codex root,
-  // so every pane in it runs the same agent.
+  // A watched dir is either one Claude project dir or one Codex home's
+  // sessions root (threads on different ChatGPT accounts have different
+  // roots), so every pane in it runs the same agent.
   const agent = dirPanes[0].agent;
 
   const stats = listSessionFiles(dir, agent); // filePath -> fs.Stats
