@@ -7188,8 +7188,14 @@ function renderPublish() {
   host.title = host.textContent + '\n' + (PUB_SECURITY_LABEL[site.security] || site.security);
   const rpath = document.createElement('div');
   rpath.className = 'pub-path';
-  rpath.textContent = '/' + (site.remoteDir || '');
-  rpath.title = 'Remote folder: /' + (site.remoteDir || '') + '\n' + (PUB_SECURITY_LABEL[site.security] || site.security);
+  // A bare "/" reads like a configured path; spell out that no remote folder is
+  // set, because on shared hosting that publishes above the web root.
+  rpath.textContent = site.remoteDir ? '/' + site.remoteDir : 'FTP login root (no remote folder set)';
+  if (!site.remoteDir) rpath.classList.add('warn');
+  rpath.title = (site.remoteDir
+    ? 'Remote folder: /' + site.remoteDir
+    : 'No remote folder set — files go to the FTP login root, which on most hosts is above the website folder.')
+    + '\n' + (PUB_SECURITY_LABEL[site.security] || site.security);
   const when = document.createElement('div');
   when.className = 'pub-when';
   when.textContent = 'Last published ' + pubAgo(site.lastPublish);
@@ -7206,6 +7212,14 @@ function renderPublish() {
   targetRow.appendChild(editBtn);
   publishBody.appendChild(targetRow);
 
+  if (!site.remoteDir) {
+    // Legal, but on shared hosting the FTP login lands above the web root, so
+    // every file uploads successfully and the website never changes.
+    const warn = document.createElement('div');
+    warn.className = 'pub-warn';
+    warn.textContent = 'No remote folder is set, so files go to the FTP login root. On most hosts the website lives in a subfolder — public_html, or domains/your-domain.com/public_html — and publishing to the root changes nothing on the site. Set it in ⚙.';
+    publishBody.appendChild(warn);
+  }
   if (site.security === 'plain') {
     const warn = document.createElement('div');
     warn.className = 'pub-warn';
@@ -7516,7 +7530,10 @@ async function doPublish(all) {
   // the failures visible until that file publishes successfully.
   pubRowStatus.clear();
   for (const f of (res && res.failed) || []) pubRowStatus.set(f.rel, 'fail');
-  setPublishMsg((res && res.message) || 'Publish finished.', res && res.ok ? 'ok' : (failed || (res && res.ok === false) ? 'err' : ''));
+  // A warning outranks a cheerful "Published 18 files." — every file can
+  // transfer fine and still land somewhere the website isn't served from.
+  if (res && res.warning) setPublishMsg(res.message + ' ' + res.warning, 'err');
+  else setPublishMsg((res && res.message) || 'Publish finished.', res && res.ok ? 'ok' : (failed || (res && res.ok === false) ? 'err' : ''));
   if (res && res.uploaded) {
     window.api.notify({
       title: 'Hivemind',

@@ -1475,6 +1475,8 @@ button.usage-pill.crit { color: var(--danger); }
 .pub-target .pub-host, .pub-target .pub-path {
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
+/* No remote folder set — publishes above the web root on most hosts. */
+.pub-target .pub-path.warn { color: var(--yellow); }
 .pub-target-row { display: flex; align-items: center; gap: 8px; }
 .pub-target-row .pub-target { flex: 1; }
 

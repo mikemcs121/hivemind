@@ -302,6 +302,10 @@ function setConfig(dir, patch) {
   const key = keyFor(dir);
   const store = readStore();
   const rec = store.sites[key] || { dir: path.resolve(dir), files: [], state: {} };
+  // Upload state records local fingerprints, not "what is on that server", so
+  // it only means anything for one destination. Remember which one it was.
+  const destOf = (r) => [r.host || '', r.port || 21, r.remoteDir || ''].join(' ');
+  const destBefore = destOf(rec);
 
   const checks = [
     ['host', cleanHost, p.host],
@@ -352,6 +356,12 @@ function setConfig(dir, patch) {
   if (rec.remoteDir == null) rec.remoteDir = '';
   if (!SECURITY.has(rec.security)) rec.security = 'ftps-control';
   if (rec.insecureCert === undefined) rec.insecureCert = true;
+
+  // Pointing the hive at a different server or folder invalidates every
+  // fingerprint: the new destination has none of these files. Without this the
+  // next publish reports "Everything is already up to date." and uploads
+  // nothing — the same silent no-op that hid the empty-remoteDir bug.
+  if (destOf(rec) !== destBefore && Object.keys(rec.state || {}).length) rec.state = {};
 
   store.sites[key] = rec;
   if (!writeStore(store)) return { ok: false, message: 'Could not save the publish settings.' };
@@ -740,7 +750,15 @@ async function publish(dir, { all = false } = {}, onProgress = () => {}) {
   else if (failed.length) message = `${uploaded.length} uploaded, ${failed.length} failed: ${failed.map((f) => f.rel).join(', ')}`;
   else message = `Published ${uploaded.length} file${uploaded.length === 1 ? '' : 's'}.`;
 
-  return { ok: !failed.length && !cancelled, cancelled, uploaded: uploaded.length, files: uploaded, failed, skipped: skippedProblems, message };
+  // An empty remote folder is legal — it means the FTP login root — but on
+  // shared hosting the login lands *above* the web root, so every file
+  // transfers successfully and the website never changes. That failure is
+  // completely silent otherwise, so say it out loud.
+  const warning = !rec.remoteDir && uploaded.length
+    ? 'Uploaded to the FTP login root, because no remote folder is set. On most hosts the website lives in a subfolder (public_html, or domains/<your-domain>/public_html) and nothing on the site will have changed. Check the remote folder in ⚙.'
+    : undefined;
+
+  return { ok: !failed.length && !cancelled, cancelled, uploaded: uploaded.length, files: uploaded, failed, skipped: skippedProblems, message, warning };
 }
 
 function cancel(dir) {
