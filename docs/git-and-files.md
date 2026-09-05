@@ -27,7 +27,7 @@ raw CLI result shape `{ code, stdout, stderr }` — **they never reject**; failu
 | `stageAll(cwd)` | — | CLI result | `git add -A` |
 | `unstage(cwd, files)` | array of paths | CLI result | `git reset -q HEAD -- <files>` |
 | `unstageAll(cwd)` | — | CLI result | `git reset -q HEAD` |
-| `discard(cwd, files)` (`git.js:230`) | array of `{ path, untracked }` | CLI result (last failure wins) | tracked: `git restore --source=HEAD --staged --worktree -- <files>`; untracked: `fs.rmSync` (guarded by `insideCwd`; `{ recursive: true, force: true }` so untracked directories are removed too) |
+| `discard(cwd, files)` (`git.js:230`) | array of `{ path, untracked }` | CLI result (last failure wins) | tracked: `git restore --source=HEAD --staged --worktree -- <files>`; untracked: `fs.rmSync` (guarded by `insideCwd` **and** `realInside`; `{ recursive: true, force: true }` so untracked directories are removed too) |
 | `commit(cwd, message)` | message string | CLI result | `git commit -m <message>` |
 | `branches(cwd)` (`git.js:248`) | — | `string[]` (empty on error) | `git branch --format=%(refname:short)` |
 | `log(cwd, count = 3)` (`git.js:254`) | count clamped to 1–50 | `[{ hash, subject, when, author }]` newest first (empty on error / no commits) | `git log -n <count> --pretty=format:` with `%x1f`/`%x1e` separators |
@@ -53,7 +53,10 @@ untracked-file read/delete to the project tree (folds case on win32 before the p
 check, so case-differing in-tree paths aren't false-rejected); `realpathAllowMissing` /
 `realInside` resolve the *real* path (following symlinks) and re-verify containment
 (case-folded on win32) so a symlink can't point read/delete outside the tree — used by
-`diff`'s untracked read; `isSafeRemoteUrl` rejects `ext::`/`fd::`/`file::` and any
+`diff`'s untracked read **and `discard`'s recursive delete** (the latter checked only the
+lexical guard until recently, even though this file already claimed both call sites were
+covered; a recursive delete is the most destructive thing the module does, and Windows
+project trees are full of junctions); `isSafeRemoteUrl` rejects `ext::`/`fd::`/`file::` and any
 `scheme::` transport helper (allowing http(s)/ssh/git URLs and scp-style `user@host:path`)
 and `isSafeCloneTarget` additionally allows `owner/repo`; `unquotePath` (`git.js:159`)
 reverses git's C-style quoting of non-ASCII paths; `webUrlFromRemote` (`git.js:140`) maps

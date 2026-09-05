@@ -6,8 +6,7 @@
 // older/missing CLI never prevents the app from opening.
 
 const childProcess = require('child_process');
-const fs = require('fs');
-const path = require('path');
+const agentCli = require('./agent-cli');
 
 const TIMEOUT_MS = 15000;
 const MAX_OUTPUT = 8 * 1024 * 1024;
@@ -108,19 +107,12 @@ function parseClaude(stdout) {
   return normalize(aliases);
 }
 
+// PATH lookup lives in agent-cli.js, which also searches the install
+// directories a CLI can occupy without ever landing on PATH (the Codex desktop
+// app's per-build bin). Threads spawn with those same directories appended to
+// PATH, so discovery and the running thread agree on which binary a name means.
 function resolveCommand(name) {
-  const dirs = String(process.env.PATH || '').split(path.delimiter).map((p) => p.replace(/^"|"$/g, ''));
-  const extensions = process.platform === 'win32' ? ['.exe', '.cmd', '.bat', ''] : [''];
-  for (const dir of dirs) {
-    if (!dir) continue;
-    for (const ext of extensions) {
-      const candidate = path.join(dir, name + ext);
-      try {
-        if (fs.statSync(candidate).isFile()) return candidate;
-      } catch (_) { /* keep searching PATH */ }
-    }
-  }
-  return null;
+  return agentCli.resolveCommand(name);
 }
 
 function runCli(name, args, env) {
@@ -132,7 +124,7 @@ function runCli(name, args, env) {
   const shell = process.platform === 'win32' && /\.(cmd|bat)$/i.test(bin);
   return new Promise((resolve, reject) => {
     const options = {
-      env: Object.assign({}, process.env, env || {}),
+      env: agentCli.augmentEnv(Object.assign({}, process.env, env || {})),
       windowsHide: true,
       timeout: TIMEOUT_MS,
       maxBuffer: MAX_OUTPUT,
@@ -157,7 +149,11 @@ function runCli(name, args, env) {
 }
 
 async function discover(provider, options = {}) {
-  const fallback = FALLBACKS[provider];
+  // `FALLBACKS[provider]` on its own inherits from Object.prototype, so a
+  // provider of "constructor" or "toString" returns something truthy, sails past
+  // the guard, and throws deeper in `merge`. Own properties only.
+  const known = Object.prototype.hasOwnProperty.call(FALLBACKS, provider);
+  const fallback = known ? FALLBACKS[provider] : null;
   if (!fallback) return { provider, models: [], source: 'fallback', installed: false, error: 'Unknown agent.' };
   const codexHome = provider === 'codex' && options.codexHome ? String(options.codexHome) : '';
   const key = provider + '\0' + codexHome;

@@ -27,7 +27,14 @@
           </span>
           <button id="add-board" title="New hive">＋</button>
         </div>
-        <ul id="board-list"></ul>
+        <!-- Placeholder rows so the hive list reads as "still loading" rather
+             than "you have no hives" during the first paint; renderBoardList
+             clears them the moment the real list arrives. -->
+        <ul id="board-list">
+          <li class="board-skel"></li>
+          <li class="board-skel"></li>
+          <li class="board-skel"></li>
+        </ul>
 
         <!-- File Explorer panel — docked inside the sidebar -->
         <aside id="files-panel" class="hidden">
@@ -51,41 +58,6 @@
           </div>
           <div id="git-body"></div>
           <div id="git-msgbar" class="git-msgbar hidden"></div>
-        </aside>
-
-        <!-- Publish panel — upload this hive's site to a web host over FTP.
-             Connection settings and the DPAPI-encrypted password live in
-             Hivemind's userData, never in the project folder. -->
-        <aside id="publish-panel" class="hidden">
-          <div class="git-header">
-            <span class="git-title">Publish</span>
-            <div class="spacer"></div>
-            <button id="publish-refresh" class="git-icon" title="Rescan for changed files">⟳</button>
-            <button id="publish-close" class="git-icon" title="Close">✕</button>
-          </div>
-          <div id="publish-body"></div>
-          <div id="publish-msgbar" class="git-msgbar hidden"></div>
-        </aside>
-
-        <!-- Todo panel — a per-hive checklist stored in .hivemind/todos.json -->
-        <aside id="todo-panel" class="hidden">
-          <div class="git-header">
-            <span class="git-title">Todo</span>
-            <div class="spacer"></div>
-            <button id="todo-refresh" class="git-icon" title="Refresh">⟳</button>
-            <button id="todo-close" class="git-icon" title="Close">✕</button>
-          </div>
-          <div class="todo-addbar">
-            <input id="todo-input" type="text" placeholder="Add a todo…" autocomplete="off" spellcheck="true" />
-            <button id="todo-add" class="git-icon" title="Add todo">＋</button>
-          </div>
-          <div id="todo-body"></div>
-          <div id="todo-footer" class="todo-footer hidden">
-            <span id="todo-count"></span>
-            <div class="spacer"></div>
-            <button id="todo-clear-done" class="todo-linkbtn">Clear completed</button>
-          </div>
-          <div id="todo-msgbar" class="git-msgbar hidden"></div>
         </aside>
 
         <!-- Chat with Hivemind — command console docked inside the sidebar.
@@ -136,21 +108,6 @@
               <path d="M18 9a9 9 0 0 1-9 9" />
             </svg>
           </button>
-          <button id="publish-toggle" class="sidebar-action-btn" title="Publish to website (FTP)" aria-label="Publish to website" disabled>
-            <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor"
-                 stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-              <path d="M20 17.6A4 4 0 0 0 18 10h-1.3A7 7 0 1 0 5 16.3" />
-              <polyline points="9 13 12 10 15 13" />
-              <line x1="12" y1="10" x2="12" y2="21" />
-            </svg>
-          </button>
-          <button id="todo-toggle" class="sidebar-action-btn" title="Todo" aria-label="Todo" disabled>
-            <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor"
-                 stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-              <path d="M9 11l3 3L22 4" />
-              <path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11" />
-            </svg>
-          </button>
           <button id="history-toggle" class="sidebar-action-btn" title="Prompt History — click an entry to jump to it in the chat" aria-label="Prompt History" disabled>
             <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor"
                  stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
@@ -172,20 +129,35 @@
 
       <main id="workspace">
         <header id="board-bar">
-          <div id="board-title">No hive selected</div>
+          <!-- Neutral until init() knows whether there are hives — see #boot-state. -->
+          <div id="board-title">Loading…</div>
           <div id="board-meta"></div>
           <div class="spacer"></div>
-          <button id="usage-btn" class="pill-btn usage-pill" title="Claude usage — how much of your plan's limits you've used">Usage</button>
-          <button id="voice-toggle" class="icon-btn" title="Voice typing — dictate into the focused thread (toggle with the ~ key)" disabled>🎤</button>
+          <button id="usage-btn" class="pill-btn usage-pill" title="Agent usage — how much of each agent's plan you've used"><span class="usage-seg">Usage</span></button>
+          <button id="voice-toggle" class="icon-btn" title="Voice typing — dictate into the focused thread (toggle with the ~ key)" aria-label="Voice typing" disabled>
+            <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor"
+                 stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <rect x="9" y="2.5" width="6" height="11" rx="3" />
+              <path d="M5 11a7 7 0 0 0 14 0" />
+              <line x1="12" y1="18" x2="12" y2="21.5" />
+            </svg>
+          </button>
           <button id="settings-btn" class="icon-btn" title="Settings">⚙</button>
           <button id="help-btn" class="icon-btn" title="Help">❔</button>
           <button id="add-term" class="primary" disabled>＋ Thread</button>
         </header>
-        <section id="grid"></section>
+        <section id="grid" class="hidden"></section>
 
         <!-- Live voice status / interim transcript overlay (shown while listening) -->
         <div id="voice-hud" class="hidden">
-          <span class="vh-mic">🎙️</span>
+          <span class="vh-mic" aria-hidden="true">
+            <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor"
+                 stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
+              <rect x="9" y="2.5" width="6" height="11" rx="3" />
+              <path d="M5 11a7 7 0 0 0 14 0" />
+              <line x1="12" y1="18" x2="12" y2="21.5" />
+            </svg>
+          </span>
           <span class="vh-state">Listening…</span>
           <span class="vh-text" id="voice-hud-text"></span>
           <span class="vh-target" id="voice-hud-target"></span>
@@ -199,11 +171,26 @@
           <button id="voice-suggest-add" class="primary">Add</button>
           <button id="voice-suggest-no" title="Don't suggest this correction again">✕</button>
         </div>
-        <div id="empty-state" class="empty">
+        <!-- What the first paint shows. Loading the hives (and the panes they
+             rebuild) takes a moment, and the welcome screen below used to fill
+             that gap — telling returning users, wrongly, that they had nothing
+             set up. This says "loading" until init() knows the answer, and only
+             then is one of #grid / #empty-state revealed. -->
+        <div id="boot-state" class="empty boot">
+          <div class="boot-spinner" aria-hidden="true"></div>
+          <p class="boot-text">Loading your hives…</p>
+        </div>
+        <div id="empty-state" class="empty hidden">
           <h2>Welcome 👋</h2>
           <p>Create a hive, point it at a project directory, and open as many
-             Claude threads as you like — they all share that directory.</p>
-          <button id="empty-add-board" class="primary">Create your first hive</button>
+             agent threads as you like — they all share that directory.</p>
+          <div class="empty-actions">
+            <button id="empty-setup" class="primary">Set up an agent</button>
+            <button id="empty-add-board">Create a hive</button>
+          </div>
+          <p class="empty-note">New here? <strong>Set up an agent</strong> checks which agent
+             CLIs are installed on this machine, helps you get one connected, and makes
+             your first hive at the end.</p>
         </div>
       </main>
     </div>
@@ -220,29 +207,6 @@
       </div>
     </div>
 
-    <!-- "Choose files to publish" — a lazy checkbox tree of the project folder.
-         Ticking a folder publishes it recursively; files Hivemind refuses to
-         upload (secrets, .git, node_modules …) are shown struck through. -->
-    <div id="publish-pick-backdrop" class="hidden">
-      <div id="publish-pick-modal">
-        <div class="diff-head">
-          <span id="publish-pick-title">Files to publish</span>
-          <div class="spacer"></div>
-          <button id="publish-pick-close" class="git-icon" title="Close">✕</button>
-        </div>
-        <div id="publish-pick-hint" class="pub-pick-hint">
-          Tick what should go to the website. Ticking a folder publishes everything
-          inside it. Anything not ticked stays on this machine.
-        </div>
-        <div id="publish-pick-body"></div>
-        <div class="pub-pick-foot">
-          <span id="publish-pick-count" class="pub-pick-count"></span>
-          <div class="spacer"></div>
-          <button id="publish-pick-cancel" class="plan-mini-btn">Cancel</button>
-          <button id="publish-pick-save" class="primary">Save list</button>
-        </div>
-      </div>
-    </div>
 
     <!-- Plan review — a thread's plan as a full document, with inline comments
          and Approve / Request-changes actions that answer Claude Code's own
@@ -317,6 +281,23 @@
       </div>
     </div>
 
+    <!-- First-run setup wizard — pick an agent, install/sign it in, then make
+         the first hive. Shown automatically on a profile with no hives that
+         hasn't been through setup; reopenable from the empty state, Settings,
+         and "Hivemind, run setup". -->
+    <div id="setup-backdrop" class="hidden">
+      <div id="setup-modal">
+        <div class="gh-head">
+          <span id="setup-title">Welcome to Hivemind</span>
+          <span id="setup-steps" class="setup-steps"></span>
+          <div class="spacer"></div>
+          <button id="setup-close" class="git-icon" title="Close">✕</button>
+        </div>
+        <div id="setup-body"></div>
+        <div id="setup-msg" class="gh-msg hidden"></div>
+      </div>
+    </div>
+
     <!-- Settings (tabbed) — consolidates app preferences in one place -->
     <div id="settings-backdrop" class="hidden">
       <div id="settings-modal">
@@ -345,6 +326,9 @@
 
             <div class="settings-group">
               <div class="settings-group-title">Defaults for new threads</div>
+              <label>Agent
+                <select id="set-default-agent"></select>
+              </label>
               <label>Claude model
                 <select id="set-default-model"></select>
               </label>
@@ -365,6 +349,14 @@
                 A−/A+ and Ctrl+scroll.</small>
               <button id="refresh-agent-models" class="pill-btn">Refresh agent models</button>
               <small id="agent-model-status">Checking installed agents…</small>
+            </div>
+
+            <div class="settings-group">
+              <div class="settings-group-title">Agent setup</div>
+              <button id="open-setup" class="pill-btn">🧭 Run agent setup…</button>
+              <small id="setup-status">Checks which agent CLIs are installed and signed in on
+                this machine and walks you through connecting one. Safe to run any time — it
+                only offers to create a hive at the end if you want one.</small>
             </div>
 
             <div class="settings-group">
@@ -410,7 +402,7 @@
                 <input type="checkbox" id="set-autocorrect" />
                 <span>Autocorrect spelling as you type — clear typos are fixed the
                   moment you finish a word, everywhere spelling is checked (the chat
-                  composer, todos, commit messages, …)</span>
+                  composer, commit messages, …)</span>
               </label>
               <small>Ctrl+Z undoes a correction. Right-click a squiggled word and
                 choose <em>Add to dictionary</em> to stop it being corrected.</small>
@@ -550,8 +542,9 @@
           <div class="settings-group">
             <div class="settings-group-title">Getting started</div>
             <ol class="help-list">
+              <li><strong>First run — get an agent connected.</strong> Hivemind runs agent command-line tools (Claude Code, OpenAI's Codex, Gemini, Grok) in its threads; it never talks to a model service itself, so at least one of them has to be installed on this machine. The first time you open Hivemind with no hives, a <strong>setup wizard</strong> appears: it shows every agent with a live status — <em>ready</em>, <em>sign-in needed</em>, or <em>not installed</em> — read from this machine, gives you the exact install command (with a <strong>⧉ Copy</strong> button) for the one you pick, and re-checks by itself while you install it in another window. The last step makes your first hive and opens a thread on the agent you chose. Signing in happens in that thread, in the agent's own sign-in screen. You can reopen the wizard any time from <strong>⚙ Settings → General → Agent setup</strong>, from the <strong>Set up an agent</strong> button on the welcome screen, or by saying <em>“Hivemind, run setup”</em>. On every later start Hivemind shows <strong>Loading your hives…</strong> until your saved hives are open, so the welcome screen and the wizard only ever appear when there really is nothing set up.</li>
               <li>Click <strong>＋</strong> next to the logo to create a <em>hive</em> and point it at a project directory — pick an existing folder with <strong>Browse…</strong>, or use <strong>⬇ Clone a project from GitHub…</strong> to sign in to GitHub and clone one of your repositories into a new folder first.</li>
-              <li>Press <strong>＋ Thread</strong> to open a Claude thread — open as many as you like; they all share the hive's directory.</li>
+              <li>Press <strong>＋ Thread</strong> to open a Claude thread — open as many as you like; they all share the hive's directory. Threads tile up to <strong>three across</strong>, then wrap onto a second row (the fourth thread stacks under the shortest column). Drag the bars between threads to resize them.</li>
               <li>Use the
                 <strong><svg class="help-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z" /></svg> Explorer</strong>
                 and
@@ -559,22 +552,21 @@
                 buttons to browse files and manage Git, the
                 <strong><svg class="help-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 17.6A4 4 0 0 0 18 10h-1.3A7 7 0 1 0 5 16.3" /><polyline points="9 13 12 10 15 13" /><line x1="12" y1="10" x2="12" y2="21" /></svg> Publish</strong>
                 button to upload a website to your web host over FTP, and the
-                <strong><svg class="help-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 11l3 3L22 4" /><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11" /></svg> Todo</strong>
-                button to keep a checklist for the hive, and the
                 <strong><svg class="help-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9" /><polyline points="12 7 12 12 15.5 14" /></svg> Prompt History</strong>
                 button to see the prompts you've sent in this hive — click one to jump to that prompt in the conversation where it appears (the thread is focused and the message flashes briefly). Use the visible <strong>➤</strong> button to send it again to the focused thread. Hover an entry for <strong>🎤</strong> to re-speak that prompt in voice training (read it aloud and accept dictionary fixes for anything misheard), or <strong>🗑</strong> to remove it from the list.</li>
-              <li><strong>Drag the sidebar's right edge</strong> to make it (and the Explorer, Source Control, Publish, Todo, Prompt History and 🐝 Chat with Hivemind panels docked in it) wider or narrower. Double-click the edge to reset the width; it's remembered across restarts.</li>
+              <li>While one of those panels is open the sidebar <strong>keeps the hive you're working on pinned at the top</strong>, so you can always see which project the panel is showing. Click that pinned row (marked <strong>⌄</strong>) to drop down the full hive list and switch hives without closing the panel.</li>
+              <li><strong>Drag the sidebar's right edge</strong> to make it (and the Explorer, Source Control, Publish, Prompt History and 🐝 Chat with Hivemind panels docked in it) wider or narrower. Double-click the edge to reset the width; it's remembered across restarts.</li>
             </ol>
           </div>
 
           <div class="settings-group">
             <div class="settings-group-title">Threads</div>
             <ul class="help-list">
-              <li><strong>🎤 Voice typing</strong> — dictate into the focused thread; speech is transcribed on-device (English, fully offline) and typed at the cursor when you pause. Toggle with the <kbd>~</kbd> key. You can start speaking right away — words spoken while the model loads are kept, and toggling off still types what you had just said. If the HUD says “Didn’t catch that”, the model heard you but couldn’t make out words. In <strong>⚙ Settings → Voice</strong> you can pick the <strong>recognition model</strong> (the default Moonshine model is bundled; others download once, then run offline — <strong>Parakeet</strong>, by far the most accurate, is a ~630&nbsp;MB one-time download that runs natively on your CPU) and use the user dictionary to fix words it mishears. Hivemind also <strong>learns from your fixes</strong>: when you edit dictated text in a composer before sending and make the same fix twice, a small offer appears to add that correction to the dictionary with one click (✕ declines it for good). You can also <strong>train the dictionary proactively</strong>: click <strong>🎓 Train dictionary</strong> in <strong>⚙ Settings → Voice</strong> (or say <em>“Hivemind, train dictionary”</em>) to read short practice sentences built from your own prompt history — Hivemind compares what it heard with the sentence and proposes corrections you can add with one click.</li>
+              <li><strong>Voice typing</strong> (the mic button in the board bar) — dictate into the focused thread; speech is transcribed on-device (English, fully offline) and typed at the cursor when you pause. Toggle with the <kbd>~</kbd> key. You can start speaking right away — words spoken while the model loads are kept, and toggling off still types what you had just said. If the HUD says “Didn’t catch that”, the model heard you but couldn’t make out words. In <strong>⚙ Settings → Voice</strong> you can pick the <strong>recognition model</strong> (the default Moonshine model is bundled; others download once, then run offline — <strong>Parakeet</strong>, by far the most accurate, is a ~630&nbsp;MB one-time download that runs natively on your CPU) and use the user dictionary to fix words it mishears. Hivemind also <strong>learns from your fixes</strong>: when you edit dictated text in a composer before sending and make the same fix twice, a small offer appears to add that correction to the dictionary with one click (✕ declines it for good). You can also <strong>train the dictionary proactively</strong>: click <strong>🎓 Train dictionary</strong> in <strong>⚙ Settings → Voice</strong> (or say <em>“Hivemind, train dictionary”</em>) to read short practice sentences built from your own prompt history — Hivemind compares what it heard with the sentence and proposes corrections you can add with one click.</li>
               <li>Every new thread gets a short random <strong>name</strong> — <em>Leo</em>, <em>Nina</em>, … — shown as its header title. Use it to address the thread in Hivemind commands: <em>“Hivemind, run the tests in Leo”</em> or <em>“Hivemind, tell Leo to fix the login bug”</em>. Double-click the name to rename a thread.</li>
               <li>Just below the header, the chat view's top bar shows a <strong>caption</strong> built from the last prompt you send the thread (to the left of <strong>🕘 History</strong>), so you can see what every thread is working on at a glance. Short replies like <em>yes</em>, <em>no</em> or a menu number don't replace the caption, so answering a prompt keeps the real task on show.</li>
-              <li>Each thread can run a different <strong>agent</strong> — pick <em>Claude</em>, <em>ChatGPT</em>, <em>Gemini</em>, or <em>Grok</em> from the dropdown in the thread header. One hive can mix them (e.g. three Claude threads and one ChatGPT thread). Switching a running thread restarts it with the new agent. ChatGPT needs OpenAI's Codex CLI (<code>npm install -g @openai/codex</code>), Gemini needs Google's Gemini CLI (<code>npm install -g @google/gemini-cli</code>), and Grok needs the official Grok Build installer from <code>https://x.ai/cli</code>. Launch each CLI once and complete its sign-in flow.</li>
-              <li>Claude, ChatGPT, and Grok threads have a <strong>model</strong> dropdown. Hivemind refreshes models from the installed CLIs at startup and when Settings opens; use <strong>Refresh agent models</strong> after a new release or login. Claude's rolling aliases automatically track their latest family versions. Grok switches live via <code>/model</code>; ChatGPT restarts with a fresh conversation because its model is selected at startup. Gemini currently has no model dropdown.</li>
+              <li>Each thread can run a different <strong>agent</strong> — pick <em>Claude</em>, <em>ChatGPT</em>, <em>Gemini</em>, or <em>Grok</em> from the dropdown in the thread header. One hive can mix them (e.g. three Claude threads and one ChatGPT thread). Switching a running thread restarts it with the new agent. ChatGPT needs OpenAI's Codex CLI (<code>npm install -g @openai/codex</code>), Gemini needs Google's Gemini CLI (<code>npm install -g @google/gemini-cli</code>), and Grok needs the official Grok Build installer from <code>https://x.ai/cli</code>. Launch each CLI once and complete its sign-in flow. If you have the <strong>Codex desktop app</strong>, its bundled <code>codex</code> is found automatically — no separate install or PATH setup needed. To see which of them are installed and signed in on this machine (and get the install command for one that isn't), run the <strong>setup wizard</strong> from <strong>⚙ Settings → General → Agent setup</strong>. New threads open on the agent set in <strong>⚙ Settings → General → Defaults for new threads → Agent</strong>, which the setup wizard also sets to whichever agent you picked.</li>
+              <li>Claude, ChatGPT, and Grok threads have a <strong>model</strong> dropdown. Hivemind refreshes models from the installed CLIs at startup and when Settings opens; use <strong>Refresh agent models</strong> after a new release or login. Claude's rolling aliases automatically track their latest family versions. Grok switches live via <code>/model</code>; ChatGPT restarts with a fresh conversation because its model is selected at startup. Gemini currently has no model dropdown. Claude and Grok switch by typing <code>/model</code> into the running thread, so if the thread is <strong>showing a menu or a question</strong> the switch waits until you've answered it — typing into a menu would otherwise pick an option for you.</li>
               <li>ChatGPT threads also have an <strong>account</strong> dropdown, so different threads can run as <strong>different ChatGPT logins at the same time</strong>. Add accounts in <strong>⚙ Settings → General → ChatGPT accounts</strong> — each one gets its own private Codex home, seeded with a copy of your Codex settings but no credentials. To sign a new account in, pick it on a ChatGPT thread and follow Codex's sign-in screen (approve it in a browser signed into that ChatGPT account); an account with no stored login is marked <em>(sign in)</em> and its dropdown is highlighted. The account is read when Codex starts, so switching it <strong>restarts the thread</strong> with a fresh conversation. <em>Default</em> is whatever <code>codex login</code> put in <code>~/.codex</code>. Settings also has <em>Sign out</em> (drops the stored login, keeps the account) and <em>Remove</em> (deletes the account's Codex home from this machine; the ChatGPT account itself is untouched).</li>
               <li>Each Claude thread has a <strong>permission mode</strong> dropdown in its header — <em>Default</em>, <em>Accept&nbsp;Edits</em>, <em>Auto</em>, <em>Plan</em>, or <em>Bypass&nbsp;⚠</em> — so you can see and set the mode without hunting for it in Claude's own display. It's handed to Claude Code as a startup flag (<em>Bypass</em> skips the accept-permissions screen entirely). Since Claude has no command to change mode mid-session, switching a running thread restarts it (resuming the conversation when there is one). If the thread is <strong>mid-turn</strong>, the switch waits until the turn ends rather than killing the work in flight — the dropdown goes dashed and dimmed while it's pending, and the restart happens as soon as the thread is done (or as soon as you've answered, if it stops to ask you something). The dropdown also <strong>follows the thread</strong>: if the mode changes inside Claude — you press <kbd>Shift</kbd>+<kbd>Tab</kbd> in the terminal, or approving a plan moves the thread to auto/manual — the dropdown updates to match, without restarting anything. <em>Bypass</em> turns the dropdown amber as a reminder that permissions are being skipped. The choice is remembered as the default for new threads.</li>
               <li>When a thread <strong>finishes its turn</strong>, its whole pane pulses green and the header status shows <strong>✓ done</strong> until you click into that thread — so completed work stands out across a busy hive. The hive list's status dot and the maximize tab strip's dots pulse green too. (Threads that need an answer or hit an error still pulse amber/red as before.)</li>
@@ -592,17 +584,17 @@
               <li>On Claude threads, click <strong>🕘 History</strong> in the top bar to browse this thread's <strong>past conversations</strong>. The menu lists earlier sessions in the project (newest first, titled by their topic or first message); pick one to view it over the live chat. To <strong>continue</strong> a past conversation, just type in the composer and send — the thread restarts on that conversation (<code>claude --resume</code>) with your message as the next turn. Click <strong>Back to live</strong> (or the <em>live</em> entry in the menu) to return to the running conversation instead, which keeps updating underneath the whole time.</li>
               <li>While the thread is working on a turn, a spinning <strong>🌀 swirl</strong> appears below the last message; it disappears when the turn finishes.</li>
               <li><strong>Hover any of the agent's replies</strong> to reveal a small <strong>⧉ Copy</strong> button at the end of the message — click it to copy that message's raw markdown to the clipboard (it flips to ✓ briefly to confirm). Each <strong>code block</strong> gets its own <strong>⧉</strong> button in its top-right corner (revealed on hover) that copies just that block's code.</li>
-              <li>When Claude asks you a multiple-choice question, it appears as a <strong>question card</strong> in the chat — click an option to answer (it presses that option's number in the hidden terminal — plus <kbd>Enter</kbd> on the questions Claude Code shows with a preview panel, where the number only moves the selection — and a click only fires while the menu is really still on screen, so a stale card can't press keys into whatever replaced it; on the rare menu with more than 9 options, options past 9 need the terminal; multi-select options show a ☑ as you toggle them — click <em>Review ⇥</em>, and Claude Code's confirmation step appears as its own card where <em>Submit answers</em> sends your picks). The thread shows <strong>needs you</strong> until the question is answered. For a custom answer, click <strong>Open terminal</strong> on the card and type it there. Claude Code's plan-approval menu (<em>“Ready to code?”</em> / <em>“Would you like to proceed?”</em>) appears as the same kind of card — with the <strong>full plan review embedded right on the card</strong>: the plan renders as a collapsible 📋 section above the options, you can <strong>highlight any plan text and click ＋ Comment</strong> to attach a note (comments appear in a rail under the plan, with ✓ to resolve), and the card's <strong>Request changes</strong> button (next to the <em>Overall feedback</em> line) picks <em>“No, keep planning”</em> and sends your comments to the thread as the revision request. Click a menu option to approve the plan or keep planning, or click <strong>📋 Open as window</strong> to do the same review in a full window instead — both share the same plan and comments. <strong>ChatGPT approval prompts</strong> (run a command, make edits, grant permissions, network access) appear as the same kind of card too, showing what's being approved with clickable options.</li>
+              <li>When Claude asks you a multiple-choice question, it appears as a <strong>question card</strong> in the chat — click an option to answer (it presses that option's number in the hidden terminal — plus <kbd>Enter</kbd> on the questions Claude Code shows with a preview panel, where the number only moves the selection — and a click only fires while the menu is really still on screen, so a stale card can't press keys into whatever replaced it; on the rare menu with more than 9 options, options past 9 use Interact; multi-select options show a ☑ as you toggle them — click <em>Review ⇥</em>, and Claude Code's confirmation step appears as its own card where <em>Submit answers</em> sends your picks). The thread shows <strong>needs you</strong> until the question is answered. For a custom answer, click <strong>Interact</strong> on the card and type in the live controls inside chat. Click <strong>Done</strong> to close them. Claude Code's plan-approval menu (<em>“Ready to code?”</em> / <em>“Would you like to proceed?”</em>) appears as the same kind of card — with the <strong>full plan review embedded right on the card</strong>: the plan renders as a collapsible 📋 section above the options, you can <strong>highlight any plan text and click ＋ Comment</strong> to attach a note (comments appear in a rail under the plan, with ✓ to resolve), and the card's <strong>Request changes</strong> button (next to the <em>Overall feedback</em> line) picks <em>“No, keep planning”</em> and sends your comments to the thread as the revision request. Click a menu option to approve the plan or keep planning, or click <strong>📋 Open as window</strong> to do the same review in a full window instead — both share the same plan and comments. <strong>ChatGPT approval prompts</strong> (run a command, make edits, grant permissions, network access) appear as the same kind of card too, showing what's being approved with clickable options.</li>
               <li><strong>Filter chips</strong> at the top right (<em>Tools</em>, <em>Thinking</em>, <em>Meta</em>, <em>Subagents</em>) control exactly what the chat shows. Tool calls appear as collapsed one-liners — click one to expand its input and result. Your choices persist per thread and become the default for new threads.</li>
               <li>The <strong>composer</strong> at the bottom sends to the thread: <kbd>Enter</kbd> sends, <kbd>Shift</kbd>+<kbd>Enter</kbd> adds a line — multi-line messages arrive as one message. Press <kbd>↑</kbd> in an empty composer (or on the first line) to <strong>recall</strong> messages you've sent before, <kbd>↓</kbd> to come back — editing keeps whatever you land on. Misspelled words get a red squiggle — <strong>right-click</strong> for suggestions or to add a word to the dictionary — and clear typos are <strong>autocorrected</strong> the moment you finish a word (<kbd>Ctrl</kbd>+<kbd>Z</kbd> undoes a fix; <em>Add to dictionary</em> protects a word; turn it off in <strong>⚙ Settings → General → Typing</strong>).</li>
               <li>Click <strong>⏹ Interrupt</strong> next to the composer's ➤ send button to stop whatever the thread is running — it sends the same <kbd>Ctrl</kbd>+<kbd>C</kbd> the terminal would, without you having to open the terminal view first. Handy for cutting off a long-running command or a turn that's gone down the wrong path.</li>
               <li><strong>Attachments</strong>: paste an image (including Win+Shift+S screenshots), drag files onto the chat, or click <strong>📎</strong> to pick files — each shows as a chip above the input (images get a thumbnail preview). Click a chip's <strong>✕</strong> to remove it; when you send, the attached files' paths go along with your message so the agent can read them. On <strong>ChatGPT threads</strong>, images are handed to Codex as real image input (they appear as <em>[Image #N]</em> in its composer, so the model can actually see them), and other files from outside the project are first copied into <code>.hivemind/attachments/</code> in the project (the Codex sandbox can only read files inside its workspace); the copies are git-ignored and swept after a week.</li>
               <li>The composer <strong>autocompletes</strong> as you type: start a message with <kbd>/</kbd> for slash-command suggestions (Claude Code built-ins plus your project's <code>.claude/commands</code> and <code>.claude/skills</code>), or type <kbd>@</kbd> anywhere for file paths from the project directory — completing a folder steps into it. <kbd>↑</kbd>/<kbd>↓</kbd> pick a suggestion, <kbd>Tab</kbd> or <kbd>Enter</kbd> accepts it, <kbd>Esc</kbd> dismisses the menu.</li>
-              <li>When the hidden terminal needs something the chat can't show — a permission prompt, an approval menu, an error, or a turn that ended on a question — it appears as a <strong>card in the chat flow</strong> (right where the conversation is), with quick keys (<em>1</em> and <em>2</em> when it's a numbered menu, plus <em>Enter</em> and <em>Esc</em>) and an <strong>Open terminal</strong> button showing the real prompt; like question cards, the keys only fire while the prompt is really still waiting. While a prompt is waiting the <strong>composer is locked</strong> — a typed message wouldn't reach the terminal (it wants a menu keypress), so answer with the card's keys or open the terminal for a custom reply; the composer unlocks the moment the prompt is answered. This works on both Claude and ChatGPT threads (ChatGPT approvals appear while the thread still looks busy, and recognized ones render as full question cards instead).</li>
-              <li>If the thread's agent needs you to <strong>sign in again</strong> — a Claude login that expired, a <code>/login</code> nudge, or the CLI starting up on its login chooser — the chat view says so instead of going quiet: a <strong>🔑 Sign in to continue</strong> card appears in the conversation showing exactly what the terminal is asking, with an <strong>Open terminal to sign in</strong> button, the thread's header status reads <strong>sign in</strong>, and you get a notification. The composer stays locked while it lasts, because nothing typed there can reach the thread until it's signed back in — it unlocks by itself once you are.</li>
-              <li>If a message you send gets <strong>no response at all</strong> and the thread isn't working on it, the message is marked <strong>⚠ no response yet</strong> with its own <strong>Open terminal</strong> button, so a send that quietly went nowhere (a login screen, a wedged terminal) never just sits there looking delivered.</li>
+              <li>When the hidden terminal needs something the chat can't show — a permission prompt, an approval menu, or an error — it appears as a <strong>card in the chat flow</strong> (right where the conversation is), with quick keys (<em>1</em> and <em>2</em> when it's a numbered menu, plus <em>Enter</em> and <em>Esc</em>) and an <strong>Interact</strong> button showing the live prompt inside chat; like question cards, the keys only fire while the prompt is really still waiting. While a prompt is waiting the <strong>composer is locked</strong> — a typed message wouldn't reach the terminal (it wants a menu keypress), so answer with the card's keys or use Interact for a custom reply; the composer unlocks the moment the prompt is answered. Ordinary follow-up questions remain answerable directly in the composer. This works on both Claude and ChatGPT threads (ChatGPT approvals appear while the thread still looks busy, and recognized ones render as full question cards instead).</li>
+              <li>If the thread's agent needs you to <strong>sign in again</strong> — a Claude login that expired, a <code>/login</code> nudge, or the CLI starting up on its login chooser — the chat view says so instead of going quiet: a <strong>🔑 Sign in to continue</strong> card appears in the conversation showing exactly what the terminal is asking, with an <strong>Interact to sign in</strong> button, the thread's header status reads <strong>sign in</strong>, and you get a notification. The composer stays locked while it lasts, because nothing typed there can reach the thread until it's signed back in — it unlocks by itself once you are.</li>
+              <li>If a message you send gets <strong>no response at all</strong> and the thread isn't working on it, the message is marked <strong>⚠ no response yet</strong> with its own <strong>Interact</strong> button, so a send that quietly went nowhere (a login screen, a wedged terminal) never just sits there looking delivered.</li>
               <li>If the agent hits an <strong>API error</strong> — the chosen model isn't available on your account, a usage limit was hit, the request failed — the full error message appears in the chat as a <strong>red error card</strong> (it's never hidden by the filter chips), and the thread's status flips to <em>error</em> so you're notified.</li>
-              <li>The chat is read from the thread's local session log — Claude Code's transcript for Claude threads, the Codex CLI's session file for ChatGPT threads. If Hivemind can't find a Claude transcript (e.g. a custom startup command that isn't <code>claude</code>), a notice appears; a ChatGPT chat simply fills in from your first message (Codex writes its log when the conversation starts). The terminal view still works as always — and if you click the notice's <strong>Open terminal</strong> to watch a thread while its transcript is still catching up, the chat view snaps back automatically the moment the transcript is found (opening the terminal that way is temporary, so the thread won't reopen stuck in the terminal later; the <strong>&gt;_</strong> / <strong>💬</strong> toggle is still the way to make a lasting choice).</li>
+              <li>The chat is read from the thread's local session log — Claude Code's transcript for Claude threads, the Codex CLI's session file for ChatGPT threads. If Hivemind still can't find a Claude transcript a few seconds after you send a message (e.g. a custom startup command that isn't <code>claude</code>), a notice appears — an idle thread you haven't written to yet has no transcript to find, and says nothing; a ChatGPT chat simply fills in from your first message (Codex writes its log when the conversation starts). Click <strong>Interact</strong> in the notice or chat toolbar to see and operate the live CLI while keeping chat open. This also covers slash-command menus, custom answers, sign-in, and other CLI controls. The <strong>&gt;_</strong> / <strong>💬</strong> toggle still switches the whole view.</li>
             </ul>
           </div>
 
@@ -624,7 +616,7 @@
               says so and nothing happens.</p>
             <p class="help-note">Prefer a dedicated chat? The <strong>🐝 Chat with Hivemind</strong>
               panel (the <svg class="help-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" /></svg> chat-bubble button at the bottom of the sidebar, <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>H</kbd>,
-              or say <em>“Hivemind, chat”</em>) docks into the sidebar — like Source Control or Todo —
+              or say <em>“Hivemind, chat”</em>) docks into the sidebar — like Source Control or the Explorer —
               and treats <em>every</em> message as a command — no “Hivemind” prefix needed (though it's
               still fine to use one). While the panel is open, the <kbd>~</kbd> voice hotkey dictates
               into it — <strong>stopping the mic sends the command automatically</strong>, no ➤ click
@@ -662,21 +654,6 @@
           </div>
 
           <div class="settings-group">
-            <div class="settings-group-title">Publish to website (FTP)</div>
-            <ul class="help-list">
-              <li>The <strong><svg class="help-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 17.6A4 4 0 0 0 18 10h-1.3A7 7 0 1 0 5 16.3" /><polyline points="9 13 12 10 15 13" /><line x1="12" y1="10" x2="12" y2="21" /></svg> Publish</strong> panel uploads this hive's website to a web host over FTP — Source Control's shape, pointed at your hosting instead of GitHub. It's per hive: each hive publishes to its own site.</li>
-              <li>First time, fill in the <strong>connection</strong>: FTP server, username, password, and the <strong>remote folder</strong> (the path from the FTP login root — often <code>public_html</code>, or something like <code>domains/example.com/public_html</code>). Getting that path right matters: leave it blank and files go to the FTP login root, which on most hosts sits <em>above</em> the website folder — every file uploads successfully and nothing on the site changes. The panel warns when no remote folder is set. An optional <strong>website address</strong> adds a <strong>↗</strong> button that opens the live site. Reopen the form any time with <strong>⚙</strong>.</li>
-              <li><strong>Choose…</strong> opens a tick-box tree of the project folder — <strong>only what you tick is ever uploaded</strong>. Ticking a folder publishes everything inside it. Build sources, notes and tooling stay on your machine simply by leaving them unticked.</li>
-              <li>The file list marks each file <strong>●&nbsp;changed</strong> or <strong>·&nbsp;unchanged</strong> since the last publish, and <strong>⇧ Publish</strong> uploads only the changed ones — so a big video isn't re-sent every time. Use <strong>⋯ → Publish everything</strong> to force a full re-upload, and <strong>Stop</strong> to cancel a run in progress. Changing the FTP server, port or remote folder marks every file changed again — the new destination doesn't have any of them yet.</li>
-              <li><strong>⋯ → Test connection</strong> checks the host, login and remote folder without uploading anything.</li>
-              <li><strong>Your credentials stay yours.</strong> The host, username, file list and password are stored in Hivemind's own folder — never in the project directory — so they are never committed, never pushed to GitHub, and not visible to the agent threads working in that project. The password is encrypted by Windows (DPAPI) under your user account: another Windows user can't read it, and the file is useless if copied to another machine. It never leaves the main process, and it's passed to the uploader over a private channel rather than on a command line. <strong>⋯ → Forget saved password</strong> removes it; <strong>⋯ → Remove publish settings</strong> deletes everything Hivemind stores for the hive (the website itself is untouched).</li>
-              <li><strong>Connection security</strong> defaults to encrypting the login (FTPS control channel), which is what most shared hosts handle reliably. Fully-encrypted FTPS is selectable if your host supports it; plain FTP sends the password in the clear and shows a warning.</li>
-              <li>Some files are <strong>never uploaded</strong>, even inside a ticked folder: <code>.git</code>, <code>.hivemind</code>, <code>.claude</code>, <code>node_modules</code>, <code>.env</code> files, keys and certificates. They show struck through in the picker.</li>
-              <li>Say <em>“Hivemind, publish the site”</em> to open the panel and upload the changed files in one step.</li>
-            </ul>
-          </div>
-
-          <div class="settings-group">
             <div class="settings-group-title">Plan review</div>
             <ul class="help-list">
               <li>When a Claude thread works in <strong>plan mode</strong> (the <em>Plan</em> permission mode, or whenever Claude plans on its own), Hivemind detects the plan automatically. While Claude drafts it the thread's header shows a <strong>📋 planning</strong> chip; the moment Claude finishes and asks for approval (<em>“Ready to code?”</em> / <em>“Would you like to proceed?”</em>), the review is ready: in the <strong>chat view</strong> the approval card embeds it right in the conversation (see <em>Chat view</em> above), and in the <strong>terminal view</strong> the plan pops up as a <strong>full document</strong> — rendered markdown in an editor-style window that live-updates as the plan is written. If the thread isn't focused, nothing pops up: the header shows a <strong>📋 plan ready</strong> chip instead — click it (or the chat card's <strong>📋 Open as window</strong> button) to open the review window. To reopen a plan later — say, after it's been approved — use the <em>“Hivemind, show the plan”</em> command in the thread's composer. The auto-popup can be turned off in <strong>⚙ Settings → General → Plan review</strong>.</li>
@@ -690,40 +667,34 @@
           </div>
 
           <div class="settings-group">
-            <div class="settings-group-title">Todo</div>
-            <ul class="help-list">
-              <li>The <strong>Todo</strong> panel is a simple checklist for the hive. Unlike a thread's plan review it's shared across every thread in the hive, not tied to the focused one.</li>
-              <li>Type in the box at the top and press <strong>Enter</strong> (or <strong>＋</strong>) to add an item. <strong>Tick the checkbox</strong> to mark it done, <strong>double-click</strong> an item to rename it, and hover to reveal a <strong>✕</strong> to delete it. Spelling is checked as you type — typos get the same red squiggles, right-click suggestions, and autocorrect as the chat composer.</li>
-              <li><strong>Push a todo to a new thread</strong>: hover an item and click the <strong>▶</strong> to open a fresh thread that starts working on it right away — the item's text (plus any unfinished sub-items) becomes the new Claude's first prompt. The todo stays unticked until you mark it done yourself.</li>
-              <li><strong>Quick add from anywhere</strong>: start a composer message (or a dictated sentence) with <strong>todo</strong> — e.g. <em>“todo make the repo public”</em> — and it's added to the panel instead of being sent to Claude (<em>TODO:</em> and <em>to-do</em> work too; a bare <em>todo</em> just opens the panel). <em>“Hivemind, add a todo …”</em> does the same. If dictation hears it as two words (“to do”), add a <strong>Settings → Voice</strong> dictionary correction mapping it to “todo”.</li>
-              <li>Items <strong>nest to any depth</strong>: hover a row and click the <strong>＋</strong> to add a sub-item beneath it. Ticking a parent ticks all of its sub-items, but sub-items never auto-tick their parent — a parent is only done when you tick it yourself (un-ticking a sub-item does un-tick a done parent); a partly-done parent shows a dash. Use the <strong>▾ / ▸</strong> caret to collapse or expand a branch.</li>
-              <li>The footer shows how many leaf items are done and offers <strong>Clear completed</strong> to remove the ticked ones (a done parent stays if it still has unfinished sub-items).</li>
-              <li>The list is saved with the project in <code>.hivemind/todos.json</code> (kept out of Git via <code>.gitignore</code>, like plans), so it survives restarts and updates live if a thread edits the file.</li>
-            </ul>
-          </div>
-
-          <div class="settings-group">
             <div class="settings-group-title">Shortcuts</div>
             <ul class="help-list">
               <li><kbd>~</kbd> — start / stop voice typing</li>
               <li><kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>H</kbd> — open / close the Chat with Hivemind panel in the sidebar (<kbd>Esc</kbd> inside it closes it)</li>
-              <li><kbd>Ctrl</kbd>+<kbd>F</kbd> — find in the focused thread</li>
+              <li><kbd>Ctrl</kbd>+<kbd>F</kbd> — find in the focused thread. In chat, this opens <strong>Interact</strong> and searches the live terminal scrollback without leaving the conversation. <kbd>Esc</kbd> closes the find bar; <strong>Done</strong> closes Interact.</li>
               <li><kbd>Ctrl</kbd>+<kbd>Enter</kbd> — maximize / restore the focused thread</li>
               <li><kbd>Ctrl</kbd>+<kbd>1</kbd>…<kbd>9</kbd> — focus the 1st–9th thread on the hive</li>
               <li><kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>]</kbd> / <kbd>[</kbd> — cycle focus to the next / previous thread</li>
               <li><kbd>A−</kbd> / <kbd>A+</kbd>, <kbd>Ctrl</kbd>+<kbd>=</kbd>/<kbd>−</kbd>/<kbd>0</kbd>, or <kbd>Ctrl</kbd>+scroll — change the focused thread's font size (works in both the chat and terminal views)</li>
-              <li><kbd>Esc</kbd> — close the open dialog</li>
+              <li><kbd>Esc</kbd> — close the open dialog (any of them, including the New/Edit-hive dialog and the Publish file picker)</li>
             </ul>
           </div>
 
           <div class="settings-group">
             <div class="settings-group-title">Usage &amp; limits</div>
-            <p class="help-note">The <strong>Usage</strong> pill in the toolbar shows how much of your
-              Claude plan's most-constrained limit is used right now (green → yellow → red as you approach
-              it). Click it for the full picture: the 5-hour session window and weekly limits with their
-              reset times — the same numbers as Claude Code's <code>/usage</code> — plus how many tokens
-              each model has used today, totalled from your local Claude Code transcripts. Figures refresh
-              about once a minute.</p>
+            <p class="help-note">Claude threads and ChatGPT threads bill against different
+              subscriptions, so the <strong>Usage</strong> pill in the toolbar carries one segment per
+              agent — <em>Claude 62%  ChatGPT 5%</em> — each showing that agent's most-constrained
+              limit right now (green → yellow → red as you approach it). An agent you aren't signed in to
+              is left off the pill; hover for the reason.</p>
+            <p class="help-note">Click the pill for the full picture, agent by agent: every limit window
+              with its reset time, then how many tokens each model has used today. <strong>Claude</strong>
+              numbers are live — the same limits as Claude Code's <code>/usage</code>.
+              <strong>ChatGPT</strong> limits are read from what the Codex CLI last recorded, one set per
+              signed-in ChatGPT account, so each is stamped with when that account last ran. Any reading
+              that isn't current says so underneath, with its age — a refused refresh keeps the last
+              numbers rather than blanking them. Figures
+              refresh about once a minute; <strong>⟳</strong> in the modal fetches them immediately.</p>
           </div>
 
           <div class="settings-group">
@@ -767,11 +738,11 @@
       </div>
     </div>
 
-    <!-- Claude usage (plan limits + today's tokens) -->
+    <!-- Agent usage (per-agent plan limits + today's tokens) -->
     <div id="usage-backdrop" class="hidden">
       <div id="usage-modal">
         <div class="settings-head">
-          <span id="usage-title">📊 Claude usage</span>
+          <span id="usage-title">📊 Agent usage</span>
           <div class="spacer"></div>
           <button id="usage-refresh" class="git-icon" title="Refresh">⟳</button>
           <button id="usage-close" class="git-icon" title="Close">✕</button>

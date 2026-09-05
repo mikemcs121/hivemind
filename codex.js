@@ -17,7 +17,7 @@
 //
 // ## Why userData and not the project or the home directory
 //
-// Same reasoning as publish.json: the agent threads Hivemind spawns work
+// The agent threads Hivemind spawns work
 // *inside* the project folder and the project folder gets committed and
 // shared, so credentials must not live there. `~/.codex-<name>` was the other
 // candidate; userData keeps every Hivemind-created home in one place that an

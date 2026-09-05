@@ -120,28 +120,6 @@ contextBridge.exposeInMainWorld('api', {
     reveal: (cwd, rel) => ipcRenderer.invoke('files:reveal', { cwd, rel }),
   },
 
-  // Publish to website (FTP). `cwd` is the active board's project directory and
-  // keys the settings, which live in Hivemind's userData — never in the project
-  // folder. `config` reports `hasPassword`; the password itself is write-only
-  // from here and never comes back across the bridge.
-  publish: {
-    config: (cwd) => ipcRenderer.invoke('publish:config', { cwd }),
-    setConfig: (cwd, patch) => ipcRenderer.invoke('publish:setConfig', { cwd, patch }),
-    setPassword: (cwd, password) => ipcRenderer.invoke('publish:setPassword', { cwd, password }),
-    forget: (cwd) => ipcRenderer.invoke('publish:forget', { cwd }),
-    scan: (cwd) => ipcRenderer.invoke('publish:scan', { cwd }),
-    test: (cwd) => ipcRenderer.invoke('publish:test', { cwd }),
-    run: (cwd, all) => ipcRenderer.invoke('publish:run', { cwd, all }),
-    cancel: (cwd) => ipcRenderer.invoke('publish:cancel', { cwd }),
-    // Which of these project-relative paths the backend refuses to upload, and why.
-    deny: (rels) => ipcRenderer.invoke('publish:deny', { rels }),
-    onProgress: (cb) => {
-      const h = (_e, payload) => cb(payload);
-      ipcRenderer.on('publish:progress', h);
-      return () => ipcRenderer.removeListener('publish:progress', h);
-    },
-  },
-
   // ChatGPT accounts: named Codex CLI homes, one signed-in account each. A
   // thread names the account by id; main resolves it to a CODEX_HOME path.
   codex: {
@@ -158,6 +136,12 @@ contextBridge.exposeInMainWorld('api', {
   agentModels: (provider, codexAccount, force) =>
     ipcRenderer.invoke('agents:models', { provider, codexAccount, force: !!force }),
 
+  // Which agent CLIs are installed and signed in on this machine (booleans
+  // only, never a token or a credential path). Drives the first-run setup
+  // wizard, which polls it while the user installs a CLI elsewhere — so it is
+  // filesystem-only and never starts a CLI. See agent-setup.js.
+  detectAgents: () => ipcRenderer.invoke('agents:detect'),
+
   // Plan pane. `cwd` is the active board's project directory; `planId` keys the
   // per-thread plan file the thread writes and the comments Hivemind attaches.
   plan: {
@@ -168,14 +152,6 @@ contextBridge.exposeInMainWorld('api', {
     writeComments: (cwd, planId, comments) => ipcRenderer.invoke('plan:comments:write', { cwd, planId, comments }),
     clear: (cwd, planId) => ipcRenderer.invoke('plan:clear', { cwd, planId }),
     ensureIgnored: (cwd) => ipcRenderer.invoke('plan:ensureIgnored', { cwd }),
-  },
-
-  // Todo panel. `cwd` is the active board's project directory; the checklist is
-  // shared per-hive (one `.hivemind/todos.json`), not per-thread.
-  todo: {
-    read: (cwd) => ipcRenderer.invoke('todo:read', { cwd }),
-    write: (cwd, todos) => ipcRenderer.invoke('todo:write', { cwd, todos }),
-    ensureIgnored: (cwd) => ipcRenderer.invoke('todo:ensureIgnored', { cwd }),
   },
 
   // Prompt History panel. `cwd` is the active board's project directory; the
@@ -212,7 +188,7 @@ contextBridge.exposeInMainWorld('api', {
 
   // Autocorrect: look up the word just typed; returns the replacement or null
   // to leave it alone. Synchronous on purpose — the fix has to be in the field
-  // before the Enter that committed the word is acted on (send, add todo, …).
+  // before the Enter that committed the word is acted on (send, commit, …).
   spellCorrect: (word) => ipcRenderer.sendSync('spell:correct', word),
 
   // Open a web/mail link in the OS default browser (used by plan links).
@@ -229,9 +205,10 @@ contextBridge.exposeInMainWorld('api', {
     return () => ipcRenderer.removeListener('build:progress', h);
   },
 
-  // Claude usage: rate-limit windows + today's token totals.
+  // Agent usage: per-agent (Claude / ChatGPT) rate-limit windows and today's
+  // token totals. `force` skips the main-process cache for the Refresh button.
   usage: {
-    get: () => ipcRenderer.invoke('usage:get'),
+    get: (opts) => ipcRenderer.invoke('usage:get', { force: !!(opts && opts.force) }),
   },
 
   // Speech-to-text models. `ensureModel` makes sure the chosen model's files are

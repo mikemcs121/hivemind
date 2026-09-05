@@ -132,11 +132,11 @@ const pty = require('@homebridge/node-pty-prebuilt-multiarch');
 const git = require('./git');
 const files = require('./files');
 const plan = require('./plan');
-const todo = require('./todo');
 const promptHistory = require('./promptHistory');
-const publish = require('./publish');
 const codexAccounts = require('./codex');
+const agentCli = require('./agent-cli');
 const agentModels = require('./agent-models');
+const agentSetup = require('./agent-setup');
 const build = require('./build');
 const usage = require('./usage');
 const transcript = require('./transcript');
@@ -147,20 +147,91 @@ const updater = require('./updater');
 // ---------------------------------------------------------------------------
 const boardsFile = () => path.join(app.getPath('userData'), 'boards.json');
 
+// `boards.json` holds every hive the user has. Reading it must distinguish
+// "there is no file yet" (a first run — an empty list is the right answer) from
+// "the file is there but unreadable" (a torn write, a partial disk flush, a
+// concurrent writer). Collapsing both to `[]` meant a single corrupt file showed
+// the empty state and the very next persist() wrote `[]` straight over it,
+// destroying every hive with no warning and no copy. The same
+// unreadable-vs-empty distinction already exists in promptHistory.js
+// (ARCHITECTURE invariant 6); this is the file where it mattered most and was
+// missing.
+//
+// A corrupt file is preserved as `boards.corrupt-<ts>.json` rather than being
+// overwritten, so the hives are recoverable by hand.
+let boardsCache = null; // { boards } — invalidated on every save
+
 function loadBoards() {
+  if (boardsCache) return boardsCache.boards;
+  const file = boardsFile();
+  let raw;
   try {
-    const raw = fs.readFileSync(boardsFile(), 'utf8');
-    const data = JSON.parse(raw);
-    if (Array.isArray(data)) return data;
-  } catch (_) {
-    /* no file yet */
+    raw = fs.readFileSync(file, 'utf8');
+  } catch (err) {
+    if (err.code !== 'ENOENT') console.error('Failed to read boards.json:', err);
+    boardsCache = { boards: [] };
+    return boardsCache.boards;
   }
-  return [];
+  try {
+    // Strip a UTF-8 BOM. JSON.parse rejects one, and plenty of Windows tooling
+    // writes it (PowerShell's `Out-File -Encoding utf8`, some editors) — a hand-
+    // edited boards.json shouldn't read as corrupt.
+    const data = JSON.parse(raw.charCodeAt(0) === 0xfeff ? raw.slice(1) : raw);
+    if (Array.isArray(data)) {
+      boardsCache = { boards: data };
+      return data;
+    }
+    throw new Error('boards.json is not an array');
+  } catch (err) {
+    const backup = path.join(path.dirname(file), `boards.corrupt-${Date.now()}.json`);
+    try {
+      fs.copyFileSync(file, backup);
+      console.error('boards.json is unreadable (%s) — kept a copy at %s', err.message, backup);
+    } catch (copyErr) {
+      console.error('boards.json is unreadable and could not be backed up:', copyErr);
+    }
+    boardsCache = { boards: [] };
+    return boardsCache.boards;
+  }
 }
+
+// `boards.json` is what `isKnownBoardDir` consults, so this file decides which
+// directories every guarded IPC channel will touch. It is still renderer-written
+// — that makes the guard defense-in-depth against a *confused* renderer, not a
+// boundary against a fully compromised one — but structural validation keeps a
+// malformed or hostile payload from turning the guard into a no-op (an entry
+// with a relative `dir`, a giant array, a non-object) and keeps a bad write from
+// corrupting the file the next launch reads.
+//
+// Deliberately does NOT require `dir` to exist: a board on a disconnected drive
+// or an unmounted share must survive a save, or a routine layout persist would
+// silently delete the user's hive.
+const MAX_BOARDS = 200;
 
 function saveBoards(boards) {
   try {
-    fs.writeFileSync(boardsFile(), JSON.stringify(boards, null, 2), 'utf8');
+    if (!Array.isArray(boards) || boards.length > MAX_BOARDS) {
+      console.error('boards:save refused: not an array of at most %d boards', MAX_BOARDS);
+      return false;
+    }
+    for (const b of boards) {
+      if (!b || typeof b !== 'object' || Array.isArray(b)) {
+        console.error('boards:save refused: entry is not an object');
+        return false;
+      }
+      if (b.dir != null && (typeof b.dir !== 'string' || (b.dir && !path.isAbsolute(b.dir)))) {
+        console.error('boards:save refused: board dir is not an absolute path:', b.dir);
+        return false;
+      }
+    }
+    // Atomic: write a sibling temp file and rename over the target, so a crash
+    // or a concurrent reader never observes a half-written boards.json. A torn
+    // write here used to be unrecoverable (see loadBoards).
+    const file = boardsFile();
+    const tmp = file + '.tmp';
+    fs.writeFileSync(tmp, JSON.stringify(boards, null, 2), 'utf8');
+    fs.renameSync(tmp, file);
+    boardsCache = { boards };
     return true;
   } catch (err) {
     console.error('Failed to save boards:', err);
@@ -184,6 +255,42 @@ function isKnownBoardDir(cwd) {
   } catch (_) {
     return false;
   }
+}
+
+// Every IPC handler below that takes a project directory takes it *from the
+// renderer*. The helper modules are careful to keep a relative path inside the
+// root they are given (`files.safeJoin`, `plan`'s guards, `git`'s `safeRef`),
+// but until this wrapper existed the root itself was a free variable: the
+// renderer could name any directory on disk and `git:discard` would recursively
+// delete inside it, `promptHistory:append` would create `.hivemind\` in it, and
+// `plan:ensureIgnored` would append to its `.gitignore`.
+//
+// `guardCwd` closes that by pinning every such channel to the directories the
+// user actually opened as boards. It is defense-in-depth, not a trust boundary
+// on its own — `boards.json` is renderer-written (see `saveBoards`, which
+// validates entries for the same reason) — but it turns "any path on the
+// machine" into "a path the user deliberately opened", which is the difference
+// that matters when the renderer's whole job is displaying untrusted agent
+// output.
+// Absolute paths the user picked in a native file dialog this session. The only
+// outside-the-project sources `attach:stage` will copy from (see there).
+const pickedFiles = new Set();
+
+const CWD_DENIED = Object.freeze({
+  ok: false,
+  reason: 'denied',
+  message: 'That folder is not one of your project directories.',
+});
+
+function guardCwd(fn) {
+  return (event, args) => {
+    const a = args || {};
+    if (!isKnownBoardDir(a.cwd)) {
+      console.error('IPC refused: cwd is not a known board directory:', a.cwd);
+      return CWD_DENIED;
+    }
+    return fn(event, a);
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -219,6 +326,11 @@ function spawnPty({ id, cwd, cols, rows, startupCommand, model, resume, permissi
   const env = Object.assign({}, process.env);
   const codexHome = codexAccount ? codexAccounts.homeFor(codexAccount) : null;
   if (codexHome) env.CODEX_HOME = codexHome;
+  // The thread types a bare command name at a shell prompt, so the CLI has to
+  // be on PATH. Some installs aren't — notably the Codex desktop app, whose
+  // bundled codex.exe lives in a per-build directory nothing adds to PATH —
+  // so append the known install locations (see agent-cli.js).
+  agentCli.augmentEnv(env);
 
   const proc = pty.spawn(shell, [], {
     name: 'xterm-color',
@@ -246,7 +358,10 @@ function spawnPty({ id, cwd, cols, rows, startupCommand, model, resume, permissi
   // inserting the flag right after the `claude`/`codex`/`grok` token (so flags like
   // `claude --resume` still work). Skip for "default" and for other commands.
   // Codex model ids contain dots (e.g. gpt-5.1-codex), hence the [a-z0-9.-].
-  if (model && model !== 'default' && /^[a-z0-9.-]+$/i.test(model)) {
+  // The leading character must be alphanumeric: `[a-z0-9.-]+` also matches
+  // `-p`, which would splice a second flag into the typed command line rather
+  // than a model name.
+  if (model && model !== 'default' && /^[a-z0-9][a-z0-9.-]*$/i.test(model)) {
     cmd = cmd.replace(/^(claude|codex|grok)(\.exe|\.cmd)?\b/i, (m) => `${m} --model ${model}`);
   }
   // Permission mode: hand the choice to Claude Code as a startup flag. "default"
@@ -269,7 +384,8 @@ function spawnPty({ id, cwd, cols, rows, startupCommand, model, resume, permissi
   // transcript binding stays deterministic). Only meaningful for the `claude`
   // command.
   if (resume && /^claude(\.exe|\.cmd)?\b/i.test(cmd) && !/--continue\b|--resume\b/.test(cmd)) {
-    const flag = (typeof resume === 'string' && /^[a-zA-Z0-9-]+$/.test(resume))
+    // Leading char must be alphanumeric — see the model regex above.
+    const flag = (typeof resume === 'string' && /^[a-zA-Z0-9][a-zA-Z0-9-]*$/.test(resume))
       ? `--resume ${resume}`
       : '--continue';
     cmd = cmd.replace(/^claude(\.exe|\.cmd)?\b/i, (m) => `${m} ${flag}`);
@@ -465,6 +581,21 @@ function createWindow() {
 
   mainWindow.removeMenu();
   mainWindow.loadFile(path.join(__dirname, 'src', 'index.html'));
+
+  // The renderer is the only thing that knows which pane owns which pty id. If
+  // it goes away without closing its panes — a crash, an OOM, a Ctrl+R reload —
+  // those ids die with it and the shells become unreachable orphans. Reap them
+  // so the reload starts from a clean slate instead of doubling the thread count.
+  mainWindow.webContents.on('render-process-gone', () => {
+    transcript.disposeAll();
+    killAllPtys();
+  });
+  mainWindow.webContents.on('did-start-navigation', (_e, _url, isInPlace, isMainFrame) => {
+    if (isMainFrame && !isInPlace) {
+      transcript.disposeAll();
+      killAllPtys();
+    }
+  });
 
   // Lock down navigation. The renderer is a local file:// page that should never
   // navigate anywhere else and never open child windows (which would inherit the
@@ -780,26 +911,44 @@ app.whenReady().then(() => {
   });
 
   // Attach files to a chat message via the composer's 📎 button.
+  // Paths the *user* chose in a native dialog are the only arbitrary locations
+  // `attach:stage` will copy from, so remember them. The renderer can ask to
+  // stage any of these; it cannot invent one.
   ipcMain.handle('dialog:pickFiles', async () => {
     const res = await dialog.showOpenDialog(mainWindow, {
       properties: ['openFile', 'multiSelections'],
       title: 'Attach files to this message',
     });
-    return res.canceled ? [] : res.filePaths;
+    if (res.canceled) return [];
+    for (const f of res.filePaths) pickedFiles.add(path.resolve(f));
+    return res.filePaths;
   });
 
   // -- IPC: images ----------------------------------------------------------
   // A screenshot pasted or an image dragged into a terminal arrives as raw
   // bytes. We persist it to a temp file and hand the path back so the renderer
   // can type it into the pane — Claude Code reads image paths from its prompt.
+  // The extension is an allowlist, not a sanitizer. Stripping non-alphanumerics
+  // still admits `exe`, `cmd`, `bat`, `ps1`, `scr` — and since the renderer also
+  // reaches `files:open` (→ `shell.openPath`), "write arbitrary bytes to a
+  // caller-named extension" plus "ask the OS to open that file" is a full
+  // sandbox escape. Only image types can be written here.
+  const IMAGE_EXTS = new Set(['png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp', 'svg', 'avif']);
+  const MAX_IMAGE_BYTES = 32 * 1024 * 1024;
   ipcMain.handle('image:saveTemp', (_e, { bytes, ext }) => {
     try {
       const dir = path.join(os.tmpdir(), 'hivemind-images');
       fs.mkdirSync(dir, { recursive: true });
-      const safeExt = (ext || 'png').replace(/[^a-z0-9]/gi, '').toLowerCase() || 'png';
+      const asked = String(ext || 'png').replace(/[^a-z0-9]/gi, '').toLowerCase();
+      const safeExt = IMAGE_EXTS.has(asked) ? asked : 'png';
+      const buf = Buffer.from(bytes);
+      if (buf.length > MAX_IMAGE_BYTES) {
+        console.error('image:saveTemp refused: %d bytes exceeds the cap', buf.length);
+        return null;
+      }
       const name = `paste-${Date.now()}-${Math.floor(Math.random() * 1e6)}.${safeExt}`;
       const file = path.join(dir, name);
-      fs.writeFileSync(file, Buffer.from(bytes));
+      fs.writeFileSync(file, buf);
       return file;
     } catch (err) {
       console.error('Failed to save pasted image:', err);
@@ -853,6 +1002,20 @@ app.whenReady().then(() => {
           if (Date.now() - fs.statSync(full).mtimeMs > WEEK) fs.unlinkSync(full);
         } catch (_) { /* ignore sweep races */ }
       }
+      // The destination is pinned to a board dir above; the *source* must be
+      // pinned too. Without this, `attach:stage(board, '~/.claude/.credentials.json')`
+      // copies a token into `.hivemind/attachments/` — a directory whose whole
+      // purpose is being readable by the agent threads. Legitimate sources are
+      // only ever a pasted image in our temp dir, a file the user picked through
+      // `dialog:pickFiles`, or something already inside the project.
+      const src = path.resolve(srcPath);
+      const imagesDir = path.resolve(path.join(os.tmpdir(), 'hivemind-images'));
+      const boardRoot = path.resolve(cwd);
+      const within = (root, p) => p === root || p.startsWith(root + path.sep);
+      if (!within(imagesDir, src) && !within(boardRoot, src) && !pickedFiles.has(src)) {
+        console.error('attach:stage refused: source is not a picked or staged file:', srcPath);
+        return null;
+      }
       const base = path.basename(srcPath);
       let dest = path.join(dir, base);
       if (fs.existsSync(dest)) {
@@ -873,14 +1036,25 @@ app.whenReady().then(() => {
 
   ipcMain.on('pty:write', (_e, { id, data }) => {
     const live = ptys.get(id);
-    if (live) live.proc.write(data);
+    // `ipcMain.on` listeners run outside any promise, so a throw here is an
+    // uncaught exception in the main process — which would take down every
+    // thread in the app, not just this pane. node-pty throws synchronously on a
+    // non-string payload, so check the type and swallow the write races.
+    if (!live || typeof data !== 'string') return;
+    try {
+      live.proc.write(data);
+    } catch (_) {
+      /* the pty exited between the renderer's send and this write */
+    }
   });
 
   ipcMain.on('pty:resize', (_e, { id, cols, rows }) => {
     const live = ptys.get(id);
     if (live) {
       try {
-        live.proc.resize(Math.max(cols, 1), Math.max(rows, 1));
+        // `Math.max(undefined, 1)` is NaN, which resizes to nothing at all —
+        // coerce first so a malformed message can't silently wedge the pane.
+        live.proc.resize(Math.max(Number(cols) || 80, 1), Math.max(Number(rows) || 24, 1));
       } catch (_) {
         /* ignore resize race */
       }
@@ -902,36 +1076,36 @@ app.whenReady().then(() => {
   // -- IPC: git -------------------------------------------------------------
   // All operations run in the directory passed by the renderer (the active
   // board's project dir). Each returns a plain object the panel can render.
-  ipcMain.handle('git:status', (_e, { cwd }) => git.status(cwd));
-  ipcMain.handle('git:diff', (_e, { cwd, file, staged, untracked }) => git.diff(cwd, file, staged, untracked));
-  ipcMain.handle('git:stage', (_e, { cwd, files }) => git.stage(cwd, files));
-  ipcMain.handle('git:stageAll', (_e, { cwd }) => git.stageAll(cwd));
-  ipcMain.handle('git:unstage', (_e, { cwd, files }) => git.unstage(cwd, files));
-  ipcMain.handle('git:unstageAll', (_e, { cwd }) => git.unstageAll(cwd));
-  ipcMain.handle('git:discard', (_e, { cwd, files }) => git.discard(cwd, files));
-  ipcMain.handle('git:commit', (_e, { cwd, message }) => git.commit(cwd, message));
-  ipcMain.handle('git:branches', (_e, { cwd }) => git.branches(cwd));
-  ipcMain.handle('git:log', (_e, { cwd, count }) => git.log(cwd, count));
-  ipcMain.handle('git:checkout', (_e, { cwd, name }) => git.checkout(cwd, name));
-  ipcMain.handle('git:createBranch', (_e, { cwd, name }) => git.createBranch(cwd, name));
-  ipcMain.handle('git:init', (_e, { cwd }) => git.init(cwd));
-  ipcMain.handle('git:fetch', (_e, { cwd }) => git.fetch(cwd));
-  ipcMain.handle('git:pull', (_e, { cwd }) => git.pull(cwd));
-  ipcMain.handle('git:push', (_e, { cwd, branch, setUpstream }) => git.push(cwd, { branch, setUpstream }));
-  ipcMain.handle('git:resetToRemote', (_e, { cwd, branch }) => git.resetToRemote(cwd, { branch }));
+  ipcMain.handle('git:status', guardCwd((_e, { cwd }) => git.status(cwd)));
+  ipcMain.handle('git:diff', guardCwd((_e, { cwd, file, staged, untracked }) => git.diff(cwd, file, staged, untracked)));
+  ipcMain.handle('git:stage', guardCwd((_e, { cwd, files }) => git.stage(cwd, files)));
+  ipcMain.handle('git:stageAll', guardCwd((_e, { cwd }) => git.stageAll(cwd)));
+  ipcMain.handle('git:unstage', guardCwd((_e, { cwd, files }) => git.unstage(cwd, files)));
+  ipcMain.handle('git:unstageAll', guardCwd((_e, { cwd }) => git.unstageAll(cwd)));
+  ipcMain.handle('git:discard', guardCwd((_e, { cwd, files }) => git.discard(cwd, files)));
+  ipcMain.handle('git:commit', guardCwd((_e, { cwd, message }) => git.commit(cwd, message)));
+  ipcMain.handle('git:branches', guardCwd((_e, { cwd }) => git.branches(cwd)));
+  ipcMain.handle('git:log', guardCwd((_e, { cwd, count }) => git.log(cwd, count)));
+  ipcMain.handle('git:checkout', guardCwd((_e, { cwd, name }) => git.checkout(cwd, name)));
+  ipcMain.handle('git:createBranch', guardCwd((_e, { cwd, name }) => git.createBranch(cwd, name)));
+  ipcMain.handle('git:init', guardCwd((_e, { cwd }) => git.init(cwd)));
+  ipcMain.handle('git:fetch', guardCwd((_e, { cwd }) => git.fetch(cwd)));
+  ipcMain.handle('git:pull', guardCwd((_e, { cwd }) => git.pull(cwd)));
+  ipcMain.handle('git:push', guardCwd((_e, { cwd, branch, setUpstream }) => git.push(cwd, { branch, setUpstream })));
+  ipcMain.handle('git:resetToRemote', guardCwd((_e, { cwd, branch }) => git.resetToRemote(cwd, { branch })));
 
   // -- IPC: GitHub connection wizard ----------------------------------------
-  ipcMain.handle('git:remoteUrl', (_e, { cwd }) => git.getRemoteUrl(cwd));
-  ipcMain.handle('git:setRemote', (_e, { cwd, url }) => git.setRemoteOrigin(cwd, url));
+  ipcMain.handle('git:remoteUrl', guardCwd((_e, { cwd }) => git.getRemoteUrl(cwd)));
+  ipcMain.handle('git:setRemote', guardCwd((_e, { cwd, url }) => git.setRemoteOrigin(cwd, url)));
   ipcMain.handle('gh:check', () => git.ghCheck());
-  ipcMain.handle('gh:createRepo', (_e, { cwd, name, visibility, push }) => git.ghCreateRepo(cwd, { name, visibility, push }));
+  ipcMain.handle('gh:createRepo', guardCwd((_e, { cwd, name, visibility, push }) => git.ghCreateRepo(cwd, { name, visibility, push })));
   // "Clone from GitHub" New-hive wizard: list the user's repos, run a PTY-driven
   // device-flow sign-in, and clone a chosen repo into a new folder.
   ipcMain.handle('gh:listRepos', (_e, opts) => git.ghListRepos(opts || {}));
   ipcMain.handle('gh:clone', (_e, opts) => git.ghClone(opts || {}));
   ipcMain.handle('gh:authStart', (e) => startGhAuth(BrowserWindow.fromWebContents(e.sender) || mainWindow));
   ipcMain.handle('gh:authCancel', () => cancelGhAuth());
-  ipcMain.handle('git:aiCommit', (_e, { cwd }) => git.aiCommit(cwd));
+  ipcMain.handle('git:aiCommit', guardCwd((_e, { cwd }) => git.aiCommit(cwd)));
   // Conversational Hivemind commands: map free-form phrasing onto the command
   // registry with a one-shot `claude -p` (fast model, scratch dir).
   ipcMain.handle('hm:interpret', (_e, { payload }) => git.hmInterpret(payload));
@@ -941,30 +1115,19 @@ app.whenReady().then(() => {
   // Explorer panels can refresh themselves when threads change files on disk.
   // One watcher at a time (the active board); bursts are debounced in the
   // renderer-facing event.
-  ipcMain.on('watch:set', (_e, { cwd }) => setWatch(cwd));
+  ipcMain.on('watch:set', (_e, { cwd }) => {
+    // An unvalidated path here installs a recursive ReadDirectoryChangesW over
+    // whatever it names — `watch:set('C:\\')` would watch the whole volume.
+    if (isKnownBoardDir(cwd)) setWatch(cwd);
+    else clearWatch();
+  });
 
   // -- IPC: file explorer ---------------------------------------------------
   // Operate inside the active board's project directory. `rel` is empty for the
   // root and a "/"-separated path under it for nested entries.
-  ipcMain.handle('files:list', (_e, { cwd, rel }) => files.list(cwd, rel));
-  ipcMain.handle('files:open', (_e, { cwd, rel }) => files.open(cwd, rel));
-  ipcMain.handle('files:reveal', (_e, { cwd, rel }) => files.reveal(cwd, rel));
-
-  // -- IPC: Publish to website (FTP) ------------------------------------------
-  // Settings and the encrypted password live in userData, never in the project
-  // folder, and the plaintext password never crosses back to the renderer —
-  // `getConfig` reports `hasPassword` only. See publish.js for the reasoning.
-  ipcMain.handle('publish:config', (_e, { cwd }) => publish.getConfig(cwd));
-  ipcMain.handle('publish:setConfig', (_e, { cwd, patch }) => publish.setConfig(cwd, patch));
-  ipcMain.handle('publish:setPassword', (_e, { cwd, password }) => publish.setPassword(cwd, password));
-  ipcMain.handle('publish:forget', (_e, { cwd }) => publish.forget(cwd));
-  ipcMain.handle('publish:scan', (_e, { cwd }) => publish.scan(cwd));
-  ipcMain.handle('publish:test', (_e, { cwd }) => publish.test(cwd));
-  ipcMain.handle('publish:run', (_e, { cwd, all }) => publish.publish(cwd, { all }, (p) => {
-    if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('publish:progress', p);
-  }));
-  ipcMain.handle('publish:cancel', (_e, { cwd }) => publish.cancel(cwd));
-  ipcMain.handle('publish:deny', (_e, { rels }) => publish.denyPaths(rels));
+  ipcMain.handle('files:list', guardCwd((_e, { cwd, rel }) => files.list(cwd, rel)));
+  ipcMain.handle('files:open', guardCwd((_e, { cwd, rel }) => files.open(cwd, rel)));
+  ipcMain.handle('files:reveal', guardCwd((_e, { cwd, rel }) => files.reveal(cwd, rel)));
 
   // -- IPC: ChatGPT accounts --------------------------------------------------
   // Named Codex CLI homes, one signed-in ChatGPT account each (see codex.js).
@@ -985,34 +1148,33 @@ app.whenReady().then(() => {
       force: !!force,
     }));
 
+  // Which agent CLIs exist on this machine and which are signed in — the fact
+  // base for the first-run setup wizard. Filesystem-only (see agent-setup.js):
+  // the wizard re-checks on a timer while the user installs a CLI in another
+  // window, so this must stay cheap enough to call every few seconds and must
+  // never block on a cold CLI start.
+  ipcMain.handle('agents:detect', () => agentSetup.detect());
+
   // -- IPC: Plan pane ---------------------------------------------------------
   // The thread writes its plan to `.hivemind/plans/<planId>.md`; Hivemind reads
   // it and stores highlight-comments in a sidecar JSON alongside it.
-  ipcMain.handle('plan:read', (_e, { cwd, planId }) => plan.readPlan(cwd, planId));
+  ipcMain.handle('plan:read', guardCwd((_e, { cwd, planId }) => plan.readPlan(cwd, planId)));
   // Native plan-mode files live outside the project (~/.claude/plans/…); read
   // by absolute path, guarded to that dir plus the project's .hivemind/plans.
-  ipcMain.handle('plan:readFile', (_e, { cwd, file }) => plan.readPlanFile(cwd, file));
-  ipcMain.handle('plan:write', (_e, { cwd, planId, content }) => plan.writePlan(cwd, planId, content));
-  ipcMain.handle('plan:comments:read', (_e, { cwd, planId }) => plan.readComments(cwd, planId));
-  ipcMain.handle('plan:comments:write', (_e, { cwd, planId, comments }) => plan.writeComments(cwd, planId, comments));
-  ipcMain.handle('plan:clear', (_e, { cwd, planId }) => plan.clearPlan(cwd, planId));
+  ipcMain.handle('plan:readFile', guardCwd((_e, { cwd, file }) => plan.readPlanFile(cwd, file)));
+  ipcMain.handle('plan:write', guardCwd((_e, { cwd, planId, content }) => plan.writePlan(cwd, planId, content)));
+  ipcMain.handle('plan:comments:read', guardCwd((_e, { cwd, planId }) => plan.readComments(cwd, planId)));
+  ipcMain.handle('plan:comments:write', guardCwd((_e, { cwd, planId, comments }) => plan.writeComments(cwd, planId, comments)));
+  ipcMain.handle('plan:clear', guardCwd((_e, { cwd, planId }) => plan.clearPlan(cwd, planId)));
   // Add `.hivemind/` to the project's .gitignore so plan files stay out of Git.
-  ipcMain.handle('plan:ensureIgnored', (_e, { cwd }) => plan.ensureIgnored(cwd));
-
-  // -- IPC: Todo panel --------------------------------------------------------
-  // A per-hive checklist stored in `.hivemind/todos.json` in the project dir.
-  ipcMain.handle('todo:read', (_e, { cwd }) => todo.readTodos(cwd));
-  ipcMain.handle('todo:write', (_e, { cwd, todos }) => todo.writeTodos(cwd, todos));
-  // Reuse the plan module's helper — both keep the shared `.hivemind/` folder
-  // out of Git via the same .gitignore entry.
-  ipcMain.handle('todo:ensureIgnored', (_e, { cwd }) => plan.ensureIgnored(cwd));
+  ipcMain.handle('plan:ensureIgnored', guardCwd((_e, { cwd }) => plan.ensureIgnored(cwd)));
 
   // -- IPC: Prompt History panel ----------------------------------------------
   // A per-hive log of sent prompts stored in `.hivemind/prompt-history.json`.
-  ipcMain.handle('promptHistory:read', (_e, { cwd }) => promptHistory.readHistory(cwd));
-  ipcMain.handle('promptHistory:append', (_e, { cwd, entry }) => promptHistory.appendPrompt(cwd, entry));
-  ipcMain.handle('promptHistory:write', (_e, { cwd, entries }) => promptHistory.writeHistory(cwd, entries));
-  ipcMain.handle('promptHistory:ensureIgnored', (_e, { cwd }) => plan.ensureIgnored(cwd));
+  ipcMain.handle('promptHistory:read', guardCwd((_e, { cwd }) => promptHistory.readHistory(cwd)));
+  ipcMain.handle('promptHistory:append', guardCwd((_e, { cwd, entry }) => promptHistory.appendPrompt(cwd, entry)));
+  ipcMain.handle('promptHistory:write', guardCwd((_e, { cwd, entries }) => promptHistory.writeHistory(cwd, entries)));
+  ipcMain.handle('promptHistory:ensureIgnored', guardCwd((_e, { cwd }) => plan.ensureIgnored(cwd)));
 
   // -- IPC: open an external link in the OS browser ---------------------------
   // Plan markdown can contain links; the file:// renderer can't navigate to them
@@ -1028,10 +1190,12 @@ app.whenReady().then(() => {
     }
   });
 
-  // -- IPC: Claude usage ------------------------------------------------------
-  // Snapshot of the account's rate-limit windows (same data as Claude Code's
-  // /usage screen) plus today's token totals from the local transcripts.
-  ipcMain.handle('usage:get', () => usage.getUsage());
+  // -- IPC: Agent usage -------------------------------------------------------
+  // One snapshot per agent Hivemind bills against: Claude's live rate-limit
+  // windows (same data as Claude Code's /usage screen) and each ChatGPT
+  // account's last recorded windows, plus today's token totals for both from
+  // their local session files. `force` bypasses the module's 30 s cache.
+  ipcMain.handle('usage:get', (_e, opts) => usage.getUsage({ force: !!(opts && opts.force) }));
 
   // -- IPC: transcript tailing (chat wrapper) --------------------------------
   // Each chat-view pane binds to its Claude Code session transcript; parsed
@@ -1250,6 +1414,13 @@ app.whenReady().then(() => {
   ipcMain.handle('build:isHivemind', (_e, { cwd }) => build.isHivemindProject(cwd));
   ipcMain.handle('build:portable', async (_e, { cwd }) => {
     if (buildRunning) return { ok: false, message: 'A build is already running.' };
+    // `build:isHivemind` only drives whether the button is *shown*. Re-check it
+    // here: everything below rewrites package.json's version, commits, and runs
+    // `gh release create` in `cwd`, so pointing it at the wrong directory would
+    // bump and publish an unrelated repo of the user's.
+    if (!isKnownBoardDir(cwd) || !(await build.isHivemindProject(cwd))) {
+      return { ok: false, message: 'That hive is not the Hivemind source checkout.' };
+    }
     buildRunning = true;
     const progress = (line) => {
       if (mainWindow && !mainWindow.isDestroyed()) {
@@ -1314,17 +1485,27 @@ function sweepOldTempImages() {
   } catch (_) { /* no temp dir yet, or unreadable — nothing to sweep */ }
 }
 
-app.on('window-all-closed', () => {
-  transcript.disposeAll();
-  cancelGhAuth();
-  clearWatch(); // stop the recursive fs.watch so it doesn't leak on macOS
+// Kill every live thread PTY. Shared by app shutdown and by renderer teardown:
+// the renderer owns the pane ids, so once it is gone (reload, crash, navigation)
+// nothing can ever address these processes again — they would keep running,
+// keep their agent CLIs alive against the project, and keep sending data to a
+// window that no longer knows the ids, while the reloaded renderer spawns a
+// second full set from the persisted layout.
+function killAllPtys() {
   for (const { proc } of ptys.values()) {
     try {
       proc.kill();
     } catch (_) {
-      /* ignore */
+      /* already gone */
     }
   }
   ptys.clear();
+}
+
+app.on('window-all-closed', () => {
+  transcript.disposeAll();
+  cancelGhAuth();
+  clearWatch(); // stop the recursive fs.watch so it doesn't leak on macOS
+  killAllPtys();
   if (process.platform !== 'darwin') app.quit();
 });

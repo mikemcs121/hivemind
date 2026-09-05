@@ -1,9 +1,9 @@
 # Sidecar feature modules
 
 Main-process modules that back the persistent, per-project features wrapped around the
-terminal panes: `plan.js`, `todo.js`, `promptHistory.js`, `transcript.js`, `usage.js`.
+terminal panes: `plan.js`, `promptHistory.js`, `transcript.js`, `usage.js`.
 
-All five live at the repo root, run in the **Electron main process**, and are wired into
+All four live at the repo root, run in the **Electron main process**, and are wired into
 IPC in one block of `main.js` (`main.js:787-850`). The renderer reaches them through the
 `window.api.*` bridge defined in `preload.js:113-185`.
 
@@ -11,9 +11,8 @@ IPC in one block of `main.js` (`main.js:787-850`). The renderer reaches them thr
 
 A Hivemind "hive" (board) is a project directory with several agent CLI panes running in
 it. These modules add persistence and insight around those panes: a reviewable plan
-document per thread (`plan.js`), a shared checklist (`todo.js`), a log of every prompt
-sent (`promptHistory.js`), a rendered chat view of each pane's conversation
-(`transcript.js`), and a subscription-usage readout (`usage.js`). Except for `usage.js`
+document per thread (`plan.js`), a log of every prompt sent (`promptHistory.js`), a rendered chat view of each pane's conversation
+(`transcript.js`), and a per-agent subscription-usage readout (`usage.js`). Except for `usage.js`
 (machine-global), each is scoped to the project directory: state lives in a `.hivemind/`
 folder inside the project (kept out of Git by `plan.ensureIgnored`), or — for
 transcripts — is read from Claude Code's own session files under `~/.claude/`. They share
@@ -46,50 +45,27 @@ by quoted text (`{ id, quote, occurrence, body, resolved, sent }`,
 | `readPlan(root, planId)` | read `.md`, returns `{ok, content, mtime}` or `reason: 'not-found'/'no-dir'` | `plan:read` |
 | `readPlanFile(root, file)` | read absolute path, root-allowlisted | `plan:readFile` |
 | `writePlan(root, planId, content)` | write `.md` (in-panel edits, checkbox toggles) | `plan:write` |
-| `readComments` / `writeComments` | sidecar JSON; a failed read is **not** treated as empty — corrupt/unreadable returns `{ok:false, reason:'corrupt'\|'unreadable'\|'error', message}` (ENOENT still returns `{ok:true, comments:[]}`), matching the todo.js/promptHistory.js discipline; the renderer blocks saving comments after a failed read so real comments aren't overwritten | `plan:comments:read` / `plan:comments:write` |
+| `readComments` / `writeComments` | sidecar JSON; a failed read is **not** treated as empty — corrupt/unreadable returns `{ok:false, reason:'corrupt'\|'unreadable'\|'error', message}` (ENOENT still returns `{ok:true, comments:[]}`), matching the promptHistory.js discipline; the renderer blocks saving comments after a failed read so real comments aren't overwritten | `plan:comments:read` / `plan:comments:write` |
 | `clearPlan(root, planId)` | delete both files, ENOENT ok | `plan:clear` |
 | `ensureIgnored(root)` | idempotently append `.hivemind/` to the project `.gitignore` | `plan:ensureIgnored` |
 
 `planId` must match `/^[A-Za-z0-9._-]+$/` and every resolved path must stay inside
 `<project>/.hivemind/plans` (`plan.js:41-49`). `ensureIgnored` is the shared
-keep-out-of-Git helper: `todo:ensureIgnored`, `promptHistory:ensureIgnored`, and the
+keep-out-of-Git helper: `promptHistory:ensureIgnored` and the
 attachment stager (`main.js:688`) all delegate to it.
-
-## todo.js
-
-Backs the **Todo panel** in the sidebar (renderer `src/renderer.js:6227-6626`): one
-shared checklist per hive (scoped to cwd, not per-thread), with nesting, rename,
-clear-completed, and a composer capture — a message starting with the word "todo" becomes
-a checklist item instead of a prompt (`TODO_PREFIX_RE`, `src/renderer.js:6321`).
-
-| Export | Does | IPC channel (`main.js:803-807`) |
-|---|---|---|
-| `readTodos(root)` | returns `{ok, todos}`; missing file → `[]`; unreadable/corrupt → `{ok:false, reason:'unreadable'|'corrupt'}` | `todo:read` |
-| `writeTodos(root, todos)` | atomic + per-file lock, creates `.hivemind/` | `todo:write` |
-| — (plan.ensureIgnored) | | `todo:ensureIgnored` |
-
-Data file: `.hivemind/todos.json`. The module header says `[{ id, text, done }]` but the
-real shape is a **tree** — the renderer adds `children` (and a transient `collapsed`)
-and normalizes on read (`normalizeTodos`, item ids like `todo-<base36>-<n>`). Treat
-`{ id, text, done, children: [...] }` as the canonical shape.
-
-The renderer refuses to save while the last read failed (`todoLoadFailed`,
-`src/renderer.js:6245,6294`), and the "todo …" capture path re-reads from disk before
-appending (`addTodoItem`, `src/renderer.js:6331`) because Claude threads edit the file
-directly and the panel's in-memory copy may be stale.
 
 ## promptHistory.js
 
 Backs the **Prompt History panel** (renderer `src/renderer.js:6627-6839`): a per-hive log
 of prompts actually delivered to threads. Recorded by `recordPromptHistory`
-(`src/renderer.js:6832`) after Hivemind-command / todo-prefix interception, so app
+(`src/renderer.js:6832`) after Hivemind-command interception, so app
 commands never appear in it. Each row offers: click → jump to that bubble in an open
 chat; the always-visible ➤ button → repost to the focused thread; 🎤 → re-speak the
 prompt in voice training.
 
 | Export | Does | IPC channel (`main.js:811-814`) |
 |---|---|---|
-| `readHistory(root)` | `{ok, entries}`; same unreadable/corrupt discipline as todo.js | `promptHistory:read` |
+| `readHistory(root)` | `{ok, entries}`; unreadable/corrupt is never reported as empty | `promptHistory:read` |
 | `appendPrompt(root, entry)` | read-modify-write under the per-file lock; dedupes by exact `text` (repeat moves to the end with a fresh `ts`); aborts if the read failed | `promptHistory:append` |
 | `writeHistory(root, entries)` | wholesale replace (used by the Clear button) | `promptHistory:write` |
 | — (plan.ensureIgnored) | | `promptHistory:ensureIgnored` |
@@ -134,8 +110,11 @@ the rule list is also the module's header comment (`transcript.js:12-38`).
    `--session-id <uuid>` and restores with `--resume <uuid>` (`main.js:205-223`), and
    passes that uuid to `bind`. The pane claims `<uuid>.jsonl` immediately — even before
    the file exists; tailing starts when it appears, and a `timeout` status is emitted if
-   it never does (`BIND_TIMEOUT_MS` = 15 s). This is the normal path; everything below is
-   fallback for `--continue`, codex, and legacy panes.
+   it still hasn't appeared `BIND_TIMEOUT_MS` = 15 s **after the pane sends its first
+   prompt**
+   (`armTimeout`, armed from `noteSent` — claude writes the file lazily, so an idle
+   thread having no transcript is normal and must not raise the notice). This is the
+   normal path; everything below is fallback for `--continue`, codex, and legacy panes.
 1. **One claim per file** — the `claims` map is authoritative, updated synchronously.
 2. **Fresh panes take fresh files**: an unclaimed file born after the pane registered
    (minus `FRESH_SLACK_MS` = 2 s of shell-startup slack) is acceptable
@@ -207,38 +186,95 @@ only arriving entries prove it (`pane.sessionBound`, `src/renderer.js:5108-5112`
   separate path. Secondary damage: the pane persists the wrong session id, so a restart
   would `--resume` the wrong session. Rule 6 self-heals the common case once the
   rightful pane's sent text lands on disk.
-- **Timeout**: `searching` → `timeout` status after 15 s with no candidate; the chat
-  view shows a notice but binding keeps trying (a late file still binds, and a
-  deterministic pane re-announces `bound` when its file finally appears).
+- **Timeout**: `searching` → `timeout` status 15 s after the pane's first sent prompt
+  with no candidate; the chat view shows a notice but binding keeps trying (a late file
+  still binds, and a deterministic pane re-announces `bound` when its file finally
+  appears). The clock only ever starts on a send (`armTimeout`), and never for codex —
+  a thread nobody has prompted yet has no transcript to find, and warning about that was
+  a false alarm on every fresh thread.
 - **Codex lazy rollouts**: codex often creates its file only on the first message, so a
   codex pane sitting unbound for minutes is normal — it stays quietly `searching`
   (`transcript.js:112-118`).
 
 ## usage.js
 
-Backs the toolbar **usage pill** (shows the fullest rate-limit window as a percent,
-colored ok/warn/crit at 60/85) and the **Usage modal** (per-window bars + today's token
-table). Renderer: `src/renderer.js:9908-10038`; polled every 60 s and on modal open.
+Backs the toolbar **usage pill** and the **Usage modal**. Hivemind bills against two
+subscriptions at once — Claude Code and the Codex CLI ("ChatGPT") — so the readout is
+**per agent, and within an agent per account**: the pill carries one segment per agent
+(`Claude 62%  ChatGPT 5%`, each tinted ok/warn/crit at 60/85 by that agent's fullest
+window), and the modal expands each agent into its accounts' windows plus today's tokens.
+Renderer: the "Agent usage" section near the end of `src/renderer.js` (`renderUsagePill`,
+`renderUsageAgent`, `renderUsageAccount`, `renderUsageTokens`); polled every 60 s and on
+modal open.
 
-Single export `getUsage()` behind one IPC channel `usage:get` (`main.js:833`), with a
-30 s in-module cache. It combines two local-first sources, each failing independently
-into `limitsError` / `tokensError` without sinking the other:
+Single export `getUsage({ force })` behind one IPC channel `usage:get`, with a 30 s
+in-module cache (`force`, wired to the modal's ⟳, bypasses it; the minute poll does not).
+It returns
+
+```js
+{ ok, fetchedAt, agents: [ {
+    id, label, live, unitLabel, note,
+    accounts: [ { id, label, email, plan, limits: [ {kind,label,percent,resetsAt,severity} ],
+                  error, observedAt, observedNote } ],
+    tokens: { byModel: { <model>: {messages,input,output,cacheRead,cacheCreate} } }, tokensError,
+} ] }
+```
+
+Every source is caught into its own `error` / `tokensError`, and the two agents are
+gathered with `Promise.all` + per-agent `.catch`, so no failure sinks another agent's
+numbers.
+
+### Claude (one machine login, live)
 
 1. **Plan limits** — the same OAuth endpoint Claude Code's `/usage` screen calls
    (`https://api.anthropic.com/api/oauth/usage`), authenticated with the token in
    `~/.claude/.credentials.json` (`claudeAiOauth.accessToken`, header
-   `anthropic-beta: oauth-2025-04-20`). The request (`fetchLimits`) has an 8s
-   `AbortController` timeout so a hung endpoint can't stall the readout. Returns `{kind,
-   label, percent, resetsAt, severity}` per window (session 5-hour, weekly all-models,
-   weekly per-model). A 401 means the token rotated — Claude Code refreshes it whenever it
-   runs, so using any thread and retrying clears it (`usage.js:62-66`).
+   `anthropic-beta: oauth-2025-04-20`). The request (`fetchClaudeLimits`) has an 8s
+   `AbortController` timeout so a hung endpoint can't stall the readout. Windows: session
+   5-hour, weekly all-models, weekly per-model. A 401 means the token rotated — Claude
+   Code refreshes it whenever it runs, so using any thread and retrying clears it. The
+   endpoint also budgets refreshes tightly (HTTP 429 — two Hivemind windows plus a few ⟳
+   clicks will trip it), which is why only ⟳ forces a fetch and why a *refused* refresh
+   falls back to `lastClaude`, the last reading the endpoint actually returned: the bars
+   stay, now carrying `observedAt` + `observedNote` and the failure reason, exactly like
+   the ChatGPT side. Blanking them would read as "your limits reset".
 2. **Today's tokens** — no network: scans `~/.claude/projects/*/*.jsonl` **across all
-   projects** (async via `fs.promises` so it no longer blocks the main-process event loop),
-   skipping files whose mtime predates local midnight, summing the `usage`
-   block of every assistant message timestamped today. Dedupes on
-   `message.id + requestId` (a message can be re-emitted on resume) and skips model
-   `<synthetic>`. Result: `tokens.byModel[model] = { messages, input, output, cacheRead,
-   cacheCreate }` (`tokensToday`, `usage.js:87-137`).
+   projects** (async via `fs.promises` so it doesn't block the main-process event loop),
+   skipping files whose mtime predates local midnight, summing the `usage` block of every
+   assistant message timestamped today. Dedupes on `message.id + requestId` (a message can
+   be re-emitted on resume) and skips model `<synthetic>` (`claudeTokensToday`).
+
+### ChatGPT / Codex (one login per `CODEX_HOME`, observed)
+
+There is no `/usage` endpoint for Codex, but the CLI writes the server's rate-limit
+snapshot into every session rollout: `event_msg` lines whose `payload.type` is
+`token_count` carry a sibling `payload.rate_limits` block (`primary` / `secondary`, each
+`{used_percent, window_minutes, resets_at | resets_in_seconds}`, plus `plan_type`).
+
+- **Accounts** come from `codex.list()` — the CLI's own home plus every named account's
+  managed home. `codex.js` needs Electron's `userData`, so a non-Electron caller falls
+  back to the default home alone (this is also what makes the module testable with plain
+  `node`).
+- **Limits** (`codexLimits`) walk that home's `sessions/YYYY/MM/DD` tree newest-first (at
+  most `CODEX_LIMIT_DAYS` = 14 date dirs / `CODEX_LIMIT_FILES` = 40 rollouts), read the
+  **tail** of each rollout (`CODEX_TAIL_BYTES` = 256 KB — snapshots ride the last events,
+  and rollouts run to megabytes), and take the newest parseable `rate_limits`.
+  `codexWindowLabel` turns `window_minutes` into the same vocabulary the Claude side uses
+  ("Session (5-hour window)", "Week — all models").
+- These readings are **observed, not live**: they are as of the last time that account
+  ran, so every account carries `observedAt` (+ `observedNote`, the clause the UI appends
+  after the age) and the UI *must* show its age
+  (`.usage-stamp`, and "as of …" in the pill tooltip). An account with no snapshot in 14
+  days reports an `error` string instead of limits, and contributes no pill segment.
+- **Today's tokens** (`codexTokensForHome`) scan the newest `CODEX_TOKEN_DAYS` = 3 date
+  dirs, mtime-pruned to midnight. `token_count` events repeat the same `last_token_usage`
+  when a turn ends without new spend, so summing deltas double-counts; instead
+  `total_token_usage` (cumulative and monotonic within a rollout) is read as **final total
+  minus the total as of the last pre-midnight event** — correct across midnight and immune
+  to repeats. The model comes from the envelope-level `turn_context` lines
+  (`o.type === 'turn_context'`, `payload.model`); Codex counts cached tokens *inside*
+  `input_tokens`, so `cached_input_tokens` is subtracted out to make the "Input" column
+  mean the same thing as Claude's.
 
 This module is machine-global (not per-project) and writes nothing.
 
@@ -246,7 +282,6 @@ This module is machine-global (not per-project) and writes nothing.
 
 | Path | Owner | Shape | Written when |
 |---|---|---|---|
-| `todos.json` | todo.js | `[{ id, text, done, children: [...] }]` (nested tree) | every panel edit; also directly by agent threads |
 | `prompt-history.json` | promptHistory.js | `[{ id, text, ts, agent }]` oldest→newest, ≤200 | every delivered prompt (append), Clear (write `[]`) |
 | `plans/<planId>.md` | plan.js | markdown | by the *thread* (Hivemind-requested plans) or by Hivemind on in-panel edits |
 | `plans/<planId>.comments.json` | plan.js | `[{ id, quote, occurrence, body, resolved, sent }]` | every comment add/resolve/send |
@@ -260,7 +295,7 @@ Claude Code session transcripts and native plan files are *read* but never owned
 
 ## Invariants & gotchas
 
-1. **Never write over a failed read.** todo.js and promptHistory.js distinguish
+1. **Never write over a failed read.** promptHistory.js distinguishes
    `'unreadable'`/`'corrupt'` from empty, and both module and renderer refuse to save in
    that state. Any new persistence must copy this — the user's own agent threads edit
    these files concurrently, and "couldn't read" mistaken for "empty" destroys data.
@@ -268,7 +303,7 @@ Claude Code session transcripts and native plan files are *read* but never owned
    (`writeAtomic`, several private copies — plan.js now among them) and read-modify-writes
    are serialized per path (`withLock`). plan.js gained its own `withLock` too, so
    `writePlan`, `writeComments`, and `ensureIgnored`'s gitignore read-modify-write are now
-   serialized per path like todo.js/promptHistory.js. Don't add a plain `fs.writeFile`.
+   serialized per path like promptHistory.js. Don't add a plain `fs.writeFile`.
 3. **Path containment everywhere.** Project-relative paths are resolved and checked to
    stay inside `.hivemind/` (or the plan-root allowlist); `readSession` accepts only a
    bare `.jsonl` basename. Renderer-supplied ids never reach the filesystem raw.
@@ -280,17 +315,17 @@ Claude Code session transcripts and native plan files are *read* but never owned
    never-written session dies with "No conversation found").
 6. **Deterministic claims are ground truth** — the self-heal rule must never steal them,
    and released files are `retired` so they can't be re-bound as rollovers.
-7. **todos.json is a tree** despite the module comment's flat sketch; keep `children`
-   round-tripping through any code that touches it.
-8. **usage.js needs a subscription login** (`~/.claude/.credentials.json`); its 401 path
-   is expected operation, not a bug, and its token scan covers *all* projects on the
-   machine, not just the open hive.
-9. **CLAUDE.md rule**: any user-facing change to these features (buttons, shortcuts,
+7. **usage.js is per agent, and machine-global.** Claude's limits need a subscription
+   login (`~/.claude/.credentials.json`) — the 401 path is expected operation, not a bug —
+   and both agents' token scans cover *all* projects on the machine, not just the open
+   hive. ChatGPT's limits are a **recorded snapshot**, never live: any UI that shows them
+   must show `observedAt` too, or it is claiming a stale number is current.
+8. **CLAUDE.md rule**: any user-facing change to these features (buttons, shortcuts,
    panels) must update the Help modal in `src/index.html` in the same change.
 
 ## How to extend: adding a new per-project sidecar feature
 
-Follow the todo.js template — it is the smallest complete example.
+Follow the promptHistory.js template — it is the smallest complete example.
 
 1. **Module** (`<feature>.js` at the repo root, main process): define
    `FEATURE_REL = '.hivemind/<feature>.json'`; copy the path guard
@@ -304,15 +339,15 @@ Follow the todo.js template — it is the smallest complete example.
    `ipcMain.handle('feature:ensureIgnored', (_e, { cwd }) => plan.ensureIgnored(cwd));`
    — reuse, don't reimplement.
 3. **Preload** (`preload.js`, near line 125): expose a `feature: { read, write, … }`
-   group on the bridge, mirroring the todo/promptHistory entries.
-4. **Renderer** (`src/renderer.js`): add a sidebar panel following the Todo panel
-   pattern — a toggle that closes the other panels (`setTodoOpen`-style mutual
+   group on the bridge, mirroring the promptHistory entries.
+4. **Renderer** (`src/renderer.js`): add a sidebar panel following the Prompt History
+   panel pattern — a toggle that closes the other panels (`setHistoryOpen`-style mutual
    exclusion), `refresh` on open and on board change, a `loadFailed` flag that blocks
    saves after a bad read, and a call to `ensureIgnored` before the first write. Panel
    markup goes in `src/index.html`, styles in `src/styles.css`.
 5. **Data file**: pick a JSON array/object shape, document it in the module header, and
    assume agent threads may edit it concurrently — re-read before append-style
-   mutations (see `addTodoItem`) rather than trusting in-memory state.
+   mutations (see `promptHistory.appendPrompt`) rather than trusting in-memory state.
 6. **Help modal**: document the new panel/shortcut in `#help-modal`
    (`src/index.html`) — per CLAUDE.md the change isn't done without it.
 

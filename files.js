@@ -105,11 +105,26 @@ async function list(root, rel) {
   return { ok: true, entries };
 }
 
+// Extensions Windows will *execute* rather than open in a viewer. `openPath`
+// on one of these is `ShellExecute`, i.e. arbitrary code as the user — so the
+// File Explorer refuses them outright and offers Reveal instead. The path
+// guards above only prove the file is inside the project; they say nothing
+// about whether opening it is safe, and a project tree is exactly where an
+// agent thread's output lands.
+const EXECUTABLE_EXTS = new Set([
+  '.exe', '.com', '.scr', '.pif', '.cpl', '.msi', '.msp', '.msc',
+  '.bat', '.cmd', '.ps1', '.psm1', '.vbs', '.vbe', '.js', '.jse', '.wsf', '.wsh',
+  '.hta', '.reg', '.lnk', '.url', '.inf', '.jar', '.appref-ms',
+]);
+
 // Open a file in the OS default application.
 async function open(root, rel) {
   const p = safeJoin(root, rel);
   if (!p) return { ok: false, message: 'Path is outside the project directory.' };
   if (!realInside(root, p)) return { ok: false, message: 'Path is outside the project directory.' };
+  if (EXECUTABLE_EXTS.has(path.extname(p).toLowerCase())) {
+    return { ok: false, message: 'That file type runs as a program — use Reveal in Explorer instead.' };
+  }
   const err = await shell.openPath(p); // '' on success
   return err ? { ok: false, message: err } : { ok: true };
 }

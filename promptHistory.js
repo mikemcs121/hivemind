@@ -6,10 +6,10 @@
 //
 //   .hivemind/prompt-history.json  -- [{ id, text, ts, agent }]
 //
-// Scoped to the project directory (cwd) like the Todo panel — one shared list
-// per hive, not per-thread. Appended newest-last (the panel renders it
-// newest-first). The path is resolved and checked to stay inside the project's
-// `.hivemind/` folder (same guard as todo.js / files.js / plan.js).
+// Scoped to the project directory (cwd) — one shared list per hive, not
+// per-thread. Appended newest-last (the panel renders it newest-first). The
+// path is resolved and checked to stay inside the project's `.hivemind/`
+// folder (same guard as files.js / plan.js).
 // ---------------------------------------------------------------------------
 
 const fs = require('fs');

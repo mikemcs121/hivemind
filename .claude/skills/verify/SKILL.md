@@ -21,6 +21,16 @@ are isolated via `HM_USER_DATA`.
 2. Launch in the background (PowerShell):
    `$env:HM_USER_DATA='<seeded dir>'; npx electron . --remote-debugging-port=9223`
 
+## Or: a first-run instance (no seeding)
+
+To see what a brand-new user sees — the setup wizard (`#setup-backdrop`) over an
+empty `#empty-state`, no hives, no settings —
+skip the seeding and run `node scripts/fresh-run.js --debug` (add `--sample-project`
+for a virgin project folder, `--keep` to reuse the profile for a second run). It
+wipes a throwaway profile under `%TEMP%\hivemind-fresh`, scrubs `CLAUDE_CODE_*`
+from the child env, and launches with `--remote-debugging-port=9223` plus an
+`--hm-fresh` marker to kill on. See docs/development.md.
+
 ## Drive it over CDP
 
 No Playwright needed — Node 22+ has a global `WebSocket`. A working driver

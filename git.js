@@ -281,11 +281,19 @@ async function discard(cwd, files) {
     last = await runGit(cwd, ['restore', '--source=HEAD', '--staged', '--worktree', '--', ...tracked]);
   }
   for (const f of untracked) {
-    if (!insideCwd(cwd, f)) { last = { code: 1, stdout: '', stderr: `refused: path outside project (${f})` }; continue; }
+    // Both guards, in that order: `insideCwd` is lexical and cheap, `realInside`
+    // resolves symlinks. A recursive delete is the most destructive thing this
+    // module does, and Windows project trees are full of junctions (`node_modules`,
+    // a `dist` junction to a deploy folder) that a lexical check alone waves through.
+    const abs = path.join(cwd, f);
+    if (!insideCwd(cwd, f) || !realInside(cwd, abs)) {
+      last = { code: 1, stdout: '', stderr: `refused: path outside project (${f})` };
+      continue;
+    }
     // porcelain v2 reports an untracked directory as a single `dir/` entry, so
     // recursive is required to remove a non-empty folder (these are being
     // deliberately discarded).
-    try { fs.rmSync(path.join(cwd, f), { recursive: true, force: true }); }
+    try { fs.rmSync(abs, { recursive: true, force: true }); }
     catch (e) { last = { code: 1, stdout: '', stderr: String(e.message || e) }; }
   }
   return last;

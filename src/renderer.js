@@ -413,6 +413,20 @@ const AGENTS = [
 const isValidAgent = (a) => AGENTS.some((x) => x.value === a);
 const agentFor = (v) => AGENTS.find((x) => x.value === v) || AGENTS[0];
 
+// The agent a new thread starts on. Claude is the built-in default, but a user
+// who went through the setup wizard on ChatGPT (or set it in Settings) should
+// get ChatGPT threads without changing the dropdown on every one of them —
+// including the thread `selectBoard` opens automatically with a new hive.
+let defaultAgent = localStorage.getItem('hm.agent');
+if (!isValidAgent(defaultAgent)) defaultAgent = 'claude';
+function setDefaultAgent(agent) {
+  if (!isValidAgent(agent)) return;
+  defaultAgent = agent;
+  localStorage.setItem('hm.agent', agent);
+  const sel = $('set-default-agent');
+  if (sel && sel.value !== agent) sel.value = agent;
+}
+
 // The command a pane's PTY should auto-run. Claude threads honour the hive's
 // custom startup command; other agents always run their own CLI.
 function paneCommand(pane) {
@@ -486,17 +500,40 @@ function respawnPane(pane, { resume, initialPrompt } = {}) {
   spawnPanePty(pane, { resume: resume || false, initialPrompt });
 }
 
+// Type a slash command into a thread, but never into a menu.
+//
+// A header dropdown fires whenever the user picks from it, including while the
+// thread is sitting on a permission prompt or an AskUserQuestion. Writing
+// `/model opus\r` then goes into the menu's filter and the bare `\r` actuates
+// whatever row is highlighted — approving an edit the user never read. Every
+// other write path in this file re-checks the live screen first (typePrompt,
+// confirmSubmit, the card buttons); these two did not.
+//
+// Waits the menu out on the same cadence as confirmSubmit, then gives up: a
+// dropped model switch is recoverable, a mis-actuated approval is not.
+const SLASH_RETRY_MS = 1000;
+function writeSlashWhenClear(pane, cmd, tries = 5) {
+  if (pane.disposed || pane.state === 'dead' || tries <= 0) return;
+  if (pane.state === 'attention' || chatHasPendingQuestion(pane) ||
+      menuOnScreen(screenText(pane))) {
+    setTimeout(() => writeSlashWhenClear(pane, cmd, tries - 1), SLASH_RETRY_MS);
+    return;
+  }
+  window.api.writePty(pane.id, cmd);
+  markActivity(pane, '');
+}
+
 function setPaneModel(pane, model) {
   if (pane.disposed) return;
   if (!isValidModel(model)) model = 'default';
+  const changed = pane.model !== model;
   pane.model = model;
   defaultModel = model;
   localStorage.setItem('hm.model', model);
   if (pane.modelSelect && pane.modelSelect.value !== model) pane.modelSelect.value = model;
   // Switch a running thread live by driving Claude Code's /model command.
-  if (pane.agent === 'claude' && pane.state !== 'dead') {
-    window.api.writePty(pane.id, `/model ${model}\r`);
-    markActivity(pane, '');
+  if (changed && pane.agent === 'claude' && pane.state !== 'dead') {
+    writeSlashWhenClear(pane, `/model ${model}\r`);
   }
 }
 
@@ -518,18 +555,16 @@ function setPaneCodexModel(pane, model) {
 function setPaneGrokModel(pane, model) {
   if (pane.disposed) return;
   if (!isValidGrokModel(model)) model = 'default';
+  const changed = pane.grokModel !== model;
   pane.grokModel = model;
   defaultGrokModel = model;
   localStorage.setItem('hm.grokModel', model);
   if (pane.grokModelSelect && pane.grokModelSelect.value !== model) pane.grokModelSelect.value = model;
   // Grok Build supports a named /model command, so it can switch without
   // throwing away the current terminal session.
-  if (pane.agent === 'grok' && pane.state !== 'dead') {
+  if (changed && pane.agent === 'grok' && pane.state !== 'dead') {
     if (model === 'default') respawnPane(pane);
-    else {
-      window.api.writePty(pane.id, `/model ${model}\r`);
-      markActivity(pane, '');
-    }
+    else writeSlashWhenClear(pane, `/model ${model}\r`);
   }
 }
 
@@ -619,8 +654,17 @@ function setPanePerm(pane, mode) {
     // thinking and just sat there". Queue the switch instead and let
     // applyPendingPerm fire it once the turn goes quiet. Flipping back to the
     // mode the process is already running cancels the queued restart.
-    if (pane.state === 'busy') pane.permPending = mode === pane.permRunning ? null : mode;
-    else restartForPerm(pane); // stamps permSetAt so permScreenCheck ignores the dying frame
+    // `attention` queues for the same reason `busy` does — and applyPendingPerm
+    // below already documents it ("restarting under a blocking menu would throw
+    // away the question the thread is asking"). Only that function enforced it;
+    // this entry path sent `attention` straight to a restart, destroying the
+    // menu the user was about to answer. Queue anything that isn't settled and
+    // let applyPendingPerm be the single arbiter.
+    if (pane.state !== 'idle' && pane.state !== 'error') {
+      pane.permPending = mode === pane.permRunning ? null : mode;
+    } else {
+      restartForPerm(pane); // stamps permSetAt so permScreenCheck ignores the dying frame
+    }
   }
   paintPermSelect(pane);
 }
@@ -934,12 +978,10 @@ function syncQuestionExpiry(pane, promptVisible) {
   }, QUESTION_EXPIRE_MS);
 }
 
-// A *pending* AskUserQuestion never reaches the transcript: Claude Code only
-// flushes the assistant message (its text and the tool_use) once the tool
-// resolves — i.e. after the user has already answered in the TUI (verified
-// against v2.1.201). So while the question waits — the only window the card
-// matters — the visible screen is the sole signal, exactly like codex
-// approvals. These helpers parse the select menu off the screen and render it
+// Older Claude releases defer AskUserQuestion transcript entries until the
+// tool resolves; newer releases can emit them while the question still waits.
+// The visible screen is authoritative for the currently actionable menu,
+// exactly like Codex approvals. These helpers parse it and render it
 // as a synthetic question card (addQuestionRow) so the chat view can show and
 // answer the prompt live. Once answered, the menu leaves the screen (the
 // probe removes the stand-in) and the real transcript entries land, rendering
@@ -1244,6 +1286,13 @@ function syncScreenQuestion(pane, screen) {
   // card (addQuestionRow stamps the supersede).
   if (c.screenQSupSig === sig && Date.now() - (c.screenQSupAt || 0) < 2000) return;
   c.screenQSupSig = null;
+  // Newer Claude releases flush AskUserQuestion before it resolves. Keep its
+  // transcript row for the eventual answer, but show only the authoritative
+  // screen card while the menu is live (it also includes custom-answer rows).
+  for (const id of strandedQuestionIds(c)) {
+    const row = c.byKey.get(c.toolByUseId.get(id));
+    if (row) row.classList.add('screen-question-covered');
+  }
   if (c.screenQSig === sig && c.byKey.has(key)) return;
   c.screenQSig = sig;
   const fresh = !c.byKey.has(key);
@@ -1280,6 +1329,7 @@ function cardMenuLive(pane, q) {
 function removeScreenQuestion(pane) {
   const c = pane.chat;
   if (!c) return;
+  for (const row of c.byKey.values()) row.classList.remove('screen-question-covered');
   c.screenQSig = null;
   const key = screenQuestionKey(pane);
   const row = c.byKey.get(key);
@@ -1688,7 +1738,11 @@ function sendToPane(pane, data, { caption = true } = {}) {
 // through as its own bracketed paste (its model can't view images from a path
 // in text — codex's view_image tool is unreliable in the Windows sandbox).
 function typePrompt(pane, text, images = []) {
-  for (const p of images) sendToPane(pane, '\x1b[200~' + p + '\x1b[201~');
+  // `caption: false` — an image path is plumbing, not something the user typed.
+  // Left on, feedCaptionInput folds every attached path into capBuf and the
+  // trailing Enter commits `C:\…\shot.png` + the real prompt as the thread's
+  // caption, which then gets persisted into the layout.
+  for (const p of images) sendToPane(pane, '\x1b[200~' + p + '\x1b[201~', { caption: false });
   if (text && !text.includes('\n') && text.startsWith('/')) sendToPane(pane, text);
   else if (text) sendToPane(pane, '\x1b[200~' + text + '\x1b[201~');
   const delay = (pane.agent === 'codex' ? 250 : 150) +
@@ -1700,9 +1754,8 @@ function typePrompt(pane, text, images = []) {
     // a probe tick, and an Enter now would accept the highlighted row. Leave
     // the text in the composer; confirmSubmit waits the menu out and presses
     // Enter once it's gone.
-    if (pane.state === 'attention' || chatHasPendingQuestion(pane) ||
-        menuOnScreen(screenText(pane))) {
-      confirmSubmit(pane, ptyId, text, 5);
+    if (chatComposerBlocked(pane)) {
+      confirmSubmit(pane, ptyId, text, 5, { owesEnter: true });
       return;
     }
     sendToPane(pane, '\r');
@@ -1721,25 +1774,63 @@ function typePrompt(pane, text, images = []) {
 // menu row instead, so those bail out.
 const SUBMIT_RETRY_MS = 1000;
 const COMPOSER_ROW_RE = /^\s*(?:[>❯](\s|$)|[│▌])/;
+
+// Collapse a run of screen rows into one comparable string: strip the box
+// chrome, squeeze runs of whitespace, so a prompt that the TUI wrapped over
+// several rows still matches the single line the user typed.
+const flattenRows = (rows) =>
+  rows.map(stripBoxChrome).join(' ').replace(/\s+/g, ' ').trim();
+
+// Is the prompt still sitting unsent in the composer?
+//
+// The composer is a *block* of rows, not one row: a wrapped prompt puts its
+// head on the block's FIRST row, and in bordered builds every continuation row
+// carries the same "│" prefix. Anchoring on the bottom-most prefixed row and
+// slicing downward (what this used to do) therefore cut off the very text it
+// was looking for, and matching a 40-char head against a single row could never
+// succeed in a pane narrower than ~45 columns — which is exactly what the app's
+// own 4-across tiling produces. Both failures were silent: the retry simply
+// never fired and the prompt sat in the composer forever.
+//
+// So: find the bottom-most composer row, extend upward across the contiguous
+// block, then match against the whole block flattened (plus anything below it,
+// for unprefixed wrap continuations).
 function promptStuckOnScreen(screen, head) {
+  if (!head) return false;
   const rows = screen.split('\n');
+  let end = -1;
   for (let i = rows.length - 1; i >= 0; i--) {
-    if (!COMPOSER_ROW_RE.test(rows[i])) continue;
-    return rows.slice(i).some((l) => l.includes(head));
+    if (COMPOSER_ROW_RE.test(rows[i])) { end = i; break; }
   }
-  return false;
+  if (end < 0) return false;
+  let start = end;
+  while (start > 0 && COMPOSER_ROW_RE.test(rows[start - 1])) start--;
+  return flattenRows(rows.slice(start)).includes(head);
 }
-function confirmSubmit(pane, ptyId, text, tries) {
-  const head = String(text || '').split('\n', 1)[0].trim().slice(0, 40);
-  if (head.length < 3 || tries <= 0) return;
+
+// `owesEnter`: typePrompt withheld the Enter because a menu was on screen, so
+// this call is responsible for delivering it once the menu clears — even for a
+// prompt too short to verify by matching. Without it, every short reply sent
+// from the chat composer while a menu was up ("ok", "yes", "no", "1") was
+// pasted and then never submitted at all.
+function confirmSubmit(pane, ptyId, text, tries, { owesEnter = false } = {}) {
+  const head = flattenRows([String(text || '').split('\n', 1)[0]]).slice(0, 24);
+  if (tries <= 0) return;
+  if (!owesEnter && head.length < 3) return;
   setTimeout(() => {
     if (pane.disposed || pane.id !== ptyId) return;
     const screen = screenText(pane);
     // A menu in the way: don't actuate it — keep waiting for it to clear (the
     // user answers it in card or terminal; the stuck prompt is still worth
     // submitting afterwards), giving up once the tries run out.
-    if (pane.state === 'attention' || chatHasPendingQuestion(pane) ||
-        promptVisibleOnScreen(screen)) {
+    if (chatComposerBlocked(pane)) {
+      confirmSubmit(pane, ptyId, text, tries - 1, { owesEnter });
+      return;
+    }
+    // The menu is gone, so an Enter can no longer actuate a menu row. Deliver
+    // the one we withheld, then fall back to the normal verify loop.
+    if (owesEnter) {
+      sendToPane(pane, '\r');
       confirmSubmit(pane, ptyId, text, tries - 1);
       return;
     }
@@ -2053,14 +2144,6 @@ const HM_COMMANDS = [
     run() { hmChatClose(); },
   },
   {
-    // "add a todo (item) [to] <text>" — append to this hive's Todo panel. The
-    // bare "todo <text>" composer prefix is the shortcut for the same thing.
-    name: 'add-todo',
-    patterns: [/^(?:add|create|make|new)\s+(?:a\s+)?(?:new\s+)?to-?do(?:\s+item)?\b\s*(.*)$/i],
-    help: '<strong>add a todo &lt;text&gt;</strong> — adds an item to this hive\'s Todo panel.',
-    run(m) { captureTodo(hmExtractTask(m[1])); },
-  },
-  {
     // "open (up) a new thread [and/to <task>]" — the task rides along as the
     // new Claude's initial prompt, so it starts working the moment it boots.
     // "open 2 threads" / "open three new threads" opens that many (capped at
@@ -2166,7 +2249,7 @@ const HM_COMMANDS = [
     // "stop listening" reach the mic instead of a thread.
     name: 'voice-start',
     patterns: [/^(?:start|enable|turn\s+on|begin)\s+(?:voice(?:\s+typing)?|dictation|dictating|listening)$/i],
-    help: '<strong>start / stop voice typing</strong> — same as the 🎤 button or the <kbd>~</kbd> key.',
+    help: '<strong>start / stop voice typing</strong> — same as the mic button in the board bar or the <kbd>~</kbd> key.',
     run() { startVoice(); },
   },
   {
@@ -2423,19 +2506,18 @@ const HM_COMMANDS = [
   },
   {
     name: 'panel',
-    patterns: [/^(open|show|close|hide|toggle)\s+(?:the\s+)?(files?|file\s+explorer|explorer|git|source\s+control|to-?dos?)\s*(?:panel|sidebar|list)?$/i],
-    help: '<strong>open / close the explorer / git / todo panel</strong>',
+    patterns: [/^(open|show|close|hide|toggle)\s+(?:the\s+)?(files?|file\s+explorer|explorer|git|source\s+control)\s*(?:panel|sidebar|list)?$/i],
+    help: '<strong>open / close the explorer / git panel</strong>',
     run(m) {
       const verb = m[1].toLowerCase();
       const what = m[2].toLowerCase();
-      const kind = /git|source/.test(what) ? 'git' : /to-?do/.test(what) ? 'todo' : 'files';
-      const panel = kind === 'git' ? gitPanel : kind === 'todo' ? todoPanel : filesPanel;
+      const kind = /git|source/.test(what) ? 'git' : 'files';
+      const panel = kind === 'git' ? gitPanel : filesPanel;
       const isOpen = panel && !panel.classList.contains('hidden');
       const open = verb === 'toggle' ? !isOpen : (verb === 'open' || verb === 'show');
       if (kind === 'git') { setGitOpen(open); if (open) refreshGit(); }
-      else if (kind === 'todo') { setTodoOpen(open); if (open) refreshTodo(); }
       else { setFilesOpen(open); if (open) refreshFiles(); }
-      hmToast((kind === 'git' ? 'Source Control' : kind === 'todo' ? 'Todo' : 'Explorer') + (open ? ' panel opened.' : ' panel closed.'));
+      hmToast((kind === 'git' ? 'Source Control' : 'Explorer') + (open ? ' panel opened.' : ' panel closed.'));
     },
   },
   {
@@ -2475,31 +2557,6 @@ const HM_COMMANDS = [
       refreshGit();
       if (hits.length) hmToast(hits.length + ' changed files match "' + q + '" — pick one in Source Control.');
       else hmToast('No changed file matches "' + q + '".', 'err');
-    },
-  },
-  {
-    // "publish the site" opens the Publish panel and, when it is already set up
-    // and something has changed, starts the upload. Never uploads silently from
-    // an unconfigured hive — the panel opens so the target is visible first.
-    name: 'publish-site',
-    patterns: [
-      /^(?:publish|upload|deploy)(?:\s+(?:the|my))?(?:\s+(?:site|website|web\s*site))?$/i,
-      /^(?:publish|upload|deploy)\s+to\s+(?:the\s+)?(?:web|website|ftp|host(?:ing)?)$/i,
-    ],
-    help: '<strong>publish the site</strong> — opens the Publish panel and uploads the files that changed since the last publish.',
-    async run() {
-      const dir = activeDir();
-      if (!dir) { hmToast('This hive has no project directory set.', 'err'); return; }
-      setPublishOpen(true);
-      await refreshPublish();
-      if (!pubCfg || !pubCfg.configured) {
-        hmToast('Publish opened — fill in the FTP connection first.');
-        return;
-      }
-      const changed = ((pubScan && pubScan.files) || []).filter((f) => f.changed).length;
-      if (!changed) { hmToast('Everything is already up to date on the website.'); return; }
-      hmToast(`Publishing ${changed} changed file${changed === 1 ? '' : 's'}…`);
-      doPublish(false);
     },
   },
   {
@@ -2556,9 +2613,19 @@ const HM_COMMANDS = [
     run() { closeSettings(); },
   },
   {
+    name: 'setup',
+    patterns: [
+      /^(?:run|open|start|show)\s+(?:the\s+)?(?:agent\s+)?setup(?:\s+wizard)?$/i,
+      /^set\s*up\s+(?:an?\s+)?agents?$/i,
+      /^which\s+agents?\s+(?:are|is)\s+installed$/i,
+    ],
+    help: '<strong>run setup</strong> / <strong>set up an agent</strong> — opens the setup wizard: which agent CLIs are installed and signed in on this machine, how to connect one, and a first hive at the end.',
+    run() { openSetupWizard({ from: 'command' }); },
+  },
+  {
     name: 'usage',
-    patterns: [/^(?:open|show|check)\s+(?:the\s+)?(?:claude\s+)?usage$/i],
-    help: '<strong>show usage</strong> / <strong>close usage</strong> — your Claude plan limits and today\'s tokens.',
+    patterns: [/^(?:open|show|check)\s+(?:the\s+)?(?:claude\s+|chatgpt\s+|agent\s+)?usage$/i],
+    help: '<strong>show usage</strong> / <strong>close usage</strong> — each agent\'s plan limits and today\'s tokens.',
     run() { openUsage(); },
   },
   {
@@ -2751,7 +2818,7 @@ function runHivemindCommand(cmd, ctxPane) {
 
 // ---------------------------------------------------------------------------
 // Chat with Hivemind — command console docked in the sidebar (#hm-chat), like
-// the Source Control / Todo / Prompt History panels. Every message is a
+// the Source Control / Prompt History panels. Every message is a
 // command (the wake word is tolerated but not required); responses arrive by
 // hmToast mirroring into the transcript. The workspace stays visible so
 // commands like "focus alpha" can be watched taking effect.
@@ -2850,9 +2917,7 @@ function hmChatOpen() {
   // Docked in the sidebar — one panel at a time, like its siblings.
   if (typeof setGitOpen === 'function') setGitOpen(false);
   if (typeof setFilesOpen === 'function') setFilesOpen(false);
-  if (typeof setTodoOpen === 'function') setTodoOpen(false);
   if (typeof setHistoryOpen === 'function') setHistoryOpen(false);
-  if (typeof setPublishOpen === 'function') setPublishOpen(false);
   if (!hmChatSeeded) {
     hmChatSeeded = true;
     hmChatLog.push({ role: 'bee', text: 'Tell me what you need — plain English is fine, no "Hivemind" prefix needed. Try "help" for the full command list.' });
@@ -2863,7 +2928,8 @@ function hmChatOpen() {
   const toggle = document.getElementById('hm-chat-toggle');
   if (toggle) toggle.classList.add('active');
   const sb = document.getElementById('sidebar');
-  if (sb) sb.classList.add('hm-open'); // board list yields its space
+  if (sb) sb.classList.add('hm-open'); // hive list shrinks to the active hive
+  syncSidebarPanelState();
   const input = document.getElementById('hm-chat-input');
   if (input) input.focus();
 }
@@ -2876,6 +2942,7 @@ function hmChatClose() {
   if (toggle) toggle.classList.remove('active');
   const sb = document.getElementById('sidebar');
   if (sb) sb.classList.remove('hm-open');
+  syncSidebarPanelState();
   hmChatSendOnStop = false;
   if (window.speechSynthesis) speechSynthesis.cancel();
   // Closing the panel is a dismissal, not a "send it" — drop the auto-send.
@@ -3122,6 +3189,13 @@ function initChatUI(pane, body) {
   historyBtn.onclick = (e) => { e.stopPropagation(); toggleHistoryMenu(pane); };
   filters.append(historyBtn, historyMenu);
 
+  const interactBtn = document.createElement('button');
+  interactBtn.className = 'chat-chip chat-interact-btn';
+  interactBtn.textContent = 'Interact';
+  interactBtn.title = 'Use the live CLI inside chat: custom answers, menus, sign-in, and keyboard shortcuts';
+  interactBtn.onclick = (e) => { e.stopPropagation(); setChatInteraction(pane, !pane.chat.interactionOpen); };
+  filters.appendChild(interactBtn);
+
   const chips = {};
   for (const kind of CHAT_KINDS) {
     const chip = document.createElement('button');
@@ -3146,17 +3220,11 @@ function initChatUI(pane, body) {
   noticeText.textContent = 'Couldn’t find this thread’s transcript — the chat view can’t update. Still watching for it…';
   const noticeBtn = document.createElement('button');
   noticeBtn.className = 'chat-open-term';
-  noticeBtn.textContent = 'Open terminal';
-  // This is a *temporary* escape hatch while the chat can't find its transcript
-  // — not a lasting "I prefer the terminal" choice. Don't persist it, and mark
-  // the pane so the view snaps back to chat the moment the transcript binds
-  // (chatBindStatus). Persisting it here trapped threads in terminal view: once
-  // the transcript later bound, the chat view stayed hidden behind the terminal
-  // on every subsequent launch.
+  noticeBtn.textContent = 'Interact';
+  // The live CLI remains accessible inside chat while its transcript catches up.
   noticeBtn.onclick = (e) => {
     e.stopPropagation();
-    pane.termFallback = true;
-    setPaneView(pane, 'term', { persist: false });
+    setChatInteraction(pane, true);
   };
   notice.append(noticeText, noticeBtn);
 
@@ -3227,11 +3295,25 @@ function initChatUI(pane, body) {
   historyBackBtn.onclick = (e) => { e.stopPropagation(); exitHistory(pane); };
   historyBar.append(historyBarText, historyBackBtn);
 
-  wrap.append(filters, notice, historyBar, list, composer);
+  const interaction = document.createElement('div');
+  interaction.className = 'chat-interaction hidden';
+  const interactionHead = document.createElement('div');
+  interactionHead.className = 'chat-interaction-head';
+  const interactionLabel = document.createElement('span');
+  interactionLabel.textContent = 'Live controls — type or use the keyboard here';
+  const interactionClose = document.createElement('button');
+  interactionClose.className = 'chat-chip';
+  interactionClose.textContent = 'Done';
+  interactionClose.onclick = (e) => { e.stopPropagation(); setChatInteraction(pane, false); };
+  interactionHead.append(interactionLabel, interactionClose);
+  interaction.appendChild(interactionHead);
+  wrap.append(filters, notice, historyBar, list, interaction, composer);
   body.appendChild(wrap);
 
   pane.chat = {
     wrap, list, input, sendBtn, notice, chips, attachRow, topic, working,
+    interaction, interactBtn, interactionOpen: false,
+    terminalHost: body.querySelector('.pane-term'), terminalHome: body,
     historyBtn, historyMenu, historyBar, historyBarText,
     viewingHistory: false,   // true while showing a past session over the live view
     historySession: null,    // the session being viewed (so the composer can resume it)
@@ -3260,9 +3342,10 @@ function initChatUI(pane, body) {
   pane.composerResizeObserver = new ResizeObserver(() => {
     if (pane.disposed) return;
     pane.el.style.setProperty('--chat-composer-h', composer.offsetHeight + 'px');
-    if (pane.el.classList.contains('term-chat')) fitBoard(pane.board.id);
+    if (pane.el.classList.contains('term-chat') || pane.chat.interactionOpen) fitBoard(pane.board.id);
   });
   pane.composerResizeObserver.observe(composer);
+  pane.composerResizeObserver.observe(interaction);
 
   // Composer wiring. Keystrokes stay local to the textarea; Enter sends.
   // The autocomplete menu gets first look at keys so ↑/↓/Tab/Enter/Esc can
@@ -3330,6 +3413,7 @@ function initChatUI(pane, body) {
   });
   wrap.addEventListener('dragleave', () => pane.el.classList.remove('drag-over'));
   wrap.addEventListener('drop', async (e) => {
+    if (pane.chat.interactionOpen && pane.chat.terminalHost.contains(e.target)) return;
     pane.el.classList.remove('drag-over');
     const files = Array.from((e.dataTransfer && e.dataTransfer.files) || []);
     if (!files.length) return;
@@ -3682,8 +3766,30 @@ function updateViewBtn(pane) {
     : 'Show the chat view';
 }
 
+// Reuse the actual xterm so every CLI interaction (including future menus)
+// remains available without leaving chat or maintaining a second input buffer.
+function setChatInteraction(pane, open, { focus = true } = {}) {
+  const c = pane.chat;
+  if (!c || pane.disposed) return;
+  open = !!open && !c.viewingHistory && pane.view === 'chat';
+  c.interactionOpen = open;
+  c.interaction.classList.toggle('hidden', !open);
+  c.interactBtn.classList.toggle('active', open);
+  c.interactBtn.setAttribute('aria-expanded', String(open));
+  if (open) c.interaction.appendChild(c.terminalHost);
+  else c.terminalHome.prepend(c.terminalHost);
+  requestAnimationFrame(() => {
+    if (pane.disposed) return;
+    fitBoard(pane.board.id);
+    if (!focus) return;
+    if (c.interactionOpen) pane.term.focus();
+    else if (pane === focusedPane && pane.view === 'chat') c.input.focus();
+  });
+}
+
 function setPaneView(pane, view, { persist = true } = {}) {
   if (!chatSupported(pane)) view = 'term';
+  if (view !== 'chat' && pane.chat?.interactionOpen) setChatInteraction(pane, false);
   // A persisted view change is a deliberate user choice (the >_/💬 toggle, the
   // show-terminal/show-chat commands): it overrides any pending "terminal only
   // because the transcript was missing" fallback, so the chat view won't snap
@@ -3700,6 +3806,17 @@ function setPaneView(pane, view, { persist = true } = {}) {
   pane.el.classList.toggle('term-chat', termChat);
   updateViewBtn(pane);
   if (view === 'term' || insetChanged) fitBoard(pane.board.id); // defensive re-fit on reveal
+  // `.pane.term-view .chat-wrap` is display:none, so while the terminal is up
+  // the chat list has no layout box and every `scrollTop = scrollHeight` in the
+  // render path is a silent no-op — scrollTop also reads back as 0. Revealing
+  // the chat therefore landed the user at the very first message of the thread.
+  // Re-pin to the bottom once layout exists again.
+  if (view === 'chat' && pane.chat) {
+    requestAnimationFrame(() => {
+      if (pane.disposed || pane.view !== 'chat' || !pane.chat) return;
+      pane.chat.list.scrollTop = pane.chat.list.scrollHeight;
+    });
+  }
   if (pane === focusedPane) {
     try {
       if (view === 'chat' && pane.chat) pane.chat.input.focus();
@@ -3762,6 +3879,9 @@ function resetChat(pane) {
   c.pendingQuestions.clear();
   c.screenQSig = null;
   c.screenQSupSig = null;
+  // Drop the stall timers with the echoes they belong to — clearing the array
+  // alone left one live timeout per outstanding send.
+  for (const p of c.pendingEcho) clearTimeout(p.timer);
   c.pendingEcho = [];
   c.pinned = true;
   c.topic.textContent = '';
@@ -3929,6 +4049,7 @@ function chatIngest(pane, entries, backfill) {
   // exitHistory() re-reads the live file to catch up.
   if (!c || c.viewingHistory) return;
   renderChatEntries(pane, entries, backfill);
+  syncScreenQuestion(pane);
   // A batch of rows landing must not bury the live screen-question card —
   // keep it trailing the newest content (an exitHistory backfill otherwise
   // strands it at the top, scrolled out of view).
@@ -4242,14 +4363,8 @@ function addToolRow(pane, key, part) {
 // pendingQuestions, which drives the pane's "needs you" state.
 function addQuestionRow(pane, key, part) {
   const c = pane.chat;
-  // A real tool_use from the transcript supersedes the screen-parsed stand-in
-  // (it only lands once the question was answered and the menu left the
-  // screen). Stamp the supersede so a probe tick racing one last repaint of
-  // the answered menu can't resurrect the stand-in (syncScreenQuestion).
-  if (part.id && part.id.indexOf('screenq:') !== 0) {
-    if (c.screenQSig) { c.screenQSupSig = c.screenQSig; c.screenQSupAt = Date.now(); }
-    removeScreenQuestion(pane);
-  }
+  // A tool_use can arrive before the user answers. Only its tool_result
+  // supersedes the live screen card; ingest re-syncs that card after the batch.
   const questions = part.input.questions.filter((q) => q && typeof q === 'object');
   const isScreenCard = !!(part.id && part.id.indexOf('screenq:') === 0);
   upsertChatRow(pane, key, 'prompt', (row) => {
@@ -4338,7 +4453,7 @@ function addQuestionRow(pane, key, part) {
           // "10" is two keystrokes — the first would answer a single-select
           // menu as option 1 and leak a stray "0" into whatever follows.
           btn.disabled = true;
-          btn.title = `Option ${i + 1} — answer in the terminal (digit keys stop at 9)`;
+          btn.title = `Option ${i + 1} — use Interact (digit keys stop at 9)`;
         } else {
           btn.title = q.multiSelect
             ? `Toggle "${label}" — presses ${i + 1} in the hidden terminal`
@@ -4363,6 +4478,9 @@ function addQuestionRow(pane, key, part) {
             setTimeout(() => { delete card.dataset.sent; }, 2500);
           }
           sendToPane(pane, String(i + 1), { caption: false });
+          if (isScreenCard && /^(Type something\.?|Chat about this)$/i.test(label)) {
+            setChatInteraction(pane, true);
+          }
           // Preview-layout menus take the digit as navigation only — commit it
           // with Enter, after re-checking that the same menu is still up (the
           // digit moves the caret but leaves the labels alone, so the shape
@@ -4384,8 +4502,8 @@ function addQuestionRow(pane, key, part) {
     const hint = document.createElement('span');
     hint.className = 'chat-question-hint';
     hint.textContent = anyMulti
-      ? 'Multi-select — click options to toggle, then Review to submit. Custom answers need the terminal.'
-      : 'Click an option to answer. For a custom answer, open the terminal.';
+      ? 'Multi-select — click options to toggle, then Review to submit. Use Interact for custom answers.'
+      : 'Click an option to answer. Use Interact for a custom answer.';
     foot.appendChild(hint);
     if (anyMulti) {
       // Enter no longer submits a multi-select (it toggles the highlighted
@@ -4419,8 +4537,8 @@ function addQuestionRow(pane, key, part) {
     }
     const openTerm = document.createElement('button');
     openTerm.className = 'chat-question-key';
-    openTerm.textContent = 'Open terminal';
-    openTerm.onclick = (e) => { e.stopPropagation(); setPaneView(pane, 'term'); };
+    openTerm.textContent = 'Interact';
+    openTerm.onclick = (e) => { e.stopPropagation(); setChatInteraction(pane, true); };
     foot.appendChild(openTerm);
     card.appendChild(foot);
     const answer = document.createElement('pre');
@@ -4465,6 +4583,8 @@ function attachToolResult(pane, part, toolUseResult) {
   }
   const card = row.querySelector('.chat-question');
   if (card) {
+    if (c.screenQSig) { c.screenQSupSig = c.screenQSig; c.screenQSupAt = Date.now(); }
+    removeScreenQuestion(pane);
     if (c.pendingQuestions.delete(part.tool_use_id)) updateChatBanner(pane);
     card.classList.add('answered');
     const ans = card.querySelector('.chat-question-answer');
@@ -4527,8 +4647,13 @@ function sendChatMessage(pane) {
   const c = pane.chat;
   if (!c) return;
   // A prompt is waiting in the terminal — a typed line won't reach it (the TUI
-  // wants a menu keypress), so the composer is locked; ignore stray sends too.
-  if (pane.state === 'attention' && !c.viewingHistory) return;
+  // wants a menu keypress), so the composer is locked. Say so: this used to be
+  // a bare `return`, so dictating a prompt into a locked thread and saying
+  // "send" dropped the whole message with no feedback at all.
+  if (chatComposerBlocked(pane) && !c.viewingHistory) {
+    hmToast('That thread is waiting on a prompt — answer the card above or use Interact.', 'err');
+    return;
+  }
   const raw = c.input.value.replace(/\r\n?/g, '\n');
   let text = raw.trim();
   if (!text && !c.attachments.length) return;
@@ -4540,12 +4665,8 @@ function sendChatMessage(pane) {
   // starting with the wake word is consumed (unrecognized commands toast an
   // error); mentioning Hivemind mid-sentence sends as a normal message.
   const hmCmd = matchHivemindCommand(text);
-  // A message starting with "todo" is a checklist entry for the Todo panel,
-  // handled by Hivemind itself — same swallow-and-clear path as app commands.
-  const todoText = hmCmd === null ? matchTodoPrefix(text) : null;
-  if (hmCmd !== null || todoText !== null) {
-    if (todoText !== null) captureTodo(todoText);
-    else runHivemindCommand(hmCmd, pane);
+  if (hmCmd !== null) {
+    runHivemindCommand(hmCmd, pane);
     if (text && c.history[c.history.length - 1] !== text) {
       c.history.push(text);
       if (c.history.length > 200) c.history.shift();
@@ -4646,8 +4767,8 @@ function flagStalledEcho(pane, p) {
     ? '⚠ not delivered — this thread needs you to sign in again'
     : '⚠ no response yet — the thread may be waiting on something in the terminal';
   const btn = document.createElement('button');
-  btn.textContent = 'Open terminal';
-  btn.onclick = (e) => { e.stopPropagation(); setPaneView(pane, 'term'); };
+  btn.textContent = 'Interact';
+  btn.onclick = (e) => { e.stopPropagation(); setChatInteraction(pane, true); };
   note.appendChild(btn);
 }
 
@@ -4676,9 +4797,20 @@ function addEchoRow(pane, text) {
 function confirmEcho(pane, text) {
   const c = pane.chat;
   if (!c.pendingEcho.length) return;
-  let i = c.pendingEcho.findIndex((p) => p.text === String(text).trim());
-  if (i === -1) i = 0; // the TUI can reshape the text slightly — this real user
-                       // line still corresponds to the oldest unconfirmed send
+  const arriving = String(text).trim();
+  // Exact match first, then the message's first line: an image send stores
+  // "text\n🖼 shot.png" in the echo while the transcript records only "text".
+  let i = c.pendingEcho.findIndex((p) => p.text === arriving);
+  if (i === -1) i = c.pendingEcho.findIndex((p) => p.text.split('\n', 1)[0].trim() === arriving);
+  // Only fall back to "the oldest one" when there is nothing to get wrong.
+  // Blindly taking index 0 on any mismatch — which is what this did — confirmed
+  // message A's bubble away using message B's line, cancelling A's stall timer
+  // so the "no response yet" warning that exists for exactly this case never
+  // fired. With several sends outstanding, leave them all pending instead.
+  if (i === -1) {
+    if (c.pendingEcho.length !== 1) return;
+    i = 0;
+  }
   const [p] = c.pendingEcho.splice(i, 1);
   clearTimeout(p.timer);
   const row = c.byKey.get(p.key);
@@ -4692,9 +4824,9 @@ function confirmEcho(pane, text) {
 // the composer is locked because the terminal is waiting on a prompt.
 const PROMPT_CARD_KEY = 'attn-prompt';
 const PROMPT_LOCK_PLACEHOLDER =
-  'Answer the prompt above to continue — open the terminal to type a custom reply';
+  'Answer the prompt above to continue — use Interact for a custom reply';
 const AUTH_LOCK_PLACEHOLDER =
-  'Sign in again in the terminal to continue — messages sent from here can\'t reach the thread yet';
+  'Use Interact to sign in again — messages cannot reach the thread yet';
 
 // The text shown in the inline prompt card: the process-exit note, the last
 // error lines, or the prompt scraped from the visible screen (starting at the
@@ -4736,6 +4868,7 @@ function promptCardText(pane, state) {
 // than a separate banner strip. Quick keys and Open terminal act on the PTY.
 function renderPromptCard(pane, state) {
   const c = pane.chat;
+  const renderedScreen = screenText(pane);
   const isErr = state === 'error' || state === 'dead';
   const needsAuth = state === 'attention' && !!pane.needsAuth;
   const text = promptCardText(pane, state);
@@ -4758,7 +4891,7 @@ function renderPromptCard(pane, state) {
       note.className = 'chat-prompt-note';
       note.textContent =
         `${agentFor(pane.agent).label} is asking you to sign in again. Open the ` +
-        'terminal to finish signing in — messages sent from the chat stay in the ' +
+        'Interact panel to finish signing in — messages sent from the chat stay in the ' +
         'composer until this thread is back.';
       card.appendChild(note);
     }
@@ -4786,6 +4919,7 @@ function renderPromptCard(pane, state) {
           // while the pane still reads attention AND a prompt is actually on
           // screen; a stale Enter/Esc would land in a live turn.
           if (c.viewingHistory || pane.state !== 'attention') return;
+          if (screenText(pane) !== renderedScreen) return;
           if (!promptVisibleOnScreen(screenText(pane))) {
             removePromptCard(pane);
             return;
@@ -4798,8 +4932,8 @@ function renderPromptCard(pane, state) {
     }
     const openTerm = document.createElement('button');
     openTerm.className = 'chat-prompt-open';
-    openTerm.textContent = needsAuth ? 'Open terminal to sign in' : 'Open terminal';
-    openTerm.onclick = (e) => { e.stopPropagation(); setPaneView(pane, 'term'); };
+    openTerm.textContent = needsAuth ? 'Interact to sign in' : 'Interact';
+    openTerm.onclick = (e) => { e.stopPropagation(); setChatInteraction(pane, true); };
     foot.appendChild(openTerm);
     card.appendChild(foot);
     r.appendChild(card);
@@ -4820,11 +4954,23 @@ function removePromptCard(pane) {
 // so disable it and point the user at the card's keys or the terminal. History
 // mode owns the composer itself, so it never locks — and keeps its own
 // placeholder (updateHistoryChrome).
+function chatComposerBlocked(pane) {
+  if (pane.needsAuth || chatHasPendingQuestion(pane)) return true;
+  const screen = screenText(pane);
+  return menuOnScreen(screen) || /\([yY]\/[nN]\)|\[[yY]\/[nN]\]|press\s+enter\s+to\s+continue/i.test(screen);
+}
+
 function updateComposerLock(pane) {
   const c = pane.chat;
   if (!c) return;
-  const locked = pane.state === 'attention' && !c.viewingHistory;
-  c.input.disabled = locked;
+  const locked = chatComposerBlocked(pane) && !c.viewingHistory;
+  // `readOnly`, not `disabled`: a disabled input cannot receive focus, so
+  // focusPane's `chat.input.focus()` silently did nothing and clicking a locked
+  // thread left the keyboard pointed at the *previously* focused pane — the
+  // next thing typed went to the wrong thread's PTY. readOnly still blocks
+  // typing, and sending is already blocked by sendBtn.disabled plus the guard
+  // in sendChatMessage.
+  c.input.readOnly = locked;
   c.sendBtn.disabled = locked;
   c.wrap.classList.toggle('composer-locked', locked);
   if (c.viewingHistory) return;
@@ -4844,6 +4990,7 @@ function updateChatBanner(pane) {
   // While browsing history the swirl and prompt card don't apply to the (past,
   // finished) conversation on screen — keep them hidden.
   if (c.viewingHistory) {
+    if (c.interactionOpen) setChatInteraction(pane, false);
     c.working.classList.add('hidden');
     removePromptCard(pane);
     return;
@@ -4854,7 +5001,7 @@ function updateChatBanner(pane) {
   // The swirl sits under the last message; when it appears, keep a pinned
   // view scrolled to the bottom so it's actually visible.
   if (wasHidden && state === 'busy' && c.pinned) c.list.scrollTop = c.list.scrollHeight;
-  const show = state === 'attention' || state === 'error' || state === 'dead';
+  const show = (state === 'attention' && chatComposerBlocked(pane)) || state === 'error' || state === 'dead';
   // The exited-process card must never be suppressed by a question that can
   // no longer be answered (death also clears pendingQuestions — this is
   // belt-and-braces for ordering).
@@ -4882,7 +5029,7 @@ const $ = (id) => document.getElementById(id);
 
 // -- Sidebar resizing -------------------------------------------------------
 // Drag the divider between the sidebar and the workspace to set the sidebar
-// width; the docked Explorer/Git/Todo panels resize with it. Width is clamped
+// width; the docked Explorer/Git panels resize with it. Width is clamped
 // to the CSS min/max and remembered across restarts. Double-click resets it.
 const SIDEBAR_W_MIN = 180;
 const SIDEBAR_W_MAX = 600;
@@ -4931,6 +5078,7 @@ const SIDEBAR_W_DEFAULT = 230;
 const boardListEl = $('board-list');
 const gridEl = $('grid');
 const emptyState = $('empty-state');
+const bootState = $('boot-state');
 const boardTitle = $('board-title');
 const boardMeta = $('board-meta');
 const addTermBtn = $('add-term');
@@ -4941,13 +5089,51 @@ const BUILD_BTN_TITLE = buildBtn ? buildBtn.title : '';
 // ---------------------------------------------------------------------------
 // Persistence helpers
 // ---------------------------------------------------------------------------
-async function persist() {
-  await window.api.saveBoards(boards.map((b) => ({
+function persistNow() {
+  return window.api.saveBoards(boards.map((b) => ({
     id: b.id, name: b.name, dir: b.dir, startupCommand: b.startupCommand,
     resumeOnStart: !!b.resumeOnStart, muted: !!b.muted,
     layout: grids.has(b.id) ? serializeLayout(b.id) : (b.layout || null),
   })));
 }
+
+// Every board's full layout is re-serialized and written on each call, and the
+// callers are hot: a caption update on every Enter in every thread, every
+// screen-read permission change, every transcript status push, every dropdown,
+// every gutter drag. Nothing coalesced them and nothing awaited the result, so
+// overlapping writes of the same file raced in main.
+//
+// Trailing debounce plus a single in-flight chain: bursts collapse to one
+// write, and writes never overlap. `persist()` still returns a promise that
+// resolves once the caller's data is on disk, so `await persist()` in
+// deleteBoard/openModal keeps meaning what it did.
+const PERSIST_DEBOUNCE_MS = 400;
+let persistTimer = null;
+let persistWaiters = [];
+let persistChain = Promise.resolve();
+
+function flushPersist() {
+  clearTimeout(persistTimer);
+  persistTimer = null;
+  const waiters = persistWaiters;
+  persistWaiters = [];
+  // Chain rather than fire-and-forget: two saveBoards calls in flight at once
+  // write the same file concurrently.
+  persistChain = persistChain.then(persistNow, persistNow).catch(() => {});
+  persistChain.then(() => { for (const w of waiters) w(); });
+  return persistChain;
+}
+
+function persist() {
+  return new Promise((resolve) => {
+    persistWaiters.push(resolve);
+    clearTimeout(persistTimer);
+    persistTimer = setTimeout(flushPersist, PERSIST_DEBOUNCE_MS);
+  });
+}
+
+// A debounced write must not be dropped by the window going away.
+window.addEventListener('beforeunload', () => { if (persistTimer) flushPersist(); });
 
 // Capture the live grid (columns, splits, per-pane name/model/font) so a board's
 // whole workspace can be rebuilt on next launch. PTYs aren't serializable — only
@@ -5028,6 +5214,22 @@ function rebuildFromLayout(board) {
   if (first) focusPane(first);
 }
 
+// A docked panel (Explorer, Source Control, Prompt History, Chat with Hivemind)
+// takes over the hive list's space. `panel-open` is the single class the CSS
+// keys off to collapse that list to just the active hive, kept pinned above the
+// panel so the sidebar always answers "which project is this?". Every
+// setXOpen()/showEmpty() calls this after touching its own `x-open` class.
+function syncSidebarPanelState() {
+  const sb = document.getElementById('sidebar');
+  if (!sb) return;
+  const open = ['files-open', 'git-open', 'history-open', 'hm-open']
+    .some((c) => sb.classList.contains(c));
+  sb.classList.toggle('panel-open', open);
+  // A peek is a glance at the list, not a mode: any panel opening or closing
+  // ends it (switching hives clears it too, in the row's click handler).
+  sb.classList.remove('hives-peek');
+}
+
 // ---------------------------------------------------------------------------
 // Board list rendering
 // ---------------------------------------------------------------------------
@@ -5073,7 +5275,17 @@ function renderBoardList() {
     dir.title = b.dir || '';
 
     li.append(row, dir);
-    li.onclick = () => selectBoard(b.id);
+    li.onclick = () => {
+      const sb = document.getElementById('sidebar');
+      // Only the active hive shows while a panel is open — clicking it peeks the
+      // rest of the list so hives stay switchable without closing the panel.
+      if (sb && sb.classList.contains('panel-open') && b.id === activeBoardId) {
+        sb.classList.toggle('hives-peek');
+        return;
+      }
+      if (sb) sb.classList.remove('hives-peek');
+      selectBoard(b.id);
+    };
 
     // Drag to reorder hives.
     li.draggable = true;
@@ -5120,10 +5332,15 @@ function reorderBoards(srcId, targetId) {
 // Board selection / switching (PTYs stay alive in the background)
 // ---------------------------------------------------------------------------
 function selectBoard(id) {
-  activeBoardId = id;
+  // Resolve before committing: assigning first left `activeBoardId` naming a
+  // hive that no longer exists (a focus-pane notification for a deleted board,
+  // a stale command target), after which the grid, `＋ Thread`, `fitBoard` and
+  // every panel's board-change hook silently did nothing.
   const board = boards.find((b) => b.id === id);
   if (!board) return;
+  activeBoardId = id;
 
+  hideBootState();
   emptyState.classList.add('hidden');
   gridEl.classList.remove('hidden');
   addTermBtn.disabled = false;
@@ -5160,18 +5377,19 @@ function selectBoard(id) {
   if (typeof gitOnBoardChange === 'function') gitOnBoardChange();
   if (typeof filesToggle !== 'undefined' && filesToggle) filesToggle.disabled = false;
   if (typeof filesOnBoardChange === 'function') filesOnBoardChange();
-  if (typeof todoToggle !== 'undefined' && todoToggle) todoToggle.disabled = false;
-  if (typeof todoOnBoardChange === 'function') todoOnBoardChange();
   if (typeof historyToggle !== 'undefined' && historyToggle) historyToggle.disabled = false;
   if (typeof historyOnBoardChange === 'function') historyOnBoardChange();
-  if (typeof publishToggle !== 'undefined' && publishToggle) publishToggle.disabled = false;
-  if (typeof publishOnBoardChange === 'function') publishOnBoardChange();
   fitBoard(id);
 }
 
 // ---------------------------------------------------------------------------
 // Layout: columns -> panes, rebuilt with gutters whenever structure changes
 // ---------------------------------------------------------------------------
+// How many columns new threads tile into before they wrap into a second row.
+// Saved layouts are replayed as-is, so a hive tiled wider before this cap
+// keeps its columns.
+const MAX_COLS = 3;
+
 function layout(boardId) {
   const g = grids.get(boardId);
   if (!g) return;
@@ -5369,9 +5587,11 @@ function addTerminal(board, opts = {}) {
   if (!g) return;
   if (g.zoomed) { g.zoomed.el.classList.remove('zoomed'); g.zoomed = null; } // show the new pane
 
-  // Tiling: grow columns up to 4 across, then stack into the shortest column.
+  // Tiling: grow columns up to MAX_COLS across, then wrap — the next thread
+  // stacks into the shortest column instead of squeezing in a fourth sliver
+  // (a 4-across pane is too narrow for a CLI's composer on a normal window).
   const total = g.columns.reduce((s, c) => s + c.panes.length, 0) + 1;
-  const targetCols = Math.min(4, total);
+  const targetCols = Math.min(MAX_COLS, total);
 
   let col;
   if (g.columns.length < targetCols) {
@@ -5390,9 +5610,10 @@ function addTerminal(board, opts = {}) {
       opts = Object.assign({ name: nick }, opts);
     } else {
       board._seq = (board._seq || 0) + 1;
-      const baseCmd = (opts.agent && opts.agent !== 'claude')
-        ? agentFor(opts.agent).command
-        : (board.startupCommand || 'claude');
+      const named = isValidAgent(opts.agent) ? opts.agent : defaultAgent;
+      const baseCmd = named === 'claude'
+        ? (board.startupCommand || 'claude')
+        : agentFor(named).command;
       opts = Object.assign({ name: `${baseCmd} ${board._seq}`, autoName: true }, opts);
     }
   }
@@ -5482,7 +5703,9 @@ function spawnPanePty(pane, { resume, initialPrompt } = {}) {
 
 function createPane(board, col, opts = {}) {
   const id = nextId('term');
-  const startAgent = isValidAgent(opts.agent) ? opts.agent : 'claude';
+  // Restored panes always name their agent (rebuildFromLayout resolves it to
+  // 'claude' first), so only genuinely new threads land on the preference.
+  const startAgent = isValidAgent(opts.agent) ? opts.agent : defaultAgent;
   const startName = opts.name ||
     (startAgent === 'claude' ? (board.startupCommand || 'claude') : agentFor(startAgent).command);
   const startModel = isValidModel(opts.model) ? opts.model : defaultModel;
@@ -5928,11 +6151,20 @@ function closeFind(pane) {
   try { pane.term.focus(); } catch (_) { /* ignore */ }
 }
 
-function closePane(pane) {
-  if (pane.disposed) return;
+// Everything a pane owns that outlives its DOM node: timers, observers, blob
+// URLs, the pty, the transcript watcher, the xterm instance, and any module
+// state still pointing at it.
+//
+// This is shared by closePane and deleteBoard on purpose. deleteBoard used to
+// carry its own shorter copy of this list, so deleting a hive with N threads
+// leaked N ResizeObservers and every staged attachment's blob URL, and left the
+// plan review open on a disposed pane (whose 1.2 s poll then kept running
+// against the deleted hive's directory). One list, one place to update.
+function disposePaneResources(pane) {
   pane.disposed = true;
   if (typeof planModalPane !== 'undefined' && planModalPane === pane) closePlanReview();
   clearTimeout(pane.idleTimer);
+  clearTimeout(pane.qExpireTimer);
   stopAttentionProbe(pane);
   if (pane.composerResizeObserver) {
     try { pane.composerResizeObserver.disconnect(); } catch (_) { /* ignore */ }
@@ -5946,9 +6178,21 @@ function closePane(pane) {
       if (a && a.thumbUrl && a.thumbUrl.startsWith('blob:')) URL.revokeObjectURL(a.thumbUrl);
     }
   }
+  if (pane.chat && Array.isArray(pane.chat.pendingEcho)) {
+    for (const p of pane.chat.pendingEcho) clearTimeout(p.timer);
+    pane.chat.pendingEcho = [];
+  }
+  // A disposed pane must not stay the focus target: cycleFocus would keep
+  // finding it, and setPaneState would keep suppressing notifications for it.
+  if (focusedPane === pane) focusedPane = null;
   window.api.killPty(pane.id);
   window.api.transcript.unbind(pane.id);
   try { pane.term.dispose(); } catch (_) { /* ignore */ }
+}
+
+function closePane(pane) {
+  if (pane.disposed) return;
+  disposePaneResources(pane);
 
   const g = grids.get(pane.board.id);
   if (g.zoomed === pane) g.zoomed = null; // un-zoom if the maximized pane closed
@@ -5980,7 +6224,7 @@ function focusPane(pane, ev) {
     // TUI interaction (approval menus want raw arrow keys, which the composer
     // would swallow as history recall) — give the terminal the focus. Any
     // other route into the pane focuses the composer as usual.
-    const termClick = ev && pane.el.classList.contains('term-chat') &&
+    const termClick = ev && (pane.el.classList.contains('term-chat') || pane.chat?.interactionOpen) &&
       pane.term.element && pane.term.element.contains(ev.target);
     if (pane.view === 'chat' && pane.chat && !termClick) pane.chat.input.focus();
     else pane.term.focus();
@@ -5999,15 +6243,34 @@ function fitBoard(boardId) {
         if (pane.disposed) continue;
         try {
           pane.fitAddon.fit();
-          window.api.resizePty(pane.id, pane.term.cols, pane.term.rows);
+          // Only tell the pty when the geometry actually changed. ConPTY reflow
+          // is what strands phantom characters in the TUI (see spawnPanePty), so
+          // a no-op resize is not free — and fit() is called on far more than
+          // real size changes (view toggles, panel opens, every layout()).
+          const { cols, rows } = pane.term;
+          if (pane.sentCols !== cols || pane.sentRows !== rows) {
+            pane.sentCols = cols;
+            pane.sentRows = rows;
+            window.api.resizePty(pane.id, cols, rows);
+          }
         } catch (_) { /* terminal not ready */ }
       }
     }
   });
 }
 
+// Dragging a window edge emits `resize` at frame rate, and each one used to run
+// a full fit + one resizePty IPC per pane — ~480 ConPTY resizes a second on an
+// 8-thread hive. The sidebar resizer already deferred its fit for this reason;
+// the window path didn't. Trailing debounce, so the fit happens once the drag
+// settles.
+let resizeFitTimer = null;
 window.addEventListener('resize', () => {
-  if (activeBoardId) fitBoard(activeBoardId);
+  clearTimeout(resizeFitTimer);
+  resizeFitTimer = setTimeout(() => {
+    resizeFitTimer = null;
+    if (activeBoardId) fitBoard(activeBoardId);
+  }, 120);
 });
 
 // ---------------------------------------------------------------------------
@@ -6253,16 +6516,11 @@ async function deleteBoard(board) {
   const g = grids.get(board.id);
   if (g) {
     for (const col of g.columns) {
+      // Shared with closePane so the two teardowns can't drift again — it also
+      // unbinds the transcript watcher, which would otherwise keep streaming
+      // entries to a pane id that no longer exists.
       for (const pane of col.panes) {
-        pane.disposed = true;
-        clearTimeout(pane.idleTimer);
-        stopAttentionProbe(pane);
-        window.api.killPty(pane.id);
-        // Tell the main-process transcript binder to stop tailing this pane's
-        // session JSONL — otherwise deleting a hive with live threads leaks a
-        // watcher streaming entries to a pane id that no longer exists.
-        window.api.transcript.unbind(pane.id);
-        try { pane.term.dispose(); } catch (_) { /* ignore */ }
+        if (!pane.disposed) disposePaneResources(pane);
       }
     }
     g.el.remove();
@@ -6278,7 +6536,15 @@ async function deleteBoard(board) {
   renderBoardList();
 }
 
+// The boot spinner owns the workspace until we know whether this profile has
+// hives. Both routes out of that state — a hive to open, or none — clear it, so
+// it can never be left up over a resolved workspace.
+function hideBootState() {
+  if (bootState) bootState.classList.add('hidden');
+}
+
 function showEmpty() {
+  hideBootState();
   gridEl.classList.add('hidden');
   emptyState.classList.remove('hidden');
   addTermBtn.disabled = true;
@@ -6299,22 +6565,17 @@ function showEmpty() {
   }
   if (typeof filesPanel !== 'undefined' && filesPanel) filesPanel.classList.add('hidden');
   if (typeof planOpen === 'function' && planOpen()) closePlanReview();
-  if (typeof todoToggle !== 'undefined' && todoToggle) {
-    todoToggle.disabled = true;
-    todoToggle.classList.remove('active');
-  }
-  if (typeof todoPanel !== 'undefined' && todoPanel) todoPanel.classList.add('hidden');
   if (typeof historyToggle !== 'undefined' && historyToggle) {
     historyToggle.disabled = true;
     historyToggle.classList.remove('active');
   }
   if (typeof historyPanel !== 'undefined' && historyPanel) historyPanel.classList.add('hidden');
-  if (typeof publishToggle !== 'undefined' && publishToggle) {
-    publishToggle.disabled = true;
-    publishToggle.classList.remove('active');
-  }
-  if (typeof publishPanel !== 'undefined' && publishPanel) publishPanel.classList.add('hidden');
-  const sb = $('sidebar'); if (sb) sb.classList.remove('git-open', 'files-open', 'todo-open', 'history-open', 'publish-open');
+  // `hm-open` belongs in this list too: `#sidebar.hm-open #board-list` is
+  // display:none, so leaving it set after the last hive is deleted hides the
+  // hive list *and* the empty state's "create your first board" route.
+  if (typeof setHmChatOpen === 'function') setHmChatOpen(false);
+  const sb = $('sidebar'); if (sb) sb.classList.remove('git-open', 'files-open', 'history-open', 'hm-open');
+  syncSidebarPanelState();
 }
 
 // ---------------------------------------------------------------------------
@@ -6322,6 +6583,9 @@ function showEmpty() {
 // ---------------------------------------------------------------------------
 $('add-board').onclick = () => openModal(null);
 $('empty-add-board').onclick = () => openModal(null);
+// The empty state is where a user with no agent installed ends up; the wizard
+// is the only screen that tells them that is why nothing works.
+$('empty-setup').onclick = () => openSetupWizard({ from: 'empty-state' });
 addTermBtn.onclick = () => {
   const board = boards.find((b) => b.id === activeBoardId);
   if (board) addTerminal(board);
@@ -6378,6 +6642,18 @@ document.addEventListener('keydown', (e) => {
     if (focusedPane) { e.preventDefault(); e.stopImmediatePropagation(); toggleZoom(focusedPane); }
     return;
   }
+  // Ctrl+F is documented as "find in the focused thread", but the only handler
+  // lived inside xterm's key hook — which never fires in the chat view, and
+  // Claude/ChatGPT threads *open* in the chat view with the composer focused.
+  // The find bar searches terminal scrollback. Open the in-chat live controls
+  // without stealing focus back from the search field on the next frame.
+  if (!e.shiftKey && e.code === 'KeyF' && focusedPane && focusedPane.view === 'chat') {
+    e.preventDefault();
+    e.stopImmediatePropagation();
+    setChatInteraction(focusedPane, true, { focus: false });
+    openFind(focusedPane);
+    return;
+  }
   if (e.shiftKey && (e.code === 'BracketRight' || e.code === 'BracketLeft')) {
     e.preventDefault(); e.stopImmediatePropagation();
     cycleFocus(e.code === 'BracketRight' ? 1 : -1);
@@ -6400,24 +6676,11 @@ window.api.onFsChanged(({ cwd }) => {
   if (typeof gitPanelOpen === 'function' && gitPanelOpen() && !gitBusy && !gitMenuOpen) {
     refreshGit({ keepMsg: true });
   }
-  // Same for Publish: a thread editing a listed file flips it to "changed".
-  // Never mid-run (the row statuses would be wiped) or mid-form (typed
-  // credentials would be thrown away).
-  if (typeof publishPanelOpen === 'function' && publishPanelOpen() &&
-      !pubBusy && !pubRunning && !pubMenuOpen && !pubForm) {
-    refreshPublish({ keepMsg: true });
-  }
   // A thread may have just (re)written a `.hivemind/plans/` file — the open
   // review polls anyway, but a project-tree change gets it there sooner.
   // (Native plan files live outside the watched tree; the poll covers those.)
   if (typeof planOpen === 'function' && planOpen() && planModalPane && !planDrafting &&
       panePlan(planModalPane).source !== 'native') refreshPlanReview();
-  // Todos may have changed on disk (a thread edited todos.json). Re-render, but
-  // not while the user is mid-edit in the panel — that would clobber their input.
-  if (typeof todoPanelOpen === 'function' && todoPanelOpen() &&
-      !(document.activeElement && todoPanel.contains(document.activeElement))) {
-    refreshTodo();
-  }
 });
 
 // ---------------------------------------------------------------------------
@@ -6557,13 +6820,12 @@ function gitPanelOpen() { return gitPanel && !gitPanel.classList.contains('hidde
 const sidebarEl = $('sidebar');
 function setGitOpen(open) {
   if (open && typeof setFilesOpen === 'function') setFilesOpen(false); // one panel at a time
-  if (open && typeof setTodoOpen === 'function') setTodoOpen(false);
   if (open && typeof setHistoryOpen === 'function') setHistoryOpen(false);
   if (open && typeof setHmChatOpen === 'function') setHmChatOpen(false);
-  if (open && typeof setPublishOpen === 'function') setPublishOpen(false);
   gitPanel.classList.toggle('hidden', !open);
   gitToggle.classList.toggle('active', open);
-  sidebarEl.classList.toggle('git-open', open); // board list yields its space
+  sidebarEl.classList.toggle('git-open', open); // hive list shrinks to the active hive
+  syncSidebarPanelState();
 }
 
 gitToggle.onclick = () => {
@@ -7109,13 +7371,12 @@ function setFilesMsg(text, kind) {
 
 function setFilesOpen(open) {
   if (open) setGitOpen(false); // one panel at a time
-  if (open && typeof setTodoOpen === 'function') setTodoOpen(false);
   if (open && typeof setHistoryOpen === 'function') setHistoryOpen(false);
   if (open && typeof setHmChatOpen === 'function') setHmChatOpen(false);
-  if (open && typeof setPublishOpen === 'function') setPublishOpen(false);
   filesPanel.classList.toggle('hidden', !open);
   filesToggle.classList.toggle('active', open);
-  sidebarEl.classList.toggle('files-open', open); // board list yields its space
+  sidebarEl.classList.toggle('files-open', open); // hive list shrinks to the active hive
+  syncSidebarPanelState();
 }
 
 filesToggle.onclick = () => {
@@ -7253,8 +7514,7 @@ function insertPathIntoPane(rel) {
 // Autocorrect
 //
 // As-you-type spelling autocorrect for every plain text field that has
-// spell-check on: the chat composer, the todo add box and inline edits, the
-// commit message, plan comments… Whenever a word boundary is typed (space,
+// spell-check on: the chat composer, the commit message, plan comments… Whenever a word boundary is typed (space,
 // punctuation, Enter) the word just finished goes to the main process
 // ('spell:correct', nspell over the same en-US dictionary that paints the
 // squiggles) and, if it's a clear one-slip typo, is replaced in place. The
@@ -7314,8 +7574,8 @@ document.addEventListener('input', (e) => {
   if (boundary && el.selectionStart === el.selectionEnd) acApply(el, el.selectionStart - 1);
 });
 
-// Enter usually *commits* the field (send the message, add the todo, push the
-// commit) before any input event can fire, so catch it on the way down —
+// Enter usually *commits* the field (send the message, push the commit)
+// before any input event can fire, so catch it on the way down —
 // document capture runs before the field's own keydown handler — and fix the
 // trailing word first.
 document.addEventListener('keydown', (e) => {
@@ -7326,1128 +7586,12 @@ document.addEventListener('keydown', (e) => {
 }, true);
 
 // ---------------------------------------------------------------------------
-// Publish panel (publish to website over FTP)
-//
-// Source Control's shape, pointed at a web host instead of a git remote: the
-// panel shows where this hive publishes to, an explicit allowlist of files and
-// folders, and which of them changed since the last publish. "Publish" uploads
-// only the changed ones; "Publish everything" in the ⋯ menu forces a full run.
-//
-// The connection settings — host, user, remote folder, file list — and the
-// password all live in Hivemind's userData (see publish.js), never in the
-// project folder, so they are never committed, pushed, or visible to the agent
-// threads working in that folder. The password is encrypted by Windows DPAPI
-// and never comes back across the context bridge; this renderer only ever knows
-// `hasPassword`.
-// ---------------------------------------------------------------------------
-const publishToggle = $('publish-toggle');
-const publishPanel = $('publish-panel');
-const publishBody = $('publish-body');
-const publishMsgbar = $('publish-msgbar');
-
-let pubCfg = null;       // { configured, canEncrypt, site } for the active hive
-let pubScan = null;      // { files, problems, changed }
-let pubBusy = false;     // a save/test/publish call is in flight
-let pubRunning = false;  // an upload is running (Publish becomes Stop)
-let pubMenuOpen = false; // ⋯ menu open — suppress auto-refresh so it isn't wiped
-let pubForm = false;     // showing the connection form instead of the file view
-const pubRowStatus = new Map(); // rel -> 'done' | 'fail' | 'busy' during a run
-
-function publishPanelOpen() { return publishPanel && !publishPanel.classList.contains('hidden'); }
-
-function setPublishMsg(text, kind) {
-  if (!text) { publishMsgbar.classList.add('hidden'); publishMsgbar.textContent = ''; return; }
-  publishMsgbar.textContent = text;
-  publishMsgbar.className = 'git-msgbar' + (kind ? ' ' + kind : '');
-}
-
-function setPublishOpen(open) {
-  if (open) { // one panel at a time
-    setGitOpen(false);
-    setFilesOpen(false);
-    if (typeof setTodoOpen === 'function') setTodoOpen(false);
-    if (typeof setHistoryOpen === 'function') setHistoryOpen(false);
-    if (typeof setHmChatOpen === 'function') setHmChatOpen(false);
-  }
-  publishPanel.classList.toggle('hidden', !open);
-  publishToggle.classList.toggle('active', open);
-  sidebarEl.classList.toggle('publish-open', open); // board list yields its space
-}
-
-publishToggle.onclick = () => {
-  const open = publishPanel.classList.contains('hidden');
-  setPublishOpen(open);
-  if (open) refreshPublish();
-};
-$('publish-close').onclick = () => setPublishOpen(false);
-$('publish-refresh').onclick = () => refreshPublish();
-
-function publishOnBoardChange() {
-  pubForm = false;
-  pubRowStatus.clear();
-  if (publishPanelOpen()) refreshPublish();
-}
-
-const PUB_SECURITY_LABEL = {
-  'ftps-control': 'Encrypted login (FTPS control channel)',
-  ftps: 'Fully encrypted (FTPS)',
-  plain: 'Plain FTP — no encryption',
-};
-
-function pubBytes(n) {
-  if (!(n >= 0)) return '';
-  if (n < 1024) return n + ' B';
-  if (n < 1024 * 1024) return (n / 1024).toFixed(n < 10240 ? 1 : 0) + ' KB';
-  return (n / 1048576).toFixed(n < 10485760 ? 1 : 0) + ' MB';
-}
-
-function pubAgo(ms) {
-  if (!ms) return 'never';
-  const s = Math.max(0, Math.round((Date.now() - ms) / 1000));
-  if (s < 60) return 'just now';
-  if (s < 3600) return Math.floor(s / 60) + ' min ago';
-  if (s < 86400) return Math.floor(s / 3600) + ' h ago';
-  const d = new Date(ms);
-  return d.toLocaleDateString() + ' ' + d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-}
-
-// -- Load config + scan, then repaint ---------------------------------------
-let pubRefreshGen = 0; // bumped per refresh so a stale read can't repaint another hive
-async function refreshPublish(opts = {}) {
-  if (!publishPanelOpen()) return;
-  // The connection form owns the panel while it's up; reloading underneath it
-  // would rebuild the inputs and discard half-typed credentials.
-  if (pubForm && !opts.force) return;
-  const gen = ++pubRefreshGen;
-  const dir = activeDir();
-  if (!dir) { pubCfg = null; pubScan = null; renderPublish(); return; }
-  let cfg, sc = null;
-  try {
-    cfg = await window.api.publish.config(dir);
-    if (gen !== pubRefreshGen || activeDir() !== dir) return;
-    if (cfg && cfg.ok && cfg.configured) {
-      sc = await window.api.publish.scan(dir);
-      if (gen !== pubRefreshGen || activeDir() !== dir) return;
-    }
-  } catch (e) {
-    if (gen !== pubRefreshGen || activeDir() !== dir) return;
-    setPublishMsg(String((e && e.message) || e), 'err');
-    return;
-  }
-  pubCfg = cfg && cfg.ok ? cfg : null;
-  pubScan = sc && sc.ok ? sc : null;
-  if (!opts.keepMsg) setPublishMsg('');
-  renderPublish();
-}
-
-// -- Run a publish op with a busy guard, then refresh + report ---------------
-async function pubRun(label, fn, { refresh = true, okMsg } = {}) {
-  if (pubBusy) return;
-  const dir = activeDir();
-  if (!dir) { setPublishMsg('This hive has no project directory set.', 'err'); return; }
-  pubBusy = true;
-  setPublishMsg(label + '…');
-  // Never repaint while the connection form is up — that would rebuild the
-  // inputs from the saved config and throw away what the user just typed.
-  if (!pubForm) renderPublish();
-  let res;
-  try {
-    res = await fn(dir);
-    if (res && res.ok === false) setPublishMsg((res.message || 'Failed.').trim(), 'err');
-    else if (res && res.message) setPublishMsg(res.message, res.ok === false ? 'err' : 'ok');
-    else if (okMsg) setPublishMsg(okMsg, 'ok');
-    else setPublishMsg('');
-  } catch (e) {
-    setPublishMsg(String((e && e.message) || e), 'err');
-  } finally {
-    pubBusy = false;
-    if (refresh) await refreshPublish({ keepMsg: true });
-    else if (!pubForm) renderPublish();
-  }
-  return res;
-}
-
-// -- Render -----------------------------------------------------------------
-function renderPublish() {
-  publishBody.innerHTML = '';
-  const dir = activeDir();
-
-  if (!dir) {
-    const wrap = document.createElement('div');
-    wrap.className = 'git-empty';
-    wrap.textContent = 'This hive has no project directory set. Edit the hive to choose one.';
-    publishBody.appendChild(wrap);
-    return;
-  }
-
-  if (pubForm || !pubCfg || !pubCfg.configured) {
-    // The form owns the panel until it's saved or cancelled, so nothing
-    // repaints over half-typed credentials (see refreshPublish / pubRun).
-    pubForm = true;
-    publishBody.appendChild(renderPublishForm());
-    return;
-  }
-
-  const site = pubCfg.site;
-
-  // Where this hive publishes to.
-  const targetRow = document.createElement('div');
-  targetRow.className = 'pub-target-row';
-  const target = document.createElement('div');
-  target.className = 'pub-target';
-  const host = document.createElement('div');
-  host.className = 'pub-host';
-  host.textContent = site.user + '@' + site.host + (site.port && site.port !== 21 ? ':' + site.port : '');
-  // The sidebar is narrow enough to ellipsize these, so spell them out on hover.
-  host.title = host.textContent + '\n' + (PUB_SECURITY_LABEL[site.security] || site.security);
-  const rpath = document.createElement('div');
-  rpath.className = 'pub-path';
-  // A bare "/" reads like a configured path; spell out that no remote folder is
-  // set, because on shared hosting that publishes above the web root.
-  rpath.textContent = site.remoteDir ? '/' + site.remoteDir : 'FTP login root (no remote folder set)';
-  if (!site.remoteDir) rpath.classList.add('warn');
-  rpath.title = (site.remoteDir
-    ? 'Remote folder: /' + site.remoteDir
-    : 'No remote folder set — files go to the FTP login root, which on most hosts is above the website folder.')
-    + '\n' + (PUB_SECURITY_LABEL[site.security] || site.security);
-  const when = document.createElement('div');
-  when.className = 'pub-when';
-  when.textContent = 'Last published ' + pubAgo(site.lastPublish);
-  target.append(host, rpath, when);
-  targetRow.appendChild(target);
-
-  if (site.siteUrl) {
-    const openBtn = mkMini('↗', 'Open ' + site.siteUrl, () => window.api.openExternal(site.siteUrl));
-    openBtn.className = 'git-icon';
-    targetRow.appendChild(openBtn);
-  }
-  const editBtn = mkMini('⚙', 'Connection settings', () => { pubForm = true; renderPublish(); });
-  editBtn.className = 'git-icon';
-  targetRow.appendChild(editBtn);
-  publishBody.appendChild(targetRow);
-
-  if (!site.remoteDir) {
-    // Legal, but on shared hosting the FTP login lands above the web root, so
-    // every file uploads successfully and the website never changes.
-    const warn = document.createElement('div');
-    warn.className = 'pub-warn';
-    warn.textContent = 'No remote folder is set, so files go to the FTP login root. On most hosts the website lives in a subfolder — public_html, or domains/your-domain.com/public_html — and publishing to the root changes nothing on the site. Set it in ⚙.';
-    publishBody.appendChild(warn);
-  }
-  if (site.security === 'plain') {
-    const warn = document.createElement('div');
-    warn.className = 'pub-warn';
-    warn.textContent = 'Plain FTP sends your password across the internet unencrypted. Switch to an encrypted option in ⚙ if your host supports it.';
-    publishBody.appendChild(warn);
-  }
-  if (!site.hasPassword) {
-    const warn = document.createElement('div');
-    warn.className = 'pub-warn';
-    warn.textContent = 'No password saved yet — open ⚙ and enter it before publishing.';
-    publishBody.appendChild(warn);
-  } else if (site.passwordSessionOnly) {
-    const warn = document.createElement('div');
-    warn.className = 'pub-warn';
-    warn.textContent = 'Windows would not provide encryption, so the password is held for this session only and was never written to disk.';
-    publishBody.appendChild(warn);
-  }
-
-  // Files section.
-  const section = document.createElement('div');
-  section.className = 'git-section';
-  const head = document.createElement('div');
-  head.className = 'git-section-head';
-  const title = document.createElement('span');
-  title.textContent = 'Files to publish';
-  const count = document.createElement('span');
-  count.className = 'count';
-  count.textContent = String(pubScan && pubScan.files ? pubScan.files.length : 0);
-  const spacer = document.createElement('span');
-  spacer.className = 'spacer';
-  const chooseBtn = mkMini('Choose…', 'Pick which files and folders go to the website', openPublishPicker);
-  // Saving a new list rewrites the same store record the running publish is
-  // updating with upload fingerprints — don't let the two race.
-  chooseBtn.disabled = pubRunning || pubBusy;
-  head.append(title, count, spacer, chooseBtn);
-  section.appendChild(head);
-
-  const files = (pubScan && pubScan.files) || [];
-  if (!files.length) {
-    const empty = document.createElement('div');
-    empty.className = 'git-empty';
-    empty.textContent = 'Nothing is ticked to publish yet.';
-    const btn = mkBtn('Choose files…', openPublishPicker);
-    btn.className = 'primary';
-    empty.appendChild(btn);
-    section.appendChild(empty);
-  } else {
-    const ul = document.createElement('ul');
-    ul.className = 'pub-files';
-    for (const f of files) ul.appendChild(renderPubFileRow(f));
-    section.appendChild(ul);
-  }
-
-  for (const p of (pubScan && pubScan.problems) || []) {
-    const row = document.createElement('div');
-    row.className = 'pub-problem';
-    row.textContent = '⚠ ' + p.entry + ' — ' + p.message + ' (skipped)';
-    section.appendChild(row);
-  }
-  publishBody.appendChild(section);
-
-  // Actions.
-  const changed = files.filter((f) => f.changed).length;
-  const actions = document.createElement('div');
-  actions.className = 'pub-actions';
-
-  if (pubRunning) {
-    const stop = mkBtn('Stop', doPublishCancel);
-    stop.className = 'pub-secondary';
-    stop.title = 'Cancel the rest of this publish';
-    actions.appendChild(stop);
-  } else {
-    const btn = mkBtn(changed ? `⇧ Publish ${changed} file${changed === 1 ? '' : 's'}` : 'Up to date', () => doPublish(false));
-    btn.className = 'primary';
-    btn.disabled = pubBusy || !changed || !site.hasPassword;
-    btn.title = changed
-      ? 'Upload the files that changed since the last publish'
-      : 'Nothing has changed since the last publish';
-    actions.appendChild(btn);
-  }
-
-  // ⋯ overflow: full re-upload, connection test, and the destructive resets.
-  const moreWrap = document.createElement('div');
-  moreWrap.className = 'git-more-wrap';
-  const moreBtn = mkBtn('⋯', null);
-  moreBtn.className = 'git-more-btn';
-  moreBtn.title = 'More actions';
-  moreBtn.setAttribute('aria-label', 'More actions');
-
-  const menu = document.createElement('div');
-  menu.className = 'git-more-menu hidden';
-  const items = [
-    ['Publish everything', 'Re-upload every listed file, changed or not', () => doPublish(true), false],
-    ['Test connection', 'Check the host, login and remote folder', doPublishTest, false],
-    ['Connection settings', null, () => { pubForm = true; renderPublish(); }, false],
-    ['Forget saved password', 'Remove the stored password from this machine', doPublishForgetPassword, true],
-    ['Remove publish settings', 'Delete everything Hivemind stores about publishing this hive', doPublishForget, true],
-  ];
-  for (const [label, tip, fn, danger] of items) {
-    const it = mkBtn(label, () => { closePubMenu(); fn(); });
-    it.className = 'git-more-item' + (danger ? ' danger' : '');
-    if (tip) it.title = tip;
-    if (pubRunning) it.disabled = true;
-    menu.appendChild(it);
-  }
-
-  function onOutside(e) { if (!moreWrap.contains(e.target)) closePubMenu(); }
-  function closePubMenu() {
-    pubMenuOpen = false;
-    menu.classList.add('hidden');
-    document.removeEventListener('mousedown', onOutside);
-    publishBody.removeEventListener('scroll', closePubMenu, true);
-  }
-  moreBtn.onclick = (e) => {
-    e.stopPropagation();
-    if (menu.classList.contains('hidden')) {
-      // Unhide first so the menu can be measured, then anchor it above the
-      // button. Fixed positioning keeps it clear of #publish-body's clipping.
-      pubMenuOpen = true;
-      menu.classList.remove('hidden');
-      const r = moreBtn.getBoundingClientRect();
-      menu.style.top = (r.top - menu.offsetHeight - 6) + 'px';
-      menu.style.left = (r.right - menu.offsetWidth) + 'px';
-      document.addEventListener('mousedown', onOutside);
-      publishBody.addEventListener('scroll', closePubMenu, true);
-    } else {
-      closePubMenu();
-    }
-  };
-  moreWrap.append(moreBtn, menu);
-  actions.appendChild(moreWrap);
-  publishBody.appendChild(actions);
-}
-
-function renderPubFileRow(f) {
-  const li = document.createElement('li');
-  li.className = 'pub-file' + (f.changed ? '' : ' unchanged');
-  const run = pubRowStatus.get(f.rel);
-
-  const stat = document.createElement('span');
-  if (run === 'done') { stat.className = 'pstat done'; stat.textContent = '✓'; stat.title = 'Uploaded'; }
-  else if (run === 'fail') { stat.className = 'pstat fail'; stat.textContent = '!'; stat.title = 'Upload failed'; }
-  else if (run === 'busy') { stat.className = 'pstat changed'; stat.textContent = '↑'; stat.title = 'Uploading…'; }
-  else if (f.changed) { stat.className = 'pstat changed'; stat.textContent = '●'; stat.title = 'Changed since the last publish'; }
-  else { stat.className = 'pstat same'; stat.textContent = '·'; stat.title = 'Unchanged — will be skipped'; }
-
-  const name = document.createElement('span');
-  name.className = 'pname';
-  const i = f.rel.lastIndexOf('/');
-  if (i >= 0) {
-    const d = document.createElement('span');
-    d.className = 'pdir';
-    d.textContent = f.rel.slice(0, i + 1);
-    name.append(d, document.createTextNode(f.rel.slice(i + 1)));
-  } else {
-    name.textContent = f.rel;
-  }
-  name.title = f.rel + (f.uploadedAt ? '\nLast uploaded ' + pubAgo(f.uploadedAt) : '\nNot uploaded yet');
-
-  const size = document.createElement('span');
-  size.className = 'psize';
-  size.textContent = pubBytes(f.size);
-
-  li.append(stat, name, size);
-  return li;
-}
-
-// -- Connection form --------------------------------------------------------
-function renderPublishForm() {
-  const site = (pubCfg && pubCfg.site) || null;
-  const wrap = document.createElement('div');
-  wrap.className = 'pub-form';
-
-  const field = (label, el, hint) => {
-    const f = document.createElement('div');
-    f.className = 'pub-field';
-    const l = document.createElement('label');
-    l.textContent = label;
-    f.append(l, el);
-    if (hint) {
-      const h = document.createElement('div');
-      h.className = 'pub-hint';
-      h.textContent = hint;
-      f.appendChild(h);
-    }
-    return f;
-  };
-  const input = (value, placeholder, type) => {
-    const el = document.createElement('input');
-    el.type = type || 'text';
-    el.value = value || '';
-    if (placeholder) el.placeholder = placeholder;
-    el.autocomplete = 'off';
-    el.spellcheck = false; // keep autocorrect out of host names and passwords
-    return el;
-  };
-
-  const hostEl = input(site && site.host, 'ftp.example.com or 194.164.64.227');
-  const portEl = input(site && site.port ? String(site.port) : '21', '21');
-  const userEl = input(site && site.user, 'FTP username');
-  const passEl = input('', site && site.hasPassword ? '•••••••• (saved — leave blank to keep)' : 'FTP password', 'password');
-  const remoteEl = input(site && site.remoteDir, 'public_html');
-  const urlEl = input(site && site.siteUrl, 'https://example.com/');
-
-  const secEl = document.createElement('select');
-  for (const [v, label] of Object.entries(PUB_SECURITY_LABEL)) {
-    const o = document.createElement('option');
-    o.value = v;
-    o.textContent = label;
-    secEl.appendChild(o);
-  }
-  secEl.value = (site && site.security) || 'ftps-control';
-
-  const certWrap = document.createElement('label');
-  certWrap.className = 'pub-check';
-  const certEl = document.createElement('input');
-  certEl.type = 'checkbox';
-  certEl.checked = !site || site.insecureCert !== false;
-  certWrap.append(certEl, document.createTextNode(
-    "Allow the host's shared certificate. Shared hosting usually serves a certificate for the provider rather than your account, which otherwise fails verification."
-  ));
-
-  const row = document.createElement('div');
-  row.className = 'pub-row';
-  const hf = field('FTP server', hostEl);
-  const pf = field('Port', portEl);
-  pf.classList.add('narrow');
-  row.append(hf, pf);
-
-  wrap.append(
-    row,
-    field('Username', userEl),
-    field('Password', passEl, pubCfg && pubCfg.canEncrypt === false
-      ? 'Windows encryption is unavailable, so the password will be kept for this session only and never written to disk.'
-      : 'Encrypted with Windows DPAPI under your user account and stored in Hivemind’s own folder — never in the project, never in Git.'),
-    field('Remote folder', remoteEl, 'Path from the FTP login root, e.g. public_html or domains/example.com/public_html.'),
-    field('Website address', urlEl, 'Optional — adds a ↗ button that opens the live site.'),
-    field('Connection security', secEl),
-    certWrap
-  );
-
-  const note = document.createElement('div');
-  note.className = 'pub-note';
-  note.textContent = 'Hivemind never uploads .git, .hivemind, .claude, node_modules, .env files, keys or certificates, even if a folder containing them is ticked.';
-  wrap.appendChild(note);
-
-  const actions = document.createElement('div');
-  actions.className = 'pub-actions';
-  const saveBtn = mkBtn('Save', async () => {
-    const patch = {
-      host: hostEl.value,
-      port: portEl.value.trim() || 21,
-      user: userEl.value,
-      remoteDir: remoteEl.value,
-      siteUrl: urlEl.value,
-      security: secEl.value,
-      insecureCert: certEl.checked,
-    };
-    const pass = passEl.value;
-    const res = await pubRun('Saving', async (d) => {
-      const r = await window.api.publish.setConfig(d, patch);
-      if (!r || r.ok === false) return r;
-      if (pass) return window.api.publish.setPassword(d, pass);
-      return r;
-    }, { refresh: false });
-    if (res && res.ok !== false) {
-      pubForm = false;
-      setPublishMsg(res.warning || 'Connection settings saved.', res.warning ? 'err' : 'ok');
-      await refreshPublish({ keepMsg: true });
-    }
-  });
-  saveBtn.className = 'primary';
-  saveBtn.disabled = pubBusy;
-  actions.appendChild(saveBtn);
-
-  if (pubCfg && pubCfg.configured) {
-    const cancelBtn = mkBtn('Cancel', () => { pubForm = false; setPublishMsg(''); renderPublish(); });
-    cancelBtn.className = 'pub-secondary';
-    actions.appendChild(cancelBtn);
-  }
-  wrap.appendChild(actions);
-  return wrap;
-}
-
-// -- Operations -------------------------------------------------------------
-async function doPublish(all) {
-  const dir = activeDir();
-  if (!dir || pubBusy || pubRunning) return;
-  const site = pubCfg && pubCfg.site;
-  if (!site) return;
-  if (!site.hasPassword) { setPublishMsg('No password saved — open ⚙ and enter it first.', 'err'); return; }
-  if (all && !confirm('Re-upload every listed file to ' + site.host + ', including files that have not changed?')) return;
-
-  pubRowStatus.clear();
-  pubRunning = true;
-  setPublishMsg('Publishing…');
-  renderPublish();
-  let res;
-  try {
-    res = await window.api.publish.run(dir, !!all);
-  } catch (e) {
-    res = { ok: false, message: String((e && e.message) || e) };
-  }
-  pubRunning = false;
-  const failed = res && res.failed && res.failed.length;
-  // Drop the per-row ✓ marks now the run is over — otherwise every row stays
-  // ticked and hides the real changed/unchanged state on the next scan. Keep
-  // the failures visible until that file publishes successfully.
-  pubRowStatus.clear();
-  for (const f of (res && res.failed) || []) pubRowStatus.set(f.rel, 'fail');
-  // A warning outranks a cheerful "Published 18 files." — every file can
-  // transfer fine and still land somewhere the website isn't served from.
-  if (res && res.warning) setPublishMsg(res.message + ' ' + res.warning, 'err');
-  else setPublishMsg((res && res.message) || 'Publish finished.', res && res.ok ? 'ok' : (failed || (res && res.ok === false) ? 'err' : ''));
-  if (res && res.uploaded) {
-    window.api.notify({
-      title: 'Hivemind',
-      body: failed
-        ? `Published ${res.uploaded} file(s) to ${site.host}, ${failed} failed.`
-        : `Published ${res.uploaded} file(s) to ${site.host}.`,
-    });
-  }
-  await refreshPublish({ keepMsg: true });
-}
-
-function doPublishCancel() {
-  const dir = activeDir();
-  if (!dir) return;
-  setPublishMsg('Stopping after the current file…');
-  window.api.publish.cancel(dir);
-}
-
-function doPublishTest() {
-  pubRun('Testing the connection', (d) => window.api.publish.test(d), { refresh: false });
-}
-
-function doPublishForgetPassword() {
-  if (!confirm('Remove the saved FTP password from this machine? You will be asked for it again before the next publish.')) return;
-  pubRun('Removing the saved password', (d) => window.api.publish.setPassword(d, ''), { okMsg: 'Saved password removed.' });
-}
-
-async function doPublishForget() {
-  if (!confirm('Delete the host, username, password and file list Hivemind stores for this hive? The website itself is not touched.')) return;
-  await pubRun('Removing the publish settings', (d) => window.api.publish.forget(d), { refresh: false });
-  pubForm = false;
-  pubScan = null;
-  setPublishMsg('Publish settings removed.', 'ok');
-  await refreshPublish({ keepMsg: true });
-}
-
-// Live per-file progress from the main process during a run.
-if (window.api.publish && window.api.publish.onProgress) {
-  window.api.publish.onProgress((p) => {
-    if (!p || !pubRunning) return;
-    if (p.phase === 'start') pubRowStatus.set(p.rel, 'busy');
-    else if (p.phase === 'file') pubRowStatus.set(p.rel, p.ok ? 'done' : 'fail');
-    else if (p.phase === 'retry') { setPublishMsg(`Retrying ${p.rel} (attempt ${p.attempt + 1})…`); return; }
-    if (p.total) setPublishMsg(`Publishing ${p.index}/${p.total} — ${p.rel}`);
-    if (publishPanelOpen() && !pubMenuOpen) renderPublish();
-  });
-}
-
-// -- "Choose files" picker ---------------------------------------------------
-// A lazy checkbox tree of the project folder. Ticking a folder publishes it
-// recursively, so its descendants render as already-covered.
-const pubPickBackdrop = $('publish-pick-backdrop');
-const pubPickBody = $('publish-pick-body');
-const pubPickCount = $('publish-pick-count');
-let pubPickSet = new Set(); // entries: "index.html" or "assets/" for a folder
-
-function pubCoveredBy(rel) {
-  const parts = rel.split('/');
-  for (let i = 1; i <= parts.length - 1; i++) {
-    const anc = parts.slice(0, i).join('/') + '/';
-    if (pubPickSet.has(anc)) return anc;
-  }
-  return null;
-}
-
-function pubPickPaint() {
-  const n = pubPickSet.size;
-  pubPickCount.textContent = n ? `${n} item${n === 1 ? '' : 's'} selected` : 'Nothing selected';
-}
-
-async function openPublishPicker() {
-  const dir = activeDir();
-  if (!dir) return;
-  pubPickSet = new Set(((pubCfg && pubCfg.site && pubCfg.site.files) || []));
-  pubPickBody.innerHTML = '';
-  pubPickBackdrop.classList.remove('hidden');
-  pubPickPaint();
-  const ul = await buildPubPickLevel(dir, '', 0);
-  pubPickBody.appendChild(ul);
-}
-
-function closePublishPicker() { pubPickBackdrop.classList.add('hidden'); }
-
-$('publish-pick-close').onclick = closePublishPicker;
-$('publish-pick-cancel').onclick = closePublishPicker;
-pubPickBackdrop.addEventListener('mousedown', (e) => { if (e.target === pubPickBackdrop) closePublishPicker(); });
-$('publish-pick-save').onclick = async () => {
-  closePublishPicker();
-  const files = Array.from(pubPickSet).sort();
-  await pubRun('Saving the file list', (d) => window.api.publish.setConfig(d, { files }), { okMsg: 'File list saved.' });
-};
-
-// Build one directory level. `deny` comes from the backend so the refused-file
-// rules live in exactly one place (publish.js).
-async function buildPubPickLevel(dir, rel, depth) {
-  const ul = document.createElement('ul');
-  ul.className = depth ? 'pub-children' : 'pub-tree';
-  const res = await window.api.files.list(dir, rel);
-  if (!res || !res.ok) {
-    const li = document.createElement('li');
-    li.className = 'pub-item';
-    li.textContent = (res && res.message) || 'Could not read this folder.';
-    ul.appendChild(li);
-    return ul;
-  }
-  const deny = await window.api.publish.deny(res.entries.map((e) => e.path));
-  for (const entry of res.entries) ul.appendChild(buildPubPickRow(dir, entry, depth, deny[entry.path]));
-  return ul;
-}
-
-function buildPubPickRow(dir, entry, depth, denyWhy) {
-  const li = document.createElement('li');
-  const row = document.createElement('div');
-  row.className = 'pub-item';
-  row.style.paddingLeft = (6 + depth * 14) + 'px';
-
-  const key = entry.isDir ? entry.path + '/' : entry.path;
-  const covered = pubCoveredBy(entry.path);
-
-  const twisty = document.createElement('span');
-  twisty.className = 'pub-twisty';
-  twisty.textContent = entry.isDir ? '▸' : '';
-
-  const cb = document.createElement('input');
-  cb.type = 'checkbox';
-  cb.checked = pubPickSet.has(key) || !!covered;
-  cb.disabled = !!denyWhy || !!covered;
-  cb.title = denyWhy
-    ? 'Never published: ' + denyWhy
-    : covered ? 'Already covered by ' + covered : (entry.isDir ? 'Publish this whole folder' : 'Publish this file');
-
-  const icon = document.createElement('span');
-  icon.className = 'pub-icon';
-  icon.textContent = entry.isDir ? '📁' : '📄';
-
-  const label = document.createElement('span');
-  label.className = 'pub-label';
-  label.textContent = entry.name;
-  label.title = entry.path;
-
-  row.append(twisty, cb, icon, label);
-  if (denyWhy) {
-    row.classList.add('denied');
-    const why = document.createElement('span');
-    why.className = 'pub-why';
-    why.textContent = denyWhy;
-    row.appendChild(why);
-  } else if (covered) {
-    row.classList.add('covered');
-  }
-  li.appendChild(row);
-
-  cb.onchange = () => {
-    if (cb.checked) {
-      // A ticked folder supersedes anything already ticked inside it.
-      if (entry.isDir) {
-        for (const e of Array.from(pubPickSet)) {
-          if (e.startsWith(entry.path + '/')) pubPickSet.delete(e);
-        }
-      }
-      pubPickSet.add(key);
-    } else {
-      pubPickSet.delete(key);
-    }
-    pubPickPaint();
-    // Descendants' covered state changed — repaint the open subtree.
-    if (entry.isDir && childUl) { childUl.remove(); childUl = null; twisty.textContent = '▸'; expand(); }
-  };
-
-  let childUl = null; // null = collapsed
-  async function expand() {
-    if (!entry.isDir) return;
-    childUl = await buildPubPickLevel(dir, entry.path, depth + 1);
-    li.appendChild(childUl);
-    twisty.textContent = '▾';
-  }
-
-  if (entry.isDir) {
-    const toggle = async (e) => {
-      e.stopPropagation();
-      if (childUl) { childUl.remove(); childUl = null; twisty.textContent = '▸'; return; }
-      await expand();
-    };
-    twisty.onclick = toggle;
-    label.onclick = toggle;
-  } else {
-    label.onclick = () => { if (!cb.disabled) { cb.checked = !cb.checked; cb.onchange(); } };
-  }
-  return li;
-}
-
-// ---------------------------------------------------------------------------
-// Todo panel
-//
-// A per-hive checklist, docked in the sidebar like Source Control / Explorer.
-// The list lives in `.hivemind/todos.json` in the project dir; add items, tick
-// them off, double-click to rename, delete, or clear completed. Items nest to
-// any depth — each has a `children` array, and hovering a row reveals a ＋ to
-// add a sub-item. Scoped to the active board (cwd), not the focused thread —
-// one shared list per hive. A thread may also edit the file directly, so we
-// re-render on fs changes.
-// ---------------------------------------------------------------------------
-const todoToggle = $('todo-toggle');
-const todoPanel = $('todo-panel');
-const todoBody = $('todo-body');
-const todoMsgbar = $('todo-msgbar');
-const todoInput = $('todo-input');
-
-let todoItems = []; // tree of { id, text, done, collapsed, children: [...] }
-let todoLoadFailed = false; // last read hit a corrupt/locked file — don't overwrite it
-let todoPendingEdit = null; // { item, span } to focus once the tree is in the DOM
-
-function todoPanelOpen() { return todoPanel && !todoPanel.classList.contains('hidden'); }
-
-function setTodoMsg(text, kind) {
-  if (!text) { todoMsgbar.classList.add('hidden'); todoMsgbar.textContent = ''; return; }
-  todoMsgbar.textContent = text;
-  todoMsgbar.className = 'git-msgbar' + (kind ? ' ' + kind : '');
-}
-
-function setTodoOpen(open) {
-  if (open) { // one panel at a time
-    setGitOpen(false);
-    setFilesOpen(false);
-    if (typeof setHistoryOpen === 'function') setHistoryOpen(false);
-    if (typeof setHmChatOpen === 'function') setHmChatOpen(false);
-    if (typeof setPublishOpen === 'function') setPublishOpen(false);
-  }
-  todoPanel.classList.toggle('hidden', !open);
-  todoToggle.classList.toggle('active', open);
-  sidebarEl.classList.toggle('todo-open', open); // board list yields its space
-}
-
-todoToggle.onclick = () => {
-  const open = todoPanel.classList.contains('hidden');
-  setTodoOpen(open);
-  if (open) refreshTodo();
-};
-$('todo-close').onclick = () => setTodoOpen(false);
-$('todo-refresh').onclick = () => refreshTodo();
-
-function todoOnBoardChange() { if (todoPanelOpen()) refreshTodo(); }
-
-async function refreshTodo() {
-  if (!todoPanelOpen()) return;
-  setTodoMsg('');
-  const dir = activeDir();
-  if (!dir) { todoItems = []; renderTodo({ ok: false, reason: 'no-dir' }); return; }
-  const res = await window.api.todo.read(dir);
-  todoLoadFailed = !!(res && res.ok === false && (res.reason === 'corrupt' || res.reason === 'unreadable'));
-  todoItems = (res && res.ok && Array.isArray(res.todos)) ? normalizeTodos(res.todos) : [];
-  renderTodo(res);
-}
-
-// Persist the current list. `.hivemind/` is kept out of Git the same way plans
-// are. Failures surface in the message bar but don't lose the in-memory list.
-async function saveTodo() {
-  const dir = activeDir();
-  if (!dir) return;
-  if (todoLoadFailed) {
-    setTodoMsg('Todos file is unreadable — not overwriting it. Fix or remove .hivemind/todos.json, then reopen.', 'err');
-    return;
-  }
-  window.api.todo.ensureIgnored(dir);
-  const res = await window.api.todo.write(dir, todoItems);
-  if (!res || !res.ok) setTodoMsg((res && res.message) || 'Could not save todos.', 'err');
-  else setTodoMsg('');
-}
-
-function addTodo(text) {
-  const t = (text || '').trim();
-  if (!t || !activeDir()) return;
-  if (todoLoadFailed) {
-    setTodoMsg('Todos file is unreadable — not overwriting it. Fix or remove .hivemind/todos.json, then reopen.', 'err');
-    return;
-  }
-  todoItems.push({ id: nextId('todo'), text: t, done: false, children: [] });
-  saveTodo();
-  renderTodo({ ok: true });
-}
-
-// -- "todo …" capture from the composer / dictation ---------------------------
-// A message starting with "todo" (or "TODO:", "to-do", …) is a checklist entry
-// for this hive's Todo panel, not a prompt for Claude. Matches only the exact
-// word at the start ("todos need work" is not captured). Returns the item text
-// ('' if the word stood alone) or null when the message isn't a todo.
-const TODO_PREFIX_RE = /^to-?do\b[\s:,.!?-]*/i;
-function matchTodoPrefix(text) {
-  const t = String(text || '').trim();
-  const m = TODO_PREFIX_RE.exec(t);
-  return m ? t.slice(m[0].length).trim() : null;
-}
-
-// Append one item to this hive's todos. Reads the list from disk first — the
-// panel's in-memory copy is only current while the panel is open, and saving a
-// stale copy would clobber items added elsewhere (e.g. by a Claude thread).
-async function addTodoItem(text) {
-  const t = String(text || '').trim();
-  const dir = activeDir();
-  if (!dir) return { ok: false, message: 'No hive is open.' };
-  if (!t) return { ok: false, message: 'Nothing to add.' };
-  const res = await window.api.todo.read(dir);
-  if (res && res.ok === false && (res.reason === 'corrupt' || res.reason === 'unreadable')) {
-    return { ok: false, message: 'Todos file is unreadable — not overwriting it.' };
-  }
-  const list = (res && res.ok && Array.isArray(res.todos)) ? normalizeTodos(res.todos) : [];
-  list.push({ id: nextId('todo'), text: t, done: false, children: [] });
-  window.api.todo.ensureIgnored(dir);
-  const w = await window.api.todo.write(dir, list);
-  if (!w || !w.ok) return { ok: false, message: (w && w.message) || 'Could not save the todo.' };
-  todoItems = list;
-  if (todoPanelOpen()) renderTodo({ ok: true });
-  return { ok: true };
-}
-
-// Shared entry point for the "todo …" prefix and the "Hivemind, add a todo …"
-// command: add the item and confirm with a toast. A bare "todo" with no text
-// just opens the panel.
-async function captureTodo(text) {
-  const t = String(text || '').trim();
-  if (!t) {
-    setTodoOpen(true);
-    refreshTodo();
-    hmToast('Todo panel opened — say "todo <something>" to add an item.');
-    return;
-  }
-  const res = await addTodoItem(t);
-  if (res.ok) hmToast('Added todo: ' + t);
-  else hmToast('Could not add todo: ' + res.message, 'err');
-}
-
-// Add a blank sub-item under `parent`, expand it, and open the editor on the new
-// row. A blank row abandoned (Esc, or blurred empty) is discarded.
-function addSubTodo(parent) {
-  if (!activeDir()) return;
-  parent.children = parent.children || [];
-  parent.collapsed = false;
-  const child = { id: nextId('todo'), text: '', done: false, children: [] };
-  parent.children.push(child);
-  renderTodo({ ok: true }, child.id);
-}
-
-// Older todos.json (pre-nesting) has no `children`; give every node one so the
-// tree helpers below can recurse freely.
-function normalizeTodos(list) {
-  if (!Array.isArray(list)) return [];
-  list.forEach((it) => { it.children = normalizeTodos(it.children || []); });
-  return list;
-}
-
-// Remove `item` from whichever list holds it, searching the whole tree.
-function removeTodo(item, list) {
-  const i = list.indexOf(item);
-  if (i !== -1) { list.splice(i, 1); return true; }
-  return list.some((it) => removeTodo(item, it.children || []));
-}
-
-// Set `item` and every descendant to `done` (checking a parent checks its kids).
-function setSubtreeDone(item, done) {
-  item.done = done;
-  (item.children || []).forEach((c) => setSubtreeDone(c, done));
-}
-
-// Checking sub-items never auto-checks the parent — the parent is ticked only
-// by hand (which then checks its whole subtree). But a checked parent can't
-// stay done once any of its sub-items is undone, so clear it bottom-up.
-function reconcileTodos(list) {
-  list.forEach((it) => {
-    const kids = it.children || [];
-    if (kids.length) {
-      reconcileTodos(kids);
-      if (!kids.every((c) => c.done)) it.done = false;
-    }
-  });
-}
-
-// done/total counted over leaf items only — parents are containers, not tasks.
-function todoStats(list) {
-  let done = 0, total = 0;
-  const walk = (arr) => arr.forEach((it) => {
-    const kids = it.children || [];
-    if (kids.length) walk(kids);
-    else { total++; if (it.done) done++; }
-  });
-  walk(list);
-  return { done, total };
-}
-
-// Prune done items without orphaning an undone descendant: a done parent stays
-// as long as any child survives.
-function pruneDoneTodos(list) {
-  return list.filter((it) => {
-    it.children = pruneDoneTodos(it.children || []);
-    return !it.done || it.children.length > 0;
-  });
-}
-
-// -- Push a todo to a new thread ----------------------------------------------
-// The item's text (plus any unfinished sub-items) becomes a brand-new thread's
-// initial prompt, exactly like "Hivemind, open a new thread and <task>" — the
-// new Claude starts working on it the moment it boots. The todo itself is left
-// unticked; the thread finishing the work is what earns the checkmark.
-
-// Flatten an item into a one-line task: initialPrompt rides along as claude's
-// positional argument (main.js collapses newlines), so sub-items are folded in
-// as a "; "-separated list rather than a multi-line checklist.
-function todoThreadPrompt(item) {
-  const subs = [];
-  (function walk(kids) {
-    (kids || []).forEach((k) => {
-      const t = String(k.text || '').trim();
-      if (!k.done && t) subs.push(t);
-      walk(k.children);
-    });
-  })(item.children);
-  const t = String(item.text || '').trim();
-  if (!t) return '';
-  return subs.length ? t + ' — sub-tasks: ' + subs.join('; ') : t;
-}
-
-function pushTodoToThread(item) {
-  const board = activeBoard();
-  if (!board) { hmToast('No hive is open — create one first.', 'err'); return; }
-  const task = todoThreadPrompt(item);
-  if (!task) { hmToast('This todo is empty — give it some text first.', 'err'); return; }
-  const p = addTerminal(board, { initialPrompt: task });
-  if (p) setPaneCaption(p, String(item.text || '').trim());
-  hmToast('Opened a new thread — starting on: ' + String(item.text || '').trim());
-}
-
-// Swap a todo's label for an inline text editor; Enter/blur commits, Esc cancels.
-// `removeIfEmpty` (used for freshly-added sub-items) discards a never-named row.
-function startEditTodo(item, span, opts) {
-  const removeIfEmpty = !!(opts && opts.removeIfEmpty);
-  const input = document.createElement('input');
-  input.type = 'text';
-  input.className = 'todo-edit';
-  input.spellcheck = true;
-  input.value = item.text;
-  let committed = false;
-  const finish = (cancel) => {
-    if (committed) return;
-    committed = true;
-    const t = input.value.trim();
-    if (!cancel && t) item.text = t;
-    if (removeIfEmpty && !item.text) removeTodo(item, todoItems);
-    saveTodo();
-    renderTodo({ ok: true });
-  };
-  input.onkeydown = (e) => {
-    if (e.key === 'Enter') { e.preventDefault(); finish(false); }
-    else if (e.key === 'Escape') { finish(true); }
-  };
-  input.onblur = () => finish(false);
-  span.replaceWith(input);
-  input.focus();
-  input.select();
-}
-
-function renderTodo(res, focusEditId) {
-  todoBody.innerHTML = '';
-  todoPendingEdit = null;
-  if (res && !res.ok && res.reason === 'no-dir') {
-    const wrap = document.createElement('div');
-    wrap.className = 'git-empty';
-    wrap.textContent = 'This hive has no project directory set. Edit the hive to choose one.';
-    todoBody.appendChild(wrap);
-  } else if (!todoItems.length) {
-    const wrap = document.createElement('div');
-    wrap.className = 'git-empty';
-    wrap.textContent = 'No todos yet. Add one above to get started.';
-    todoBody.appendChild(wrap);
-  } else {
-    todoBody.appendChild(buildTodoList(todoItems, 0, focusEditId));
-  }
-  // The edited row's span must be in the document before we can focus it.
-  if (todoPendingEdit) {
-    const { item, span } = todoPendingEdit;
-    todoPendingEdit = null;
-    startEditTodo(item, span, { removeIfEmpty: true });
-  }
-  renderTodoCount();
-}
-
-// Build a <ul> for `list` at nesting `depth`, recursing into children. Rows are
-// indented by depth; items with children get a collapse caret.
-function buildTodoList(list, depth, focusEditId) {
-  const ul = document.createElement('ul');
-  ul.className = 'todo-list';
-  list.forEach((item) => {
-    const kids = item.children || [];
-    const hasKids = kids.length > 0;
-
-    const li = document.createElement('li');
-    li.className = 'todo-item' + (item.done ? ' done' : '');
-    li.style.paddingLeft = (6 + depth * 16) + 'px';
-
-    const caret = document.createElement('button');
-    caret.className = 'todo-caret';
-    if (hasKids) {
-      caret.textContent = item.collapsed ? '▸' : '▾';
-      caret.title = item.collapsed ? 'Expand' : 'Collapse';
-      caret.onclick = () => { item.collapsed = !item.collapsed; saveTodo(); renderTodo({ ok: true }); };
-    } else {
-      caret.classList.add('todo-caret-empty');
-      caret.tabIndex = -1;
-    }
-
-    const cb = document.createElement('input');
-    cb.type = 'checkbox';
-    cb.className = 'todo-check';
-    cb.checked = !!item.done;
-    if (hasKids) {
-      const s = todoStats([item]);
-      cb.indeterminate = s.done > 0 && s.done < s.total;
-    }
-    cb.title = 'Toggle done';
-    cb.onchange = () => {
-      setSubtreeDone(item, cb.checked);
-      reconcileTodos(todoItems);
-      saveTodo();
-      renderTodo({ ok: true });
-    };
-
-    const span = document.createElement('span');
-    span.className = 'todo-text';
-    span.textContent = item.text;
-    span.title = 'Double-click to edit';
-    span.ondblclick = () => startEditTodo(item, span);
-
-    const push = document.createElement('button');
-    push.className = 'todo-push';
-    push.title = 'Start in a new thread';
-    push.textContent = '▶';
-    push.onclick = () => pushTodoToThread(item);
-
-    const addSub = document.createElement('button');
-    addSub.className = 'todo-sub';
-    addSub.title = 'Add sub-item';
-    addSub.textContent = '＋';
-    addSub.onclick = () => addSubTodo(item);
-
-    const del = document.createElement('button');
-    del.className = 'todo-del';
-    del.title = 'Delete';
-    del.textContent = '✕';
-    del.onclick = () => {
-      removeTodo(item, todoItems);
-      reconcileTodos(todoItems);
-      saveTodo();
-      renderTodo({ ok: true });
-    };
-
-    li.appendChild(caret);
-    li.appendChild(cb);
-    li.appendChild(span);
-    li.appendChild(push);
-    li.appendChild(addSub);
-    li.appendChild(del);
-    ul.appendChild(li);
-
-    if (focusEditId && item.id === focusEditId) todoPendingEdit = { item, span };
-
-    if (hasKids && !item.collapsed) ul.appendChild(buildTodoList(kids, depth + 1, focusEditId));
-  });
-  return ul;
-}
-
-// Footer: "<done>/<total> done" plus a "Clear completed" action when relevant.
-function renderTodoCount() {
-  const footer = $('todo-footer');
-  const countEl = $('todo-count');
-  const clearBtn = $('todo-clear-done');
-  if (!footer || !countEl || !clearBtn) return;
-  const { done, total } = todoStats(todoItems);
-  if (!total) { footer.classList.add('hidden'); return; }
-  footer.classList.remove('hidden');
-  countEl.textContent = `${done}/${total} done`;
-  clearBtn.style.display = done ? '' : 'none';
-}
-
-if (todoInput) {
-  todoInput.onkeydown = (e) => {
-    if (e.key === 'Enter') { e.preventDefault(); addTodo(todoInput.value); todoInput.value = ''; }
-  };
-}
-$('todo-add').onclick = () => { addTodo(todoInput.value); todoInput.value = ''; todoInput.focus(); };
-$('todo-clear-done').onclick = () => {
-  todoItems = pruneDoneTodos(todoItems);
-  saveTodo();
-  renderTodo({ ok: true });
-};
-// ---------------------------------------------------------------------------
 // Prompt History panel
 //
 // A per-hive log of prompts sent to threads, stored in
-// `.hivemind/prompt-history.json` (shared per project, like todos — not
-// per-thread). Prompts are captured in sendChatMessage after the Hivemind /
-// todo command interception, so only text actually delivered to a thread is
-// recorded. Clicking an entry reposts it to the focused live thread.
+// `.hivemind/prompt-history.json` (shared per project, not per-thread).
+// Prompts are captured in sendChatMessage after the Hivemind command
+// interception, so only text actually delivered to a thread is recorded. Clicking an entry reposts it to the focused live thread.
 // ---------------------------------------------------------------------------
 const historyToggle = $('history-toggle');
 const historyPanel = $('history-panel');
@@ -8469,13 +7613,12 @@ function setHistoryOpen(open) {
   if (open) { // one panel at a time
     setGitOpen(false);
     setFilesOpen(false);
-    setTodoOpen(false);
     setHmChatOpen(false);
-    if (typeof setPublishOpen === 'function') setPublishOpen(false);
   }
   historyPanel.classList.toggle('hidden', !open);
   historyToggle.classList.toggle('active', open);
-  sidebarEl.classList.toggle('history-open', open); // board list yields its space
+  sidebarEl.classList.toggle('history-open', open); // hive list shrinks to the active hive
+  syncSidebarPanelState();
 }
 
 historyToggle.onclick = () => {
@@ -8646,7 +7789,7 @@ function jumpToChatRow(pane, row) {
 
 // Record one sent prompt into this hive's history. Appending happens in the
 // main process (read-modify-write on disk) so sends from several threads and
-// an open panel never clobber each other — same rationale as addTodoItem.
+// an open panel never clobber each other.
 async function recordPromptHistory(text, agent) {
   const t = String(text || '').trim();
   const dir = activeDir();
@@ -10021,10 +9164,17 @@ branchBackdrop.addEventListener('mousedown', (e) => { if (e.target === branchBac
 
 document.addEventListener('keydown', (e) => {
   if (e.key !== 'Escape') return;
+  // The setup wizard sits above everything (it can be opened from Settings, and
+  // its last step is a hive form the New-hive modal must not cover).
+  if (setupIsOpen()) { closeSetupWizard(); return; }
   // Training stacks above Settings — close it first.
   if (voiceTrainIsOpen()) { closeVoiceTraining(); return; }
   // The clone wizard stacks above the New-hive modal — close it first.
   if (!cloneBackdrop.classList.contains('hidden')) { closeCloneWizard(); return; }
+  // The New/Edit-hive dialog. It was missing from this chain entirely, so the
+  // first modal a new user ever sees was the one dialog Escape didn't close —
+  // while the Help modal has always claimed "Esc — close the open dialog".
+  if (!backdrop.classList.contains('hidden')) { closeModal(); return; }
   if (!planBackdrop.classList.contains('hidden')) closePlanReview();
   else if (!diffBackdrop.classList.contains('hidden')) diffBackdrop.classList.add('hidden');
   else if (!branchBackdrop.classList.contains('hidden')) branchBackdrop.classList.add('hidden');
@@ -10553,6 +9703,409 @@ function mkBtn(text, onclick) { const b = document.createElement('button'); b.te
 function mkMini(text, title, onclick) { const b = document.createElement('button'); b.textContent = text; b.title = title; b.onclick = onclick; return b; }
 
 // ---------------------------------------------------------------------------
+// First-run setup wizard
+//
+// Hivemind runs agent CLIs; it never talks to a model API itself. So a machine
+// with no agent installed can do nothing at all — and the app used to say
+// nothing about that. A new user landed on "Create your first hive", made one,
+// and watched the first thread die on PowerShell's "'claude' is not recognized
+// as the name of a cmdlet", with no hint that a CLI was the missing piece.
+//
+// This wizard is the missing first mile. Three steps:
+//
+//   1. Pick an agent — every agent Hivemind supports, each with a live status
+//      chip read from this machine (see `agent-setup.js` behind
+//      `window.api.detectAgents`), so the choice is informed rather than blind.
+//   2. Get it connected — the install command with a Copy button when the CLI
+//      is missing, and what to expect for sign-in. While the user installs it
+//      in another window this step **re-checks on a timer**, so they come back
+//      to a green tick rather than having to find a button.
+//   3. Make the first hive — and finish by opening it, which starts a thread on
+//      the agent they picked (the pick is saved as `defaultAgent`, so it is
+//      what `selectBoard`'s automatic first thread uses).
+//
+// It opens by itself once: a profile with no hives that has never been through
+// setup. Closing it — finished or skipped — sets `hm.setupDone`, so it never
+// nags. It stays reachable afterwards from the empty state, from
+// Settings → General → Agent setup, and from "Hivemind, run setup".
+//
+// Sign-in itself is deliberately *not* done here. Every one of these CLIs signs
+// in through its own terminal flow (a device code, a browser round-trip), and
+// Hivemind already handles that case well: the thread's login screen trips
+// `AUTH_PATTERNS`, the header reads "sign in", and the chat view shows a 🔑
+// card. Re-implementing that in a modal would only add a second, worse copy.
+// ---------------------------------------------------------------------------
+const setupBackdrop = $('setup-backdrop');
+const setupBody = $('setup-body');
+const setupMsg = $('setup-msg');
+const setupStepsEl = $('setup-steps');
+const SETUP_DONE_KEY = 'hm.setupDone';
+const SETUP_STEPS = 3;
+// Slow enough to be free (the check is filesystem-only — see agent-setup.js),
+// fast enough that finishing an `npm i -g` shows up before the user reaches
+// back for the mouse.
+const SETUP_RECHECK_MS = 4000;
+
+// Live wizard state; null whenever the wizard is closed.
+let setupState = null;
+let setupRecheckTimer = null;
+
+const setupIsOpen = () => !!setupBackdrop && !setupBackdrop.classList.contains('hidden');
+const setupRecord = () => (setupState && setupState.detect
+  ? setupState.detect.agents.find((a) => a.agent === setupState.agent)
+  : null);
+
+function setupSetMsg(text, kind) {
+  if (!setupMsg) return;
+  if (!text) { setupMsg.classList.add('hidden'); setupMsg.textContent = ''; return; }
+  setupMsg.textContent = text;
+  setupMsg.className = 'gh-msg' + (kind ? ' ' + kind : '');
+}
+
+function setupSetStep(n) {
+  if (setupStepsEl) setupStepsEl.textContent = `Step ${n} of ${SETUP_STEPS}`;
+  if (setupState) setupState.step = n;
+}
+
+// Ask main which CLIs exist and which are signed in. Never fatal: a failed
+// check leaves the previous answer (or none) in place and says so, because the
+// user can still install a CLI and press Check again.
+async function setupRefreshDetect() {
+  try {
+    const result = await window.api.detectAgents();
+    // The wizard can be closed (or reopened) while this is in flight — writing
+    // into a torn-down state would throw and lose the poller with it.
+    if (setupState && result && Array.isArray(result.agents)) {
+      setupState.detect = result;
+      return true;
+    }
+  } catch (_) { /* fall through */ }
+  return false;
+}
+
+// -- The install-step poller -------------------------------------------------
+// Only runs while step 2 is showing something the user is expected to go and
+// fix elsewhere. Re-renders only when the answer actually changed, so a focused
+// input or a scrolled body isn't reset every four seconds.
+function stopSetupRecheck() {
+  if (setupRecheckTimer) { clearInterval(setupRecheckTimer); setupRecheckTimer = null; }
+}
+
+function startSetupRecheck() {
+  stopSetupRecheck();
+  setupRecheckTimer = setInterval(async () => {
+    if (!setupIsOpen() || !setupState || setupState.step !== 2) { stopSetupRecheck(); return; }
+    const before = setupRecord();
+    const prev = before ? before.installed + '/' + before.signedIn : '';
+    if (!(await setupRefreshDetect())) return;
+    const after = setupRecord();
+    if (after && prev !== after.installed + '/' + after.signedIn) renderSetupConnect();
+  }, SETUP_RECHECK_MS);
+}
+
+// -- Open / close ------------------------------------------------------------
+async function openSetupWizard({ from = 'manual' } = {}) {
+  if (!setupBackdrop) return;
+  // Opened from Settings: get that modal out from under it, so Escape and the
+  // backdrop click mean one unambiguous thing.
+  if (from === 'settings' && typeof closeSettings === 'function') closeSettings();
+  setupState = { step: 1, agent: null, detect: null, dir: '', name: '', from, busy: false };
+  setupSetMsg('');
+  setupBackdrop.classList.remove('hidden');
+  renderSetupPick();                 // paints the "checking…" state immediately
+  await setupRefreshDetect();
+  if (setupIsOpen() && setupState && setupState.step === 1) renderSetupPick();
+}
+
+// Closing at any step counts as "this user has seen setup" — the wizard is a
+// welcome, not a gate, and a second uninvited appearance would be worse than
+// never showing it.
+function closeSetupWizard() {
+  stopSetupRecheck();
+  if (setupBackdrop) setupBackdrop.classList.add('hidden');
+  setupState = null;
+  setupSetMsg('');
+  try { localStorage.setItem(SETUP_DONE_KEY, '1'); } catch (_) { /* private mode */ }
+}
+
+// -- Step 1: pick an agent ---------------------------------------------------
+// The chip is the whole point of this screen: "which of these can I actually
+// use right now" is exactly what a new user cannot answer alone.
+function setupAgentStatus(rec) {
+  if (!rec.installed) return { cls: '', text: 'not installed' };
+  if (rec.signedIn === false) return { cls: 'warn', text: 'sign-in needed' };
+  // signedIn true or unknown — either way a thread on it will work or will ask.
+  return { cls: 'ready', text: rec.signedIn === true ? 'ready' : 'installed' };
+}
+
+function setupAgentCard(rec) {
+  const card = document.createElement('button');
+  card.className = 'setup-agent' + (setupState.agent === rec.agent ? ' sel' : '');
+  const top = el('div', 'setup-agent-top');
+  top.append(el('span', 'setup-agent-name', rec.label));
+  const status = setupAgentStatus(rec);
+  top.append(el('span', 'setup-chip' + (status.cls ? ' ' + status.cls : ''), status.text));
+  card.append(top, el('span', 'setup-agent-desc', rec.blurb));
+  card.onclick = () => { setupState.agent = rec.agent; renderSetupConnect(); };
+  return card;
+}
+
+function renderSetupPick() {
+  if (!setupState) return;
+  stopSetupRecheck();
+  setupSetStep(1);
+  setupBody.innerHTML = '';
+  setupBody.appendChild(el('p', 'gh-intro',
+    'Hivemind runs agent command-line tools in threads — it never talks to a model '
+    + 'service itself, so one of these has to be installed on this machine. Pick the one '
+    + 'to start with; you can add the others later and even mix them inside one hive.'));
+
+  if (!setupState.detect) {
+    setupBody.appendChild(el('p', 'gh-note', 'Checking what is installed on this machine…'));
+    return;
+  }
+
+  const opts = el('div', 'gh-options');
+  for (const rec of setupState.detect.agents) opts.appendChild(setupAgentCard(rec));
+  setupBody.appendChild(opts);
+
+  setupBody.appendChild(el('p', 'gh-note', setupState.detect.anyInstalled
+    ? 'Already installed and signed in? Pick it anyway — the last step makes your first hive.'
+    : "None of them are installed yet, which is normal on a new machine. Pick one and the "
+      + 'next step gives you the exact command to install it.'));
+
+  setupBody.appendChild(wizardActions({ right: [['Skip setup', () => closeSetupWizard()]] }));
+}
+
+// -- Step 2: install + sign in ----------------------------------------------
+function setupCheckRow(done, title, detail) {
+  const li = document.createElement('li');
+  const mark = el('span', 'setup-mark ' + (done ? 'ok' : 'todo'), done ? '✓' : '•');
+  const body = el('div');
+  body.appendChild(el('div', null, title));
+  if (typeof detail === 'string') body.appendChild(el('small', null, detail));
+  else if (detail) body.appendChild(detail);
+  li.append(mark, body);
+  return li;
+}
+
+// The install command, copyable — retyping an npm line by hand off a screen is
+// exactly where a first run goes wrong.
+function setupInstallBlock(rec) {
+  const wrap = el('div');
+  const isUrl = /^https?:/i.test(rec.install);
+  wrap.appendChild(el('small', null, isUrl
+    ? 'Download and run the official installer, then come back — this window re-checks by itself.'
+    : 'Run this in a terminal (PowerShell works), then come back — this window re-checks by itself.'));
+  if (isUrl) {
+    const link = document.createElement('button');
+    link.className = 'setup-link';
+    link.textContent = '↗ ' + rec.install;
+    link.onclick = () => window.api.openExternal(rec.install);
+    wrap.appendChild(link);
+    return wrap;
+  }
+  const row = el('div', 'setup-cmd');
+  row.appendChild(el('div', 'gh-code', rec.install));
+  const copy = document.createElement('button');
+  copy.textContent = '⧉ Copy';
+  copy.onclick = async () => {
+    try {
+      await navigator.clipboard.writeText(rec.install);
+      copy.textContent = '✓ Copied';
+      setTimeout(() => { copy.textContent = '⧉ Copy'; }, 1500);
+    } catch (_) { setupSetMsg('Could not reach the clipboard — select the command and copy it.', 'err'); }
+  };
+  row.appendChild(copy);
+  wrap.appendChild(row);
+  return wrap;
+}
+
+function renderSetupConnect() {
+  if (!setupState) return;
+  const rec = setupRecord();
+  if (!rec) { renderSetupPick(); return; }
+  setupSetStep(2);
+  setupSetMsg('');
+  setupBody.innerHTML = '';
+  setupBody.appendChild(el('p', 'gh-intro',
+    `${rec.label} threads need two things: the ${rec.command} command on this machine, `
+    + 'and an account signed in to it.'));
+
+  const list = el('ul', 'setup-checklist');
+
+  list.appendChild(setupCheckRow(rec.installed,
+    rec.installed ? 'Installed' : 'Not installed yet',
+    rec.installed
+      ? `Hivemind found the ${rec.command} command — the same lookup a thread uses, so a thread will find it too.`
+      : setupInstallBlock(rec)));
+
+  // Sign-in wording, in the order the states actually matter. An unknown is
+  // never reported as "not signed in": the thread asks if it needs to, and a
+  // false alarm sends the user off to re-authenticate a working account.
+  if (!rec.installed) {
+    list.appendChild(setupCheckRow(false, 'Sign in',
+      'Comes after the install — your first thread opens on its sign-in screen.'));
+  } else if (rec.signedIn === true) {
+    list.appendChild(setupCheckRow(true, 'Signed in',
+      `Hivemind found a stored ${rec.label} login on this machine. Nothing else to do.`));
+  } else if (rec.signedIn === null) {
+    list.appendChild(setupCheckRow(true, 'Ready to sign in',
+      "Hivemind can't read this tool's login store, so it won't guess. If a sign-in is "
+      + 'needed, the thread will ask you for it.'));
+  } else {
+    list.appendChild(setupCheckRow(false, 'Not signed in yet',
+      `Your first thread runs ${rec.command}, which opens its own sign-in screen — follow it `
+      + 'right there in the thread. Hivemind marks the thread "sign in" and shows a 🔑 card in '
+      + 'the chat view until it is done.'));
+  }
+  setupBody.appendChild(list);
+
+  if (rec.docs) {
+    const docs = document.createElement('button');
+    docs.className = 'setup-link';
+    docs.textContent = `↗ ${rec.label} setup documentation`;
+    docs.onclick = () => window.api.openExternal(rec.docs);
+    setupBody.appendChild(docs);
+  }
+
+  setupBody.appendChild(wizardActions({
+    backTo: renderSetupPick,
+    right: [
+      // Re-render first: renderSetupConnect clears the message bar, so a
+      // failure reported before it would be wiped by the repaint it triggers.
+      ['Check again', async () => {
+        const ok = await setupRefreshDetect();
+        renderSetupConnect();
+        if (!ok) setupSetMsg("Couldn't check this machine just now — try again in a moment.", 'err');
+      }],
+      [rec.installed ? 'Next →' : 'Continue anyway →', renderSetupHive, true],
+    ],
+  }));
+
+  // Nothing to watch for once it is installed and signed in.
+  if (!rec.installed || rec.signedIn === false) startSetupRecheck();
+  else stopSetupRecheck();
+}
+
+// -- Step 3: the first hive --------------------------------------------------
+const setupDirName = (dir) => (String(dir || '').split(/[\\/]+/).filter(Boolean).pop() || '');
+
+function renderSetupHive() {
+  if (!setupState) return;
+  stopSetupRecheck();
+  // Reaching this step is the commitment to the agent, so it becomes the
+  // default now — the thread `selectBoard` opens at the end reads it, and so
+  // does every thread the user opens afterwards.
+  setDefaultAgent(setupState.agent);
+  const rec = setupRecord();
+  setupSetStep(3);
+  setupSetMsg('');
+  setupBody.innerHTML = '';
+  setupBody.appendChild(el('p', 'gh-intro',
+    'Last step: a hive is one project directory. Point one at a folder and Hivemind opens a '
+    + `${rec ? rec.label : 'first'} thread in it — every thread you add to this hive shares that folder.`));
+
+  const nameLabel = el('label', null, 'Hive name');
+  const nameInput = document.createElement('input');
+  nameInput.type = 'text';
+  nameInput.placeholder = 'My project';
+  nameInput.spellcheck = false;
+  nameInput.value = setupState.name;
+  nameInput.oninput = () => { setupState.name = nameInput.value; };
+  nameLabel.appendChild(nameInput);
+
+  const dirLabel = el('label', null, 'Project directory');
+  const dirRow = el('div', 'dir-row');
+  const dirInput = document.createElement('input');
+  dirInput.type = 'text';
+  dirInput.placeholder = 'C:\\path\\to\\project';
+  dirInput.spellcheck = false;
+  dirInput.value = setupState.dir;
+  dirInput.oninput = () => { setupState.dir = dirInput.value; };
+  const browse = mkBtn('Browse…', async () => {
+    const dir = await window.api.pickDir();
+    if (!dir) return;
+    setupState.dir = dir;
+    dirInput.value = dir;
+    // Only fill a name the user hasn't typed one into.
+    if (!setupState.name) {
+      setupState.name = setupDirName(dir);
+      nameInput.value = setupState.name;
+    }
+  });
+  dirRow.append(dirInput, browse);
+  dirLabel.appendChild(dirRow);
+
+  setupBody.append(nameLabel, dirLabel);
+  setupBody.appendChild(el('p', 'gh-note',
+    'Any folder works — an existing project, a Git repo, or an empty directory you want the '
+    + 'agent to start something in.'));
+
+  setupBody.appendChild(wizardActions({
+    backTo: renderSetupConnect,
+    right: [
+      ["I'll do this later", () => closeSetupWizard()],
+      ['Create hive', finishSetup, true],
+    ],
+  }));
+  dirInput.focus();
+}
+
+async function finishSetup() {
+  if (!setupState || setupState.busy) return;
+  const dir = String(setupState.dir || '').trim();
+  if (!dir) {
+    setupSetMsg('Pick a project directory first — Browse… opens a folder picker.', 'err');
+    return;
+  }
+  setupState.busy = true;
+  const label = (setupRecord() || {}).label || 'agent';
+  const name = String(setupState.name || '').trim() || setupDirName(dir) || 'My project';
+  // Same shape the New-hive modal writes. `startupCommand` stays `claude`
+  // whatever the chosen agent is: it is only ever used by Claude threads
+  // (`paneCommand`), and leaving it right means a later Claude thread on this
+  // hive works without the user having to fix a field they never saw.
+  const board = {
+    id: nextId('board'), name, dir, startupCommand: 'claude', resumeOnStart: false, muted: false,
+  };
+  boards.push(board);
+  activeBoardId = board.id;
+  try {
+    await persist();
+  } catch (err) {
+    // Undo the optimistic push and let them try again — a wizard that ate the
+    // click and sat there is the worst possible last step.
+    boards.pop();
+    activeBoardId = null;
+    setupState.busy = false;
+    setupSetMsg('Could not save the hive: ' + (err && err.message ? err.message : 'unknown error'), 'err');
+    return;
+  }
+  renderBoardList();
+  closeSetupWizard();
+  selectBoard(board.id); // opens the hive's first thread on the chosen agent
+  hmToast(`Hive "${name}" created — starting a ${label} thread in it.`);
+}
+
+if (setupBackdrop) {
+  $('setup-close').onclick = () => closeSetupWizard();
+  setupBackdrop.addEventListener('mousedown', (e) => { if (e.target === setupBackdrop) closeSetupWizard(); });
+}
+
+// Shown once, unprompted, to the only user who needs it: a profile with no
+// hives that has never been through setup. Everyone else reaches it from the
+// empty state, Settings, or the `setup` command.
+function maybeOpenSetupWizard() {
+  if (boards.length) return false;
+  let seen = null;
+  try { seen = localStorage.getItem(SETUP_DONE_KEY); } catch (_) { seen = '1'; }
+  if (seen === '1') return false;
+  openSetupWizard({ from: 'first-run' });
+  return true;
+}
+
+// ---------------------------------------------------------------------------
 // Voice typing
 //
 // Dictate straight into the focused thread. Speech is transcribed locally and
@@ -10924,11 +10477,6 @@ function commitVoiceText(raw) {
   const hmCmd = matchHivemindCommand(text, true);
   if (hmCmd !== null) { runHivemindCommand(hmCmd, pane); return; }
 
-  // A dictated utterance starting with "todo" becomes a Todo-panel item
-  // instead of being typed into the thread.
-  const todoText = hmCmd === null ? matchTodoPrefix(text) : null;
-  if (todoText !== null) { captureTodo(todoText); return; }
-
   if (voiceAutoSpace) text += ' ';
 
   if (chatInput) {
@@ -11012,17 +10560,31 @@ function ensureSttWorker() {
 function bootSttWorker(entry, opts = {}) {
   return new Promise((resolve, reject) => {
     let worker;
+    let bootUrl = null;
+    // Revoking the blob URL is deferred until the worker's first message: a
+    // *module* worker fetches its script asynchronously, so revoking right
+    // after `new Worker()` races the fetch and the worker dies before it runs
+    // (an empty-message onerror — "voice worker crashed" on every attempt).
+    // A classic worker captures the URL synchronously; a module one does not.
+    const releaseBootUrl = () => {
+      if (!bootUrl) return;
+      URL.revokeObjectURL(bootUrl);
+      bootUrl = null;
+    };
     try {
       const bootstrap = "import 'hm://app/voice-worker.js';";
-      const url = URL.createObjectURL(new Blob([bootstrap], { type: 'text/javascript' }));
-      worker = new Worker(url, { type: 'module' });
-      URL.revokeObjectURL(url); // the Worker has captured the module — don't leak the URL
+      bootUrl = URL.createObjectURL(new Blob([bootstrap], { type: 'text/javascript' }));
+      worker = new Worker(bootUrl, { type: 'module' });
     } catch (err) {
+      releaseBootUrl();
       reject(err);
       return;
     }
 
     worker.onmessage = (ev) => {
+      // Any message proves the module script was fetched and evaluated, so the
+      // bootstrap blob is safe to release now.
+      releaseBootUrl();
       const msg = ev.data || {};
       if (msg.type === 'ready') {
         if (!opts.vadOnly) {
@@ -11049,6 +10611,7 @@ function bootSttWorker(entry, opts = {}) {
       }
     };
     worker.onerror = (e) => {
+      releaseBootUrl();
       if (!sttReady) { sttLoadPromise = null; reject(new Error(e.message || 'voice worker crashed')); }
     };
 
@@ -11578,6 +11141,15 @@ function syncGeneralFields() {
     }
   }
   if (st) st.value = currentTheme;
+  const sag = $('set-default-agent');
+  if (sag && !sag.options.length) {
+    for (const a of AGENTS) {
+      const opt = document.createElement('option');
+      opt.value = a.value; opt.textContent = a.label;
+      sag.appendChild(opt);
+    }
+  }
+  if (sag) sag.value = defaultAgent;
   const sm = $('set-default-model');
   fillModelSelect(sm, MODELS, defaultModel);
   const scm = $('set-default-codex-model');
@@ -12147,10 +11719,13 @@ if (vtBackdrop) {
   });
 }
 
-// -- Claude usage (toolbar pill + modal) --------------------------------------
-// The pill shows the most-constrained plan limit (the one closest to running
-// out); the modal breaks down every limit window plus today's per-model token
-// totals from the local Claude Code transcripts.
+// -- Agent usage (toolbar pill + modal) ---------------------------------------
+// Hivemind runs threads on two different subscriptions, so there is no single
+// "usage" number. The pill carries one segment per agent that has data —
+// "Claude 62%  ChatGPT 5%" — each showing that agent's most-constrained window
+// and tinted by how close it is. The modal expands the same snapshot: every
+// window of every account (ChatGPT can hold several logins at once), then
+// today's tokens per model for each agent.
 const usageBackdrop = $('usage-backdrop');
 const usageBtn = $('usage-btn');
 const usageBody = $('usage-body');
@@ -12176,115 +11751,204 @@ function fmtReset(iso) {
   return `resets ${clock} (${rel})`;
 }
 
+// How long ago a ChatGPT snapshot was taken — "2h ago". Those numbers only move
+// when that account runs, so their age is part of the reading, not decoration.
+function fmtAge(ms) {
+  if (!ms) return '';
+  const mins = Math.max(0, Math.round((Date.now() - ms) / 60000));
+  if (mins < 1) return 'just now';
+  if (mins < 60) return `${mins}m ago`;
+  const h = Math.round(mins / 60);
+  if (h < 24) return `${h}h ago`;
+  return `${Math.round(h / 24)}d ago`;
+}
+
 function usageSeverity(pct) {
   if (pct >= 85) return 'crit';
   if (pct >= 60) return 'warn';
   return 'ok';
 }
 
+const usageAgents = () => (usageData && Array.isArray(usageData.agents)) ? usageData.agents : [];
+
+// Every limit window an agent reports, across all of its accounts.
+function agentLimits(agent) {
+  const out = [];
+  for (const acc of agent.accounts || []) {
+    for (const l of acc.limits || []) out.push({ account: acc, limit: l });
+  }
+  return out;
+}
+
+// The binding constraint for an agent: whichever of its windows is fullest —
+// that is what decides how much of that agent you have left right now.
+function agentTop(agent) {
+  const all = agentLimits(agent);
+  if (!all.length) return null;
+  return all.reduce((a, b) => (b.limit.percent > a.limit.percent ? b : a), all[0]);
+}
+
+// Who an account is, beyond its name: "me@example.com · Pro".
+function accountDetail(acc) {
+  return [acc.email, acc.plan].filter(Boolean).join(' · ');
+}
+
+// An account's own heading — "Work · me@example.com · Pro". Only used when an
+// agent holds several logins; a single account is folded into the agent heading
+// instead, so nothing says "Claude" twice in a row.
+function accountTitle(acc) {
+  return [acc.label, accountDetail(acc)].filter(Boolean).join(' · ');
+}
+
 function renderUsagePill() {
   if (!usageBtn) return;
-  usageBtn.classList.remove('ok', 'warn', 'crit');
-  const d = usageData;
-  if (!d || !d.limits || !d.limits.length) {
-    usageBtn.textContent = 'Usage';
-    usageBtn.title = d && d.limitsError
-      ? 'Claude usage — ' + d.limitsError
-      : 'Claude usage — how much of your plan\'s limits you\'ve used';
-    return;
+  usageBtn.textContent = '';
+  const tips = [];
+  let shown = 0;
+  for (const agent of usageAgents()) {
+    const top = agentTop(agent);
+    if (!top) {
+      // Nothing to show for this agent — explain on hover rather than in the
+      // toolbar, so an agent you don't use doesn't take up space.
+      const why = (agent.accounts || []).map((a) => a.error).filter(Boolean)[0];
+      if (why) tips.push(`${agent.label}: ${why}`);
+      continue;
+    }
+    usageBtn.appendChild(el('span', 'usage-seg ' + usageSeverity(top.limit.percent),
+      `${agent.label} ${Math.round(top.limit.percent)}%`));
+    shown += 1;
+    for (const { account, limit } of agentLimits(agent)) {
+      const who = (agent.accounts || []).length > 1 ? `${agent.label} / ${account.label}` : agent.label;
+      const age = account.observedAt ? ` — as of ${fmtAge(account.observedAt)}` : '';
+      tips.push(`${who} · ${limit.label}: ${Math.round(limit.percent)}% used, ${fmtReset(limit.resetsAt)}${age}`);
+    }
   }
-  // The binding constraint is whichever window is fullest — that's the number
-  // that decides how much Claude you have left right now.
-  const top = d.limits.reduce((a, b) => (b.percent > a.percent ? b : a), d.limits[0]);
-  usageBtn.textContent = `${Math.round(top.percent)}%`;
-  usageBtn.classList.add(usageSeverity(top.percent));
-  usageBtn.title = d.limits
-    .map((l) => `${l.label}: ${Math.round(l.percent)}% used — ${fmtReset(l.resetsAt)}`)
-    .join('\n') + '\nClick for details.';
+  if (!shown) usageBtn.appendChild(el('span', 'usage-seg', 'Usage'));
+  usageBtn.title = (tips.length ? tips.join('\n') : 'Agent usage — how much of each agent\'s plan you\'ve used')
+    + '\nClick for details.';
+}
+
+// One account's limit windows as labelled bars, or the reason there are none.
+function renderUsageAccount(agent, acc) {
+  const box = el('div', 'usage-account');
+  if ((agent.accounts || []).length > 1) {
+    box.appendChild(el('div', 'usage-account-title', accountTitle(acc)));
+  }
+  const limits = acc.limits || [];
+  if (!limits.length) {
+    box.appendChild(el('p', 'help-note', acc.error || 'No limit windows reported for this account.'));
+    return box;
+  }
+  for (const l of limits) {
+    const row = el('div', 'usage-limit');
+    const head = el('div', 'usage-limit-head');
+    head.appendChild(el('span', 'usage-limit-label', l.label));
+    head.appendChild(el('span', 'usage-limit-detail',
+      `${Math.round(l.percent)}% used · ${100 - Math.round(l.percent)}% left · ${fmtReset(l.resetsAt)}`));
+    const bar = el('div', 'usage-bar');
+    const fill = el('div', 'usage-bar-fill ' + usageSeverity(l.percent));
+    fill.style.width = Math.min(100, Math.max(0, l.percent)) + '%';
+    bar.appendChild(fill);
+    row.append(head, bar);
+    box.appendChild(row);
+  }
+  // A recorded (rather than live) reading is only as good as its age — say so.
+  if (acc.observedAt) {
+    box.appendChild(el('div', 'usage-stamp',
+      `Recorded ${fmtAge(acc.observedAt)}, ${acc.observedNote || 'the last time this account ran'}.`));
+  }
+  // Bars from a fallback reading come with the reason the refresh failed.
+  if (acc.error) box.appendChild(el('div', 'usage-stamp', acc.error));
+  return box;
+}
+
+// Today's per-model token table for one agent. The count column is named by the
+// agent because Claude counts assistant messages and ChatGPT counts turns.
+function renderUsageTokens(agent) {
+  if (agent.tokensError) return el('p', 'help-note', agent.tokensError);
+  const byModel = (agent.tokens && agent.tokens.byModel) || {};
+  const models = Object.keys(byModel);
+  if (!models.length) return el('p', 'help-note', `No ${agent.label} activity recorded today.`);
+
+  const table = document.createElement('table');
+  table.className = 'usage-table';
+  const mkRow = (cells, header) => {
+    const tr = document.createElement('tr');
+    for (const c of cells) {
+      const td = document.createElement(header ? 'th' : 'td');
+      td.textContent = c;
+      tr.appendChild(td);
+    }
+    return tr;
+  };
+  table.appendChild(mkRow(['Model', agent.unitLabel || 'Msgs', 'Input', 'Output', 'Cache read', 'Cache write'], true));
+  const total = { messages: 0, input: 0, output: 0, cacheRead: 0, cacheCreate: 0 };
+  for (const model of models.sort()) {
+    const m = byModel[model];
+    table.appendChild(mkRow([model, String(m.messages), fmtTokens(m.input),
+      fmtTokens(m.output), fmtTokens(m.cacheRead), fmtTokens(m.cacheCreate)]));
+    for (const k of Object.keys(total)) total[k] += m[k];
+  }
+  if (models.length > 1) {
+    const tr = mkRow(['Total', String(total.messages), fmtTokens(total.input),
+      fmtTokens(total.output), fmtTokens(total.cacheRead), fmtTokens(total.cacheCreate)]);
+    tr.className = 'usage-total';
+    table.appendChild(tr);
+  }
+  return table;
+}
+
+// One block per agent: each account's limit windows, then today's tokens.
+function renderUsageAgent(agent) {
+  const group = el('div', 'settings-group');
+  const head = el('div', 'settings-group-title usage-agent-head');
+  head.appendChild(el('span', '', agent.label));
+  // With one login there is no account list to head, so its email/plan belongs
+  // up here next to the agent name.
+  const accounts = agent.accounts || [];
+  const solo = accounts.length === 1 ? accountDetail(accounts[0]) : '';
+  if (solo) head.appendChild(el('span', 'usage-agent-sub', solo));
+  const top = agentTop(agent);
+  if (top) {
+    head.appendChild(el('span', 'usage-badge ' + usageSeverity(top.limit.percent),
+      `${Math.round(top.limit.percent)}% used`));
+  }
+  group.appendChild(head);
+
+  if (!(agent.accounts || []).length) {
+    group.appendChild(el('p', 'help-note', 'No accounts set up for this agent.'));
+  } else {
+    for (const acc of agent.accounts) group.appendChild(renderUsageAccount(agent, acc));
+  }
+  if (agent.note) group.appendChild(el('small', '', agent.note));
+
+  group.appendChild(el('div', 'usage-subhead', 'Tokens today'));
+  group.appendChild(renderUsageTokens(agent));
+  return group;
 }
 
 function renderUsageModal() {
   if (!usageBody) return;
   usageBody.innerHTML = '';
-  const d = usageData;
-  if (!d) { usageBody.appendChild(el('p', 'help-note', 'Loading…')); return; }
-
-  // -- Plan limits ----------------------------------------------------------
-  const limitsGroup = el('div', 'settings-group');
-  const planName = d.subscriptionType ? ` (${d.subscriptionType} plan)` : '';
-  limitsGroup.appendChild(el('div', 'settings-group-title', 'Plan limits' + planName));
-  if (d.limitsError) {
-    limitsGroup.appendChild(el('p', 'help-note', d.limitsError));
-  } else if (!d.limits.length) {
-    limitsGroup.appendChild(el('p', 'help-note', 'No limit information reported for this account.'));
-  } else {
-    for (const l of d.limits) {
-      const row = el('div', 'usage-limit');
-      const head = el('div', 'usage-limit-head');
-      head.appendChild(el('span', 'usage-limit-label', l.label));
-      head.appendChild(el('span', 'usage-limit-detail',
-        `${Math.round(l.percent)}% used · ${100 - Math.round(l.percent)}% left · ${fmtReset(l.resetsAt)}`));
-      const bar = el('div', 'usage-bar');
-      const fill = el('div', 'usage-bar-fill ' + usageSeverity(l.percent));
-      fill.style.width = Math.min(100, Math.max(0, l.percent)) + '%';
-      bar.appendChild(fill);
-      row.append(head, bar);
-      limitsGroup.appendChild(row);
-    }
-    limitsGroup.appendChild(el('small', '',
-      'Same windows as Claude Code\'s /usage — the session window covers rolling 5-hour blocks; weekly windows cap the whole week.'));
-  }
-  usageBody.appendChild(limitsGroup);
-
-  // -- Today's tokens ---------------------------------------------------------
-  const tokGroup = el('div', 'settings-group');
-  tokGroup.appendChild(el('div', 'settings-group-title', 'Tokens used today'));
-  const models = Object.keys((d.tokens && d.tokens.byModel) || {});
-  if (d.tokensError) {
-    tokGroup.appendChild(el('p', 'help-note', d.tokensError));
-  } else if (!models.length) {
-    tokGroup.appendChild(el('p', 'help-note', 'No Claude activity recorded today.'));
-  } else {
-    const table = document.createElement('table');
-    table.className = 'usage-table';
-    const mkRow = (cells, header) => {
-      const tr = document.createElement('tr');
-      for (const c of cells) {
-        const td = document.createElement(header ? 'th' : 'td');
-        td.textContent = c;
-        tr.appendChild(td);
-      }
-      return tr;
-    };
-    table.appendChild(mkRow(['Model', 'Msgs', 'Input', 'Output', 'Cache read', 'Cache write'], true));
-    const total = { messages: 0, input: 0, output: 0, cacheRead: 0, cacheCreate: 0 };
-    for (const model of models.sort()) {
-      const m = d.tokens.byModel[model];
-      table.appendChild(mkRow([model, String(m.messages), fmtTokens(m.input),
-        fmtTokens(m.output), fmtTokens(m.cacheRead), fmtTokens(m.cacheCreate)]));
-      for (const k of Object.keys(total)) total[k] += m[k];
-    }
-    if (models.length > 1) {
-      const tr = mkRow(['Total', String(total.messages), fmtTokens(total.input),
-        fmtTokens(total.output), fmtTokens(total.cacheRead), fmtTokens(total.cacheCreate)]);
-      tr.className = 'usage-total';
-      table.appendChild(tr);
-    }
-    tokGroup.appendChild(table);
-    tokGroup.appendChild(el('small', '',
-      'Counted from this machine\'s Claude Code transcripts (all projects, since midnight). Cache reads are heavily discounted against your limits.'));
-  }
-  usageBody.appendChild(tokGroup);
+  if (!usageData) { usageBody.appendChild(el('p', 'help-note', 'Loading…')); return; }
+  const agents = usageAgents();
+  if (!agents.length) { usageBody.appendChild(el('p', 'help-note', 'No agent usage available.')); return; }
+  for (const agent of agents) usageBody.appendChild(renderUsageAgent(agent));
+  usageBody.appendChild(el('small', '',
+    'Token counts are read from this machine\'s own session files (all projects, since midnight). Cache reads are heavily discounted against your limits.'));
 }
 
-async function refreshUsage() {
+// `force` (the Refresh button) skips the main process's 30 s cache; the minute
+// poll does not, so the pill costs nothing to keep current.
+async function refreshUsage(force) {
   try {
-    usageData = await window.api.usage.get();
+    usageData = await window.api.usage.get({ force: force === true });
   } catch (err) {
-    usageData = {
-      limits: [], limitsError: (err && err.message) || String(err),
-      tokens: { byModel: {} }, tokensError: null, subscriptionType: null,
-    };
+    usageData = { agents: [{
+      id: 'error', label: 'Usage', unitLabel: 'Msgs', note: '',
+      accounts: [{ id: 'error', label: 'Usage', email: '', plan: '', limits: [], error: (err && err.message) || String(err), observedAt: null }],
+      tokens: { byModel: {} }, tokensError: null,
+    }] };
   }
   renderUsagePill();
   if (usageBackdrop && !usageBackdrop.classList.contains('hidden')) renderUsageModal();
@@ -12294,7 +11958,7 @@ function openUsage() {
   if (!usageBackdrop) return;
   renderUsageModal(); // show whatever we have, then refresh in place
   usageBackdrop.classList.remove('hidden');
-  refreshUsage();
+  refreshUsage(); // the cached snapshot is at most 30 s old; ⟳ forces a fresh one
 }
 function closeUsage() { if (usageBackdrop) usageBackdrop.classList.add('hidden'); }
 
@@ -12302,7 +11966,7 @@ if (usageBtn) usageBtn.onclick = openUsage;
 const usageCloseBtn = $('usage-close');
 if (usageCloseBtn) usageCloseBtn.onclick = closeUsage;
 const usageRefreshBtn = $('usage-refresh');
-if (usageRefreshBtn) usageRefreshBtn.onclick = refreshUsage;
+if (usageRefreshBtn) usageRefreshBtn.onclick = () => refreshUsage(true);
 if (usageBackdrop) usageBackdrop.addEventListener('mousedown', (e) => { if (e.target === usageBackdrop) closeUsage(); });
 
 refreshUsage();
@@ -12328,6 +11992,10 @@ const setThemeSel = $('set-theme');
 if (setThemeSel) setThemeSel.addEventListener('change', () => {
   if (isValidTheme(setThemeSel.value)) applyTheme(setThemeSel.value);
 });
+const setAgentSel = $('set-default-agent');
+if (setAgentSel) setAgentSel.addEventListener('change', () => setDefaultAgent(setAgentSel.value));
+const setSetupBtn = $('open-setup');
+if (setSetupBtn) setSetupBtn.addEventListener('click', () => openSetupWizard({ from: 'settings' }));
 const setModelSel = $('set-default-model');
 if (setModelSel) setModelSel.addEventListener('change', () => {
   if (isValidModel(setModelSel.value)) {
@@ -12448,13 +12116,27 @@ if (window.api.onSttDownloadProgress) window.api.onSttDownloadProgress((p) => {
 // Init
 // ---------------------------------------------------------------------------
 (async function init() {
-  // Before any pane is built: panes fill their ChatGPT account dropdown from
-  // this list, and a saved default that no longer exists is reset here.
-  await refreshCodexAccounts();
-  boards = (await window.api.listBoards()) || [];
+  // Both must land before any pane is built — panes fill their ChatGPT account
+  // dropdown from the account list (and a saved default that no longer exists
+  // is reset there) — but neither needs the other, so they overlap: the sooner
+  // the hives are known, the sooner the boot spinner gives way to real content.
+  // Neither is allowed to reject: the workspace is a spinner until the line
+  // below resolves it, so a failed startup call must still reach that line.
+  const [, loaded] = await Promise.all([
+    refreshCodexAccounts().catch(() => {}),
+    Promise.resolve(window.api.listBoards()).catch(() => []),
+  ]);
+  boards = loaded || [];
   renderBoardList();
   if (boards.length) selectBoard(boards[0].id);
   else showEmpty();
+  // A profile with no hives that has never seen setup is a first run: walk the
+  // user through getting an agent connected before they hit a thread that
+  // can't start. Fires after showEmpty() so the wizard opens over the welcome
+  // screen it explains, and never when a corrupt boards.json is the reason the
+  // list is empty (loadBoards preserves that file and still returns []) — the
+  // wizard makes a new hive, it never touches the ones already saved.
+  maybeOpenSetupWizard();
   // Render immediately with safe fallbacks, then replace them with each
   // installed CLI's current, account-aware catalog without delaying startup.
   refreshAgentModels(false);

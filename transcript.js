@@ -38,6 +38,11 @@
 //   6. Self-heal: a waiting pane whose sent text is the first user message of
 //      a file another pane holds — text that owner never sent — takes the
 //      claim; the previous owner rejoins the waiting pool.
+//
+// The 'timeout' status ("couldn't find this thread's transcript") is only
+// reported for a pane that has actually sent a prompt (armTimeout): agent CLIs
+// create the session file lazily, so an idle thread simply has no transcript
+// yet — nothing to warn about.
 
 const fs = require('fs');
 const path = require('path');
@@ -47,7 +52,7 @@ const FRESH_SLACK_MS = 2000;      // spawn-time slack when judging "new" files
 const TEXT_GRACE_MS = 5000;       // newborn file, no user line yet — let text-match see it first
 const SPAWN_WINDOW_MS = 30000;    // a file born this soon after a pane spawned belongs to that spawn
 const RESUME_FALLBACK_MS = 10000; // resume panes wait this long for a new file
-const BIND_TIMEOUT_MS = 15000;    // then tell the renderer we're stuck
+const BIND_TIMEOUT_MS = 15000;    // after a prompt is sent, then say we're stuck
 const POLL_MS = 2000;             // fs.watch misses appends on Windows; poll too
 const EMIT_DEBOUNCE_MS = 50;
 const MAX_STRING = 50 * 1024;     // cap any single string field sent to renderer
@@ -137,13 +142,9 @@ function bind({ paneId, cwd, resume, sessionId, agent, codexHome }, sendFn) {
       pane.deterministic = true;
       retired.delete(file); // resuming a file a closed/respawned pane released
       claimFile(pane, file);
-      pane.timeoutTimer = setTimeout(() => {
-        pane.timeoutTimer = null;
-        if (pane.boundFile && !fs.existsSync(pane.boundFile)) {
-          pane.timedOut = true;
-          emitStatus(pane, 'timeout');
-        }
-      }, BIND_TIMEOUT_MS);
+      // No timeout clock yet — claude writes the file when it first has
+      // something to record, so an untouched thread having no transcript is
+      // normal. armTimeout starts the clock at the first prompt sent.
       return { ok: true };
     }
     // Same session claimed by another live pane (shouldn't happen — ids are
@@ -157,12 +158,6 @@ function bind({ paneId, cwd, resume, sessionId, agent, codexHome }, sendFn) {
       scanDir(dir);
     }, RESUME_FALLBACK_MS);
   }
-  pane.timeoutTimer = setTimeout(() => {
-    pane.timeoutTimer = null;
-    if (!pane.boundFile) emitStatus(pane, 'timeout');
-    // keep watching — a late file still binds
-  }, BIND_TIMEOUT_MS);
-
   emitStatus(pane, 'searching');
   scanDir(dir);
   return { ok: true };
@@ -188,6 +183,28 @@ function noteSent(paneId, text) {
   if (!t) return;
   pane.lastSent.push(t);
   if (pane.lastSent.length > LAST_SENT_MAX) pane.lastSent.shift();
+  armTimeout(pane);
+}
+
+// Start the "can't find the transcript" clock — but only for a pane that has
+// actually been given a prompt. Agent CLIs create their session file lazily
+// (claude on the first thing it records, codex often only on the first
+// message), so a thread nobody has typed into yet legitimately has no
+// transcript, and warning about that is a false alarm. Nothing is overdue
+// until something was sent; from there a missing file is real trouble.
+function armTimeout(pane) {
+  if (!pane || pane.agent !== 'claude') return; // codex rollouts stay quietly 'searching'
+  if (pane.timeoutTimer || !pane.lastSent.length) return;
+  if (pane.boundFile && fs.existsSync(pane.boundFile)) return; // already tailing
+  pane.timeoutTimer = setTimeout(() => {
+    pane.timeoutTimer = null;
+    if (!pane.boundFile) emitStatus(pane, 'timeout');
+    else if (!fs.existsSync(pane.boundFile)) {
+      pane.timedOut = true; // scanDir re-announces 'bound' when it shows up
+      emitStatus(pane, 'timeout');
+    }
+    // keep watching — a late file still binds
+  }, BIND_TIMEOUT_MS);
 }
 
 function disposeAll() {
@@ -281,7 +298,7 @@ function listSessions({ paneId, cwd } = {}) {
 
 // Read one whole session file into slim entries. `name` must be a bare
 // `.jsonl` basename that resolves inside the project's transcript dir — no
-// path traversal, same containment guard as the file/plan/todo backends.
+// path traversal, same containment guard as the file/plan backends.
 function readSession({ cwd, name } = {}) {
   if (typeof name !== 'string' || !name.endsWith('.jsonl') || path.basename(name) !== name) {
     return { ok: false, reason: 'bad-name' };
@@ -540,10 +557,8 @@ function scanDir(dir) {
         releaseFile(owner);
         emitStatus(owner, 'searching');
         clearTimeout(owner.timeoutTimer);
-        owner.timeoutTimer = setTimeout(() => {
-          owner.timeoutTimer = null;
-          if (!owner.boundFile) emitStatus(owner, 'timeout');
-        }, BIND_TIMEOUT_MS);
+        owner.timeoutTimer = null;
+        armTimeout(owner); // only if that pane ever sent a prompt of its own
         claimFile(pane, file);
         break;
       }

@@ -22,7 +22,7 @@ const PLANS_REL = '.hivemind/plans';
 // Serialize writes (and read-modify-writes) per path so two concurrent
 // Hivemind threads saving the same file, or racing gitignore appends, can't
 // interleave at the awaits and clobber each other. Same pattern as
-// todo.js/promptHistory.js. Rejections are swallowed on the stored chain so
+// promptHistory.js. Rejections are swallowed on the stored chain so
 // one failure doesn't poison later work queued behind it.
 const locks = new Map();
 function withLock(key, fn) {
@@ -105,7 +105,7 @@ async function readPlanFile(root, file) {
 // can't be read (transient IO error) or parsed (locked mid-write, truncated by
 // a crash) is reported as unreadable/corrupt — NOT as an empty list — so the
 // caller can block the save instead of overwriting real comments with `[]`.
-// Same discipline as todo.js/promptHistory.js. Backward-compatible: error
+// Same discipline as promptHistory.js. Backward-compatible: error
 // results simply omit `comments`, and existing callers fall back to `[]`.
 async function readComments(root, planId) {
   const p = planPath(root, planId, '.comments.json');

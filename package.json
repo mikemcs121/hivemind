@@ -5,6 +5,7 @@
   "main": "main.js",
   "scripts": {
     "start": "electron .",
+    "fresh": "node scripts/fresh-run.js",
     "rebuild": "electron-rebuild -f -w @homebridge/node-pty-prebuilt-multiarch",
     "fetch-model": "node scripts/fetch-model.mjs",
     "postinstall": "node scripts/fetch-model.mjs --soft",

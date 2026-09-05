@@ -13,7 +13,7 @@ The main process (`main.js`) is the privileged half of the app. It owns:
 - **PTY spawning** — one `node-pty` pseudo-terminal per pane, auto-typing a `claude`
   (or `codex`, or arbitrary) startup command with model/permission/resume/session
   flags composed from pane options (`spawnPty`, `main.js:155`).
-- **IPC hub** — every renderer capability (git, files, plans, todos, prompt history,
+- **IPC hub** — every renderer capability (git, files, plans, prompt history,
   transcripts, usage, builds, notifications, autocorrect, speech models) is a channel
   registered here, mostly inside `app.whenReady()` (`main.js:575`).
 - **`hm://` custom protocol** — serves speech-to-text assets (worker, transformers.js,
@@ -41,7 +41,7 @@ longer relying on the Electron 29 default) — it can only do what `window.api` 
 | `preload.js` | ~207 lines | Context bridge exposing `window.api` |
 | `Hivemind.cmd` | ~35 lines | Launcher: hard-links bundled `electron.exe` to `dist\Hivemind.exe` (own image name, so by-name Electron kills miss the app) and runs it on the repo dir with `--disable-gpu`; no global Node needed |
 | `package.json` | ~53 lines | `"main": "main.js"`; `npm start` → `electron .`; electron-builder config (nsis + portable targets, `asarUnpack` for models and transformers.js) |
-| `git.js`, `files.js`, `plan.js`, `todo.js`, `promptHistory.js`, `publish.js`, `codex.js`, `agent-models.js`, `build.js`, `usage.js`, `transcript.js`, `updater.js` | — | Helper modules required together near the top of `main.js`; each backs a family of IPC channels |
+| `git.js`, `files.js`, `plan.js`, `promptHistory.js`, `codex.js`, `agent-cli.js`, `agent-models.js`, `agent-setup.js`, `build.js`, `usage.js`, `transcript.js`, `updater.js` | — | Helper modules required together near the top of `main.js`; each backs a family of IPC channels |
 
 ## Key concepts
 
@@ -73,14 +73,40 @@ PTY. The command is built by string surgery on the configured `startupCommand`
   stripped; PowerShell `''` vs POSIX `'\''` escaping). This is the only safe
   delivery — typing it later could hand it to the shell if the CLI is slow.
 
-**Environment variables.** The PTY inherits a copy of `process.env` with one
-possible edit: **`CODEX_HOME`**, set for a ChatGPT thread that names a non-default
-account (see "ChatGPT accounts"). The one env var `main.js` itself honors is
+**Environment variables.** The PTY inherits a copy of `process.env` with two
+possible edits: **`CODEX_HOME`**, set for a ChatGPT thread that names a non-default
+account (see "ChatGPT accounts"), and **`PATH`**, extended by `agentCli.augmentEnv`
+(see "Finding the agent CLIs"). The one env var `main.js` itself honors is
 **`HM_USER_DATA`** (`main.js:12`): if set *before* launch,
 `app.setPath('userData', ...)` redirects the entire userData tree. This is the
 sanctioned way to run a test instance without touching the user's real
 `boards.json`/models — the user's live instance is usually running, so always
 isolate dev runs with it.
+
+**Finding the agent CLIs (`agent-cli.js`).** Because a thread *types* a bare
+command name into a shell, the CLI has to be on the PTY's `PATH` — and one very
+common install isn't. The OpenAI **Codex desktop app** ships its own CLI at
+`%LOCALAPPDATA%\OpenAI\Codex\bin\<build hash>\codex.exe`, a directory that
+changes with every update and that nothing puts on `PATH`; a ChatGPT thread on
+such a machine used to die on PowerShell's *"'codex' is not recognized as the
+name of a cmdlet"*. `agent-cli.js` collects the known-but-unlisted install
+directories (the newest Codex app build first, plus `~/.local/bin`, where the
+Claude Code installer puts `claude`), keeping only ones that exist and really
+hold the executable:
+
+- `augmentEnv(env)` **appends** them to that env's `PATH` — appends, never
+  prepends, so a CLI the user installed deliberately still wins — and writes
+  back through the env block's existing key (Windows spells it `Path`; adding a
+  second `PATH` would leave the child with two competing entries).
+- `resolveCommand(name)` searches the same augmented list and returns an
+  absolute path or null. `agent-models.js` calls exactly this, so model
+  discovery and the spawned thread always agree on which binary `codex` means.
+  `.js` is deliberately not among the tried extensions even though Windows
+  lists it in `PATHEXT` — this repo contains a `codex.js`.
+
+If nothing is found the thread still fails at the shell, and the renderer's
+`CMD_MISSING_PATTERNS` check prints the one-line "not found on PATH — install it
+with …" hint into the terminal (`docs/renderer.md`).
 
 **ChatGPT accounts.** The Codex CLI stores one signed-in account per *home
 directory* (`auth.json`, `config.toml`, sessions — all under `~/.codex`) and has
@@ -139,17 +165,47 @@ top-level `.js` files. All `handle` registrations live in `app.whenReady()` exce
 `spell:correct` (`main.js:558`, registered at module load). `updater.js` uses
 native dialogs and no renderer IPC.
 
+### The `cwd` guard — read this before adding a channel
+
+Every channel below whose payload carries a project directory is wrapped in
+**`guardCwd`** (`main.js`, next to `isKnownBoardDir`). The wrapper refuses the
+call with `{ ok: false, reason: 'denied', message }` unless `cwd` is one of the
+directories the user actually opened as a hive.
+
+This matters because the helper modules only ever guarded the *relative* path
+against the root they were handed (`files.safeJoin`, `plan`'s guards,
+`git.safeRef`) — the root itself was a free variable supplied by the renderer.
+`git:discard` on an arbitrary root is a recursive delete; `promptHistory:append`
+creates `.hivemind\` wherever it is pointed; `plan:ensureIgnored` appends to any
+`.gitignore` on the machine.
+
+**When you add a channel that takes a `cwd`, wrap it:**
+`ipcMain.handle('x:y', guardCwd((_e, { cwd }) => mod.thing(cwd)));`
+
+Exceptions, and why: `gh:clone` / `gh:listRepos` (the destination is a *new*
+directory, not yet a hive), `build:portable` (checks
+`isHivemindProject` itself), `watch:set` (an `on`, so it has no return value —
+it falls back to `clearWatch()`), and `transcript:*` (guarded inside
+`transcript.js` against `~/.claude/projects`).
+
+`guardCwd` is defense-in-depth, **not** a trust boundary: it consults
+`boards.json`, which the renderer writes. `saveBoards` validates the shape for
+that reason, but a fully compromised renderer could still add a board first. It
+converts "any path on the machine" into "a path the user deliberately opened",
+which is the property that matters when the renderer's job is displaying
+untrusted agent output.
+
 ### renderer → main, `ipcMain.handle` (invoke/response)
 
 | Channel | Payload | What it does |
 |---|---|---|
-| `boards:list` | — | Returns the parsed `boards.json` array (`[]` if missing) |
-| `boards:save` | `boards` array | Overwrites `boards.json`; returns bool |
+| `boards:list` | — | Returns the parsed `boards.json` array. `[]` when the file is **missing**; a file that exists but won't parse is copied aside as `boards.corrupt-<ts>.json` first, so hives are never silently lost (`loadBoards`) |
+| `boards:save` | `boards` array | Validates the shape (array, ≤200 entries, each an object, each `dir` absolute or empty), then writes **atomically** via a `.tmp` + rename; returns bool. Refuses rather than writing a malformed file |
 | `dialog:pickDir` | — | Native directory picker; returns path or null |
 | `dialog:pickFiles` | — | Native multi-file picker; returns path array |
-| `image:saveTemp` | `{ bytes, ext }` | Writes pasted/dropped image bytes to `os.tmpdir()/hivemind-images/`; returns path or null |
+| `image:saveTemp` | `{ bytes, ext }` | Writes pasted/dropped image bytes to `os.tmpdir()/hivemind-images/`; returns path or null. `ext` is an **allowlist** (`png jpg jpeg gif webp bmp svg avif`, anything else becomes `png`) and the payload is capped at 32 MB — sanitizing `ext` to `[a-z0-9]` still admitted `exe`/`cmd`/`ps1`, which combined with `files:open` was a renderer→code-execution path |
 | `image:fromClipboard` | — | Reads a native clipboard bitmap, saves as PNG in the same temp dir; returns path or null |
-| `attach:stage` | `{ cwd, srcPath }` | Copies a file into `<cwd>/.hivemind/attachments/` (sweeps >1-week-old copies); returns staged path or null. Rejects (before any fs write) unless `cwd` is a known board directory (`isKnownBoardDir`, backed by `loadBoards()`) |
+| `attach:stage` | `{ cwd, srcPath }` | Copies a file into `<cwd>/.hivemind/attachments/` (sweeps >1-week-old copies); returns staged path or null. **Both ends are pinned**: `cwd` must be a known board directory (`isKnownBoardDir`), and `srcPath` must sit in `os.tmpdir()/hivemind-images`, inside that board, or be a path the user picked this session via `dialog:pickFiles` (tracked in `pickedFiles`). Without the source check, staging `~/.claude/.credentials.json` would drop a token into a directory whose whole purpose is being readable by agent threads |
 | `pty:spawn` | `{ id, cwd, cols, rows, startupCommand, model, resume, permissionMode, initialPrompt, sessionId, codexAccount }` | Spawns a shell PTY, auto-types the composed agent command; returns `{ id }` |
 | `git:status` | `{ cwd }` | `git.status` — status object for the Source Control panel |
 | `git:diff` | `{ cwd, file, staged, untracked }` | Diff text for one file |
@@ -172,31 +228,22 @@ native dialogs and no renderer IPC.
 | `gh:authCancel` | — | Kill any in-flight device-flow login PTY |
 | `git:aiCommit` | `{ cwd }` | Draft a commit message from the diff via one-shot `claude -p` |
 | `hm:interpret` | `{ payload }` | Map free-form "Hivemind, …" phrasing onto the command registry via one-shot `claude -p` (`git.hmInterpret`) |
-| `files:list` / `files:open` / `files:reveal` | `{ cwd, rel }` | File Explorer: list a dir, open in OS default app, reveal in Explorer |
+| `files:list` / `files:open` / `files:reveal` | `{ cwd, rel }` | File Explorer: list a dir, open in OS default app, reveal in Explorer. `files:open` **refuses executable extensions** (`.exe .bat .cmd .ps1 .js .vbs .lnk .reg .hta …`, `EXECUTABLE_EXTS` in `files.js`) — `shell.openPath` on those is `ShellExecute`, i.e. running code, and the path guards only prove the file is *inside* the project, which is exactly where agent output lands. Use Reveal instead |
 | `plan:read` / `plan:write` | `{ cwd, planId [, content] }` | Read/write `.hivemind/plans/<planId>.md` |
 | `plan:readFile` | `{ cwd, file }` | Read a native plan-mode file by absolute path (guarded to `~/.claude/plans` + project `.hivemind/plans`) |
 | `plan:comments:read` / `plan:comments:write` | `{ cwd, planId [, comments] }` | Highlight-comment sidecar JSON |
 | `plan:clear` | `{ cwd, planId }` | Delete a plan |
-| `plan:ensureIgnored` / `todo:ensureIgnored` / `promptHistory:ensureIgnored` | `{ cwd }` | All call `plan.ensureIgnored` — add `.hivemind/` to the project `.gitignore` |
-| `todo:read` / `todo:write` | `{ cwd [, todos] }` | Per-hive checklist in `.hivemind/todos.json` |
+| `plan:ensureIgnored` / `promptHistory:ensureIgnored` | `{ cwd }` | Both call `plan.ensureIgnored` — add `.hivemind/` to the project `.gitignore` |
 | `promptHistory:read` / `promptHistory:append` / `promptHistory:write` | `{ cwd [, entry \| entries] }` | Per-hive prompt log in `.hivemind/prompt-history.json` |
-| `publish:config` | `{ cwd }` | Publish settings for this project — **`hasPassword` only, never the password** (`publish.getConfig`) |
-| `publish:setConfig` | `{ cwd, patch }` | Validate + merge host/port/user/remoteDir/siteUrl/security/insecureCert/files (`password` in the patch is routed to `setPassword`) |
-| `publish:setPassword` | `{ cwd, password }` | Encrypt with `safeStorage` (DPAPI) and store; `''` clears it |
-| `publish:forget` | `{ cwd }` | Delete this project's whole publish record |
-| `publish:scan` | `{ cwd }` | Expand the allowlist to concrete files with `changed` flags + skipped-entry `problems` |
-| `publish:test` | `{ cwd }` | `NLST` the remote folder as a credential/path check |
-| `publish:run` | `{ cwd, all }` | Upload changed (or all) files; streams `publish:progress` |
-| `publish:cancel` | `{ cwd }` | Stop the running publish after the current file |
-| `publish:deny` | `{ rels }` | Which paths the denylist refuses, and why (for the picker) |
 | `codex:accounts` | — | ChatGPT accounts: `{ id, label, home, builtin, signedIn, email, plan, method }` each, Default first. No tokens |
 | `codex:addAccount` | `{ label }` | Creates a Codex home for a new account (seeded with the default home's `config.toml`); returns `{ ok, id, accounts }` or `{ ok: false, error }` |
 | `codex:renameAccount` | `{ id, label }` | Relabels an account; the home is untouched, so live threads keep working |
 | `codex:removeAccount` | `{ id }` | Forgets an account and deletes its Codex home. Refuses `default` and anything outside the accounts root |
 | `codex:signOutAccount` | `{ id }` | Signs out while keeping the account/settings. Managed homes delete their isolated `auth.json`; Default runs `codex logout` so OS-keyring credentials are cleared too |
 | `agents:models` | `{ provider, codexAccount?, force? }` | Sanitized `{value,label}` model choices discovered from the installed CLI. Codex uses `codex debug models` with the selected account's `CODEX_HOME`; Grok uses `grok models`; Claude merges rolling aliases advertised by `claude --help` with stable fallbacks. Results cache for five minutes and never expose raw CLI output |
+| `agents:detect` | — | `agentSetup.detect()` — one record per agent (`installed`, `signedIn`, plus the fixed label/blurb/install/docs strings) and the `anyInstalled`/`anyReady` summaries the first-run wizard opens on. **Filesystem only**: `agent-cli.resolveCommand` for the binary (the same lookup a thread's PATH gets) and the CLI's own credential file for the login. Nothing is spawned — the wizard polls this every few seconds while the user installs a CLI in another window, and a cold `codex debug models` would cost seconds. `signedIn` is `true`/`false`/`null`, where null means unreadable (an OS keyring): never guessed as `false`. No token, credential path or CLI output crosses IPC |
 | `open:external` | `{ url }` | `shell.openExternal` for http/https/mailto only; returns `{ ok }` |
-| `usage:get` | — | Rate-limit windows + today's token totals (`usage.getUsage`) |
+| `usage:get` | `{ force }` | Per-agent (Claude / ChatGPT) rate-limit windows + today's token totals (`usage.getUsage`); `force` bypasses the module's 30 s cache |
 | `transcript:bind` | opts (paneId, cwd, sessionId, …) | Bind a chat pane to its Claude session JSONL; entries stream back via events |
 | `transcript:sessions` | opts | List a project's past sessions |
 | `transcript:session` | opts | Read one past session for the read-only overlay |
@@ -233,7 +280,6 @@ native dialogs and no renderer IPC.
 | `transcript:status` | `{ paneId, status, file }` | Transcript binding status change (`transcript.js:921`) |
 | `stt:downloadProgress` | `{ repo, done, total, file, bytes, totalBytes }` | Speech-model download progress; byte fields update ≤4×/s so big native models show MB progress |
 | `build:progress` | `{ line }` | Portable build progress line (`main.js:897`) |
-| `publish:progress` | `{ phase, rel, index, total, ok?, message?, attempt? }` | Per-file FTP upload progress; `phase` is `start`/`file`/`retry` |
 | `gh:authStatus` | `{ phase, code?, url?, user?, message? }` | GitHub device-flow login progress (`startGhAuth`): `phase` is `starting`/`code`/`success`/`error` |
 
 ## Preload API
@@ -252,19 +298,18 @@ above). Every `on*` subscription returns an unsubscribe function.
 | `git.status/diff/stage/stageAll/unstage/unstageAll/discard/commit/branches/checkout/createBranch/init/fetch/pull/push/resetToRemote` | matching `git:*` channels |
 | `git.remoteUrl/setRemote/ghCheck/ghCreateRepo/aiCommitMessage` | `git:remoteUrl` / `git:setRemote` / `gh:check` / `gh:createRepo` / `git:aiCommit` |
 | `git.ghListRepos/ghClone/ghAuthStart/ghAuthCancel/onGhAuthStatus` | `gh:listRepos` / `gh:clone` / `gh:authStart` / `gh:authCancel` / `gh:authStatus` event |
+| `agentModels(provider, codexAccount, force)` / `detectAgents()` | `agents:models` / `agents:detect` |
 | `hm.interpret(payload)` | `hm:interpret` |
 | `setWatch(cwd)` / `onFsChanged(cb)` | `watch:set` / `fs:changed` event |
 | `files.list/open/reveal(cwd, rel)` | `files:*` |
-| `publish.config\setConfig\setPassword\forget\scan\test\run\cancel\deny\onProgress` | `publish:*` (`publish:progress` event) |
 | `plan.read/readFile/write/readComments/writeComments/clear/ensureIgnored` | `plan:*` (comments map to `plan:comments:read`/`write`) |
-| `todo.read/write/ensureIgnored(cwd, …)` | `todo:*` |
 | `promptHistory.read/append/write/ensureIgnored` | `promptHistory:*` |
 | `transcript.bind/unbind/noteSent/listSessions/readSession/refresh` | `transcript:bind`/`unbind`/`noteSent`/`sessions`/`session`/`refresh` |
 | `transcript.onEntries(cb)` / `transcript.onStatus(cb)` | `transcript:entries` / `transcript:status` events |
 | `spellCorrect(word)` | `spell:correct` (**sendSync**) |
 | `openExternal(url)` | `open:external` |
 | `build.isHivemind(cwd)` / `build.portable(cwd)` / `onBuildProgress(cb)` | `build:isHivemind` / `build:portable` / `build:progress` event |
-| `usage.get()` | `usage:get` |
+| `usage.get({ force })` | `usage:get` |
 | `stt.ensureModel(repo)` / `stt.nativeLoad(repo)` / `stt.nativeTranscribe(audio)` / `stt.nativeStop()` / `onSttDownloadProgress(cb)` | `stt:ensureModel` / `stt:nativeLoad` / `stt:nativeTranscribe` / `stt:nativeStop` / `stt:downloadProgress` event |
 | `notify(payload)` / `onFocusPane(cb)` | `notify` / `focus-pane` event |
 
@@ -273,9 +318,19 @@ above). Every `on*` subscription returns an unsubscribe function.
 Main-process reads/writes (helper modules add more inside each project's
 `.hivemind/` and `~/.claude/`):
 
-- **`<userData>/boards.json`** (`boardsFile`, `main.js:118`) — a JSON array of board
-  objects, treated as opaque by main (the renderer defines the shape: name, dir,
-  panes, layout, settings). Written pretty-printed on every `boards:save`.
+- **`<userData>/boards.json`** (`boardsFile`) — a JSON array of board
+  objects, mostly opaque to main (the renderer defines the shape: name, dir,
+  panes, layout, settings); main validates only the outer structure and that
+  each `dir` is absolute. Written pretty-printed on every `boards:save`, via a
+  `.tmp` file + rename so a crash can't leave a half-written file.
+  `loadBoards` memoizes the parse in `boardsCache` (invalidated on save) —
+  `isKnownBoardDir` now runs on every guarded IPC call, and it must not
+  re-read the file each time.
+  **Missing vs unreadable are different:** missing → `[]`; present but
+  unparseable → copied to `boards.corrupt-<ts>.json`, *then* `[]`. Collapsing
+  the two (the old behaviour) meant one bad file showed the empty state and the
+  next `persist()` wrote `[]` over every hive the user had. A UTF-8 BOM is
+  stripped before parsing rather than treated as corruption.
 - **`<userData>/models/<repo>/…`** — downloaded speech-model files
   (`stt:ensureModel`, `main.js:858`); served via `hm://models`.
 - **`os.tmpdir()/hivemind-images/`** — pasted/dropped screenshots (`paste-*` /
@@ -283,7 +338,7 @@ Main-process reads/writes (helper modules add more inside each project's
   `main.js:945`).
 - **`<project>/.hivemind/attachments/`** — staged attachment copies (`attach:stage`,
   `main.js:683`); also swept of >1-week-old files per call.
-- Via helpers: `.hivemind/plans/*.md` + comment sidecars, `.hivemind/todos.json`,
+- Via helpers: `.hivemind/plans/*.md` + comment sidecars,
   `.hivemind/prompt-history.json`, the project's `.gitignore` (ensureIgnored), and
   read-only tailing of `~/.claude/projects/**/*.jsonl` transcripts.
 - **Chromium spell-check dictionary** — custom words added via the context menu are
@@ -318,9 +373,16 @@ Main-process reads/writes (helper modules add more inside each project's
   embeds it and the updater compares it against releases.
 - **Window teardown kills all PTYs**, disposes transcript tails, clears the fs watcher
   (`clearWatch()`), and stops the native STT engine (`stopNativeStt`) on
-  `window-all-closed` (`main.js:958`); there is no PTY persistence across restarts —
+  `window-all-closed`; there is no PTY persistence across restarts —
   panes are *re-created* from `boards.json` (optionally resuming Claude sessions
   via `--resume`/`--continue`).
+- **Losing the renderer also kills all PTYs** (`killAllPtys`, wired to
+  `render-process-gone` and a main-frame `did-start-navigation` in
+  `createWindow`). The renderer is the only thing that knows which pane owns
+  which pty id, so a crash or a Ctrl+R reload orphans every shell: they keep
+  running, keep their agent CLIs alive against the project, and keep pushing
+  `pty:data` for ids nothing can address — while the reloaded renderer spawns a
+  second full set from the persisted layout.
 - **Navigation lockdown** (`main.js:322`–`337`): the renderer must never navigate or
   open child windows (they'd inherit the preload). External links must go through
   `open:external` / the window-open handler, both restricted to http/https/mailto.

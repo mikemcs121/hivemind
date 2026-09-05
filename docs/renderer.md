@@ -16,7 +16,7 @@ pre-existing elements from `index.html`.
 The renderer never touches Node APIs directly. Everything OS/process-shaped (PTYs,
 git, filesystem, transcripts, notifications, spell check, builds) goes through the
 `window.api.*` context bridge defined in `preload.js` and implemented in `main.js`
-and its helper modules (`git.js`, `files.js`, `transcript.js`, `plan.js`, `todo.js`,
+and its helper modules (`git.js`, `files.js`, `transcript.js`, `plan.js`,
 `promptHistory.js`, `build.js`, …).
 
 Terminology: a **board** ≡ a **hive** (a project directory); a **pane** ≡ a
@@ -48,7 +48,7 @@ UI says hive/thread.
 | 1022–1103 | Thread captions (rebuilt from keystrokes) | `feedCaptionInput`, `REPLY_WORDS`, `isReplyLike`, `commitCaption`, `setPaneCaption`, `sendToPane` |
 | 1105–1170 | Prompt delivery to a PTY — bracketed paste, size-scaled Enter delay, screen-verified Enter retry when the submit gets swallowed as part of the paste burst | `typePrompt`, `SUBMIT_RETRY_MS`, `confirmSubmit`, `deliverPrompt` |
 | 1136–1310 | **Hivemind command** plumbing: wake word, fuzzy match, toast | `HM_WAKE_RE`, `HM_WAKE_MISHEARD`, `hmLooksLikeWake`, `matchHivemindCommand`, `hmToast`, `boardPanes`, `findPaneByName`, `HM_PASS`, `hmRouteTaskTo`, `hmExtractTask`, `hmResolveModel` |
-| 1311–1842 | **HM_COMMANDS registry** — ordered command list; `help` HTML per entry feeds the Help modal | `HM_COMMANDS` (entries: help, open-chat, add-todo, new-thread, new-hive, tell, close-thread, rename-thread, maximize, voice-*, interrupt, focus-thread, switch-hive, font-*, theme, model, agent, permission-mode, panel, show-plan, show-diff, publish-site, show-terminal/chat, attach, history, settings, usage, build, task-in-thread, find, …) |
+| 1311–1842 | **HM_COMMANDS registry** — ordered command list; `help` HTML per entry feeds the Help modal | `HM_COMMANDS` (entries: help, open-chat, new-thread, new-hive, tell, close-thread, rename-thread, maximize, voice-*, interrupt, focus-thread, switch-hive, font-*, theme, model, agent, permission-mode, panel, show-plan, show-diff, show-terminal/chat, attach, history, settings, usage, build, task-in-thread, find, …) |
 | 1844–1965 | Command dispatch + AI fallback | `renderHmCommandHelp` (generates `#hm-cmd-list`), `hmDispatch`, `hmNormalize`, `hmInterpretRequest` (`window.api.hm.interpret`), `runHivemindCommand` |
 | 1967–2206 | **Chat with Hivemind** sidebar panel | `hmChatLog`, `hmChatOpen/Close/Toggle`, `setHmChatOpen`, `hmChatSubmit`, `hmChatDispatch`, `hmChatEditStart`, `hmChatVoiceCommit`, `hmChatVoiceSend`, `hmSpeak`, `wireHmChat`, Ctrl+Shift+H listener |
 | 2208–2262 | Image drop/paste helpers, codex attachment staging | `isImageFile`, `persistImage`, `quotePath`, `pathInsideDir`, `stagePathForPane`, `typePathIntoPane` |
@@ -63,7 +63,7 @@ UI says hive/thread.
 | 3937–3996 | `$` helper; sidebar-resizer drag; top-level DOM refs | `$`, `SIDEBAR_W_*`, `boardListEl`, `gridEl`, `emptyState`, `boardTitle`, `addTermBtn`, `buildBtn` |
 | 3998–4082 | **Layout persistence** | `persist`, `serializeLayout`, `persistLayout`, `rebuildFromLayout` |
 | 4084–4221 | Board list render + reorder; board switching | `renderBoardList`, `reorderBoards`, `selectBoard` |
-| 4223–4395 | **Grid layout** (columns/panes/gutters, tmux-style zoom) | `layout`, `toggleZoom`, `paneLabel`, `buildZoomTabs`, `refreshZoomTabs`, `makeGutter`, `startDrag` |
+| 4223–4395 | **Grid layout** (columns/panes/gutters, tmux-style zoom) | `MAX_COLS`, `layout`, `toggleZoom`, `paneLabel`, `buildZoomTabs`, `refreshZoomTabs`, `makeGutter`, `startDrag` |
 | 4397–4521 | Pane creation entry points | `PANE_NAMES`, `pickPaneName`, `addTerminal`, `spawnPanePty` |
 | 4523–4888 | **`createPane`** — builds the pane header (dot, title, plan chip, cost, status, agent/model/perm selects, view/font/zoom/close buttons), find bar, xterm Terminal + FitAddon + SearchAddon, drag/paste of images, `term.attachCustomKeyEventHandler` (Ctrl+V/F/±/0) | `createPane` |
 | 4890–4978 | Rename, find bar, close, focus | `beginRename`, `openFind`, `closeFind`, `closePane`, `focusedPane`, `focusPane` |
@@ -74,22 +74,21 @@ UI says hive/thread.
 | 5391–6514 | **Source Control panel** + Build Portable | `gitToggle/gitPanel/gitBody`, `activeBoard`, `activeDir`, `updateBuildButton`, `startPortableBuild`, `buildStageLabel`, `setGitOpen`, `gitRun`, `refreshGit`, `autoFetchGit`, `renderGitState`, `renderBranchBar`, `doRevertToRemote`, `renderCommitBox`, `doPull`, `doPush`, `doGenerateCommitMsg`, `renderSection`, `renderFileRow` |
 | 6516–6679 | File Explorer panel | `filesToggle`, `setFilesOpen`, `refreshFiles`, `renderFxItem`, `openFile`, `insertPathIntoPane` |
 | 6681–6753 | As-you-type autocorrect (all spellchecked fields) | `autocorrectEnabled`, `acEligibleField`, `acWordAt`, `acApply`, document `input`/`keydown` listeners |
-| 6755–7447 | **Publish panel** (FTP upload; settings live in userData — see `docs/publish.md`) | `publishToggle`, `setPublishOpen`, `refreshPublish`, `pubRun`, `renderPublish`, `renderPubFileRow`, `renderPublishForm`, `doPublish`, `doPublishCancel`, `doPublishTest`, `doPublishForgetPassword`, `doPublishForget`, `openPublishPicker`, `buildPubPickLevel`, `buildPubPickRow`, `publish.onProgress` handler |
-| 7449–7848 | **Todo panel** (`.hivemind/todos.json`, nested items) | `todoToggle`, `setTodoOpen`, `refreshTodo`, `saveTodo`, `addTodo`, `matchTodoPrefix` (`TODO_PREFIX_RE`), `addTodoItem`, `captureTodo`, `addSubTodo`, `normalizeTodos`, `pushTodoToThread`, `startEditTodo`, `renderTodo`, `buildTodoList` |
-| 7850–8062 | **Prompt History panel** (`.hivemind/prompt-history.json`) | `historyToggle`, `setHistoryOpen`, `refreshHistory`, `renderHistory`, `repostPrompt`, `revealPrompt`, `jumpToChatRow`, `recordPromptHistory` |
-| 8064–8366 | **Plan review — detection** (transcript + screen) | `PLAN_FILE_RE`, `PLAN_MENU_*_RE`, `PLAN_APPROVED_RE`, `panePlan`, `planSetState`, `updatePlanChip`, `planScanEntries`, `planApplyResult`, `parsePlanMenu`, `planCardText`, `planScreenCheck`, `planBecameReady` |
-| 8368–8598 | Plan review window | `planOpen`, `openPlanReview`, `closePlanReview`, `requestPlanFromThread`, `refreshPlanReview`, `startPlanPoll`/`planPollTick`, `renderPlanDocState`, `renderPlan`, `paintPlanActions` |
-| 8600–8779 | **Markdown renderer** (dependency-free, GFM subset) + checkbox write-back | `mdInline`, `parseMdList`, `markdownToHtml`, `highlightOccurrence`, `plan-link` click handler, `plan-check` change handler |
-| 8781–9064 | Plan comments + Approve / Request changes | `planCommentsKey`, `renderCommentList`, `saveDraftComment`, `resolveComment`, `persistComments`, `planAnswerMenu`, `planAwaitScreen`, `planSendFeedback` |
-| 9066–9330 | Chat-card embedded plan review | `cardPlanComments`, `cardPersistComments`, `refreshCardPlan`, `buildCardPlanReview` |
-| 9332–9459 | Diff viewer, branch menu, **global Escape handler** | `showDiff`, `escapeHtml`, `renderDiff`, `openBranchMenu`, `switchBranch`, Escape keydown at ~8143 |
-| 9461–9975 | Connect-to-GitHub wizard; **Clone-from-GitHub wizard** (New-hive modal); tiny DOM helpers | `openGitHubWizard`, `renderWizardChoice`, `startCreateFlow`, `doCreateRepo`, `renderLinkStep`, `doLink`, `renderDone`, `wizardActions`, `openCloneWizard`, `cloneStepCheck`, `renderCloneSignin`, `startCloneAuth`, `renderCloneChoose`, `cloneDoClone`, `el`, `mkBtn`, `mkMini` |
-| 9977–10876 | **Voice typing** — dictionary, correction learning, STT worker, VAD, capture, hotkey | `VOICE_DEFAULT_DICT`, `voiceDict`, `applyVoiceDict`, `STT_MODELS`, `sttModelId`, `VOICE_ENTER_RE`, `voiceLearnRecord/Harvest/FromTexts`, `vlTokens`, `vlAlign`, `voiceSuggestShow`, `currentVoicePane`, `commitVoiceText`, `resetSttWorker`, `ensureSttWorker`, `bootSttWorker`, `flushSegment`, `onAudioFrame`, `onVadVerdict`, `applyVadDecision`, `startCapture`, `stopCapture`, `startVoice`, `stopVoice`, `toggleVoice`, `voiceErrMessage`, HUD fns, `~` hotkey listener (~9262) |
-| 10878–11050 | **Settings modal** (tabbed General/Voice) | `settingsBackdrop`, `setSettingsTab`, `renderVoiceDict`, `upsertVoiceDict`, `addVoiceDictEntry`, `syncVoiceFields`, `syncGeneralFields`, `openSettings`, `closeSettings` |
-| 11052–11483 | Voice dictionary **training** modal | `voiceTrainState`, `vtExtractTerms`, `VT_TEMPLATES`, `vtGenerateSentences`, `vtPickPrompts`, `vtBuildSession`, `voiceTrainCommit`, `voiceTrainCheck`, `voiceTrainAdvance`, `vtSessionFromText`, `openVoiceTraining`, `closeVoiceTraining` |
-| 11485–11637 | Claude **usage** pill + modal | `fmtTokens`, `fmtReset`, `usageSeverity`, `renderUsagePill`, `renderUsageModal`, `refreshUsage` (60 s interval), `openUsage`, `closeUsage` |
-| 11639–11736 | Help modal open/close; Settings-tab control wiring | `openHelp`, `closeHelp`, `set-theme`/`set-default-model`/`set-default-font`/`set-notify`/`set-plan-autopopup`/`set-autocorrect` handlers, voice checkbox/model handlers |
-| 11738–11746 | **Init** — load boards, select first or show empty | `init` IIFE |
+| 7497–7709 | **Prompt History panel** (`.hivemind/prompt-history.json`) | `historyToggle`, `setHistoryOpen`, `refreshHistory`, `renderHistory`, `repostPrompt`, `revealPrompt`, `jumpToChatRow`, `recordPromptHistory` |
+| 7710–8011 | **Plan review — detection** (transcript + screen) | `PLAN_FILE_RE`, `PLAN_MENU_*_RE`, `PLAN_APPROVED_RE`, `panePlan`, `planSetState`, `updatePlanChip`, `planScanEntries`, `planApplyResult`, `parsePlanMenu`, `planCardText`, `planScreenCheck`, `planBecameReady` |
+| 8012–8245 | Plan review window | `planOpen`, `openPlanReview`, `closePlanReview`, `requestPlanFromThread`, `refreshPlanReview`, `startPlanPoll`/`planPollTick`, `renderPlanDocState`, `renderPlan`, `paintPlanActions` |
+| 8247–8426 | **Markdown renderer** (dependency-free, GFM subset) + checkbox write-back | `mdInline`, `parseMdList`, `markdownToHtml`, `highlightOccurrence`, `plan-link` click handler, `plan-check` change handler |
+| 8428–8711 | Plan comments + Approve / Request changes | `planCommentsKey`, `renderCommentList`, `saveDraftComment`, `resolveComment`, `persistComments`, `planAnswerMenu`, `planAwaitScreen`, `planSendFeedback` |
+| 8713–8975 | Chat-card embedded plan review | `cardPlanComments`, `cardPersistComments`, `refreshCardPlan`, `buildCardPlanReview` |
+| 8976–9090 | Diff viewer, branch menu, **global Escape handler** | `showDiff`, `escapeHtml`, `renderDiff`, `openBranchMenu`, `switchBranch` |
+| 9091–9609 | Connect-to-GitHub wizard; **Clone-from-GitHub wizard** (New-hive modal); tiny DOM helpers | `openGitHubWizard`, `renderWizardChoice`, `startCreateFlow`, `doCreateRepo`, `renderLinkStep`, `doLink`, `renderDone`, `wizardActions`, `openCloneWizard`, `cloneStepCheck`, `renderCloneSignin`, `startCloneAuth`, `renderCloneChoose`, `cloneDoClone`, `el`, `mkBtn`, `mkMini` |
+| (after the wizards) | **First-run setup wizard** — agent detection, install/sign-in step, first hive | `setupBackdrop`/`setupBody`/`setupMsg`, `SETUP_DONE_KEY`, `SETUP_RECHECK_MS`, `setupState`, `setupIsOpen`, `setupRecord`, `setupRefreshDetect`, `startSetupRecheck`/`stopSetupRecheck`, `openSetupWizard`, `closeSetupWizard`, `setupAgentStatus`, `setupAgentCard`, `renderSetupPick`, `setupCheckRow`, `setupInstallBlock`, `renderSetupConnect`, `renderSetupHive`, `finishSetup`, `maybeOpenSetupWizard` |
+| 9611–10535 | **Voice typing** — dictionary, correction learning, STT worker, VAD, capture, hotkey | `VOICE_DEFAULT_DICT`, `voiceDict`, `applyVoiceDict`, `STT_MODELS`, `sttModelId`, `VOICE_ENTER_RE`, `voiceLearnRecord/Harvest/FromTexts`, `vlTokens`, `vlAlign`, `voiceSuggestShow`, `currentVoicePane`, `commitVoiceText`, `resetSttWorker`, `ensureSttWorker`, `bootSttWorker`, `flushSegment`, `onAudioFrame`, `onVadVerdict`, `applyVadDecision`, `startCapture`, `stopCapture`, `startVoice`, `stopVoice`, `toggleVoice`, `voiceErrMessage`, HUD fns, `~` hotkey listener |
+| 10537–10838 | **Settings modal** (tabbed General/Voice) + ChatGPT accounts | `settingsBackdrop`, `setSettingsTab`, `renderVoiceDict`, `upsertVoiceDict`, `addVoiceDictEntry`, `syncVoiceFields`, `syncGeneralFields`, `openSettings`, `closeSettings` |
+| 10840–11226 | Voice dictionary **training** modal | `voiceTrainState`, `vtExtractTerms`, `VT_TEMPLATES`, `vtGenerateSentences`, `vtPickPrompts`, `vtBuildSession`, `voiceTrainCommit`, `voiceTrainCheck`, `voiceTrainAdvance`, `vtSessionFromText`, `openVoiceTraining`, `closeVoiceTraining` |
+| 11228–11469 | Per-agent **usage** pill + modal (Claude + ChatGPT) | `fmtTokens`, `fmtReset`, `fmtAge`, `usageSeverity`, `agentLimits`, `agentTop`, `accountTitle`, `renderUsagePill`, `renderUsageAccount`, `renderUsageTokens`, `renderUsageAgent`, `renderUsageModal`, `refreshUsage` (60 s interval; `force` only from ⟳), `openUsage`, `closeUsage` |
+| 11471–11604 | Help modal open/close; Settings-tab control wiring | `openHelp`, `closeHelp`, `set-theme`/`set-default-model`/`set-default-font`/`set-notify`/`set-plan-autopopup`/`set-autocorrect` handlers, voice checkbox/model handlers |
+| 11606–11623 | **Init** — load accounts + boards in parallel, select first or show empty (clears the boot state) | `init` IIFE, `hideBootState` |
 
 ## Core data model
 
@@ -97,6 +96,9 @@ UI says hive/thread.
 
 - `boards` (`renderer.js:8`) — array of `{ id, name, dir, startupCommand, resumeOnStart, muted, layout }`. Loaded via `window.api.listBoards()` in `init`, saved whole via `persist()` → `window.api.saveBoards`.
 - `grids` — `Map<boardId, grid>` where a grid is `{ el, columns: [{ el, flex, panes: [pane] }], zoomed?: pane }`. Built lazily the first time a board is selected (`selectBoard`, `renderer.js:~4175`). Switching boards only toggles `display` — PTYs and terminals keep running in the background.
+- Tiling (`addTerminal`): new threads add a column until `MAX_COLS` (3, `renderer.js:~5281`), then
+  wrap — the next pane stacks into the shortest existing column. Saved layouts are replayed
+  verbatim by `rebuildFromLayout`, so a hive tiled wider before the cap keeps its columns.
 - Layout persistence: `serializeLayout` captures columns/flex plus per-pane metadata (name, agent, model, codexModel, perm, fontSize, flex, caption, autoName, planId/planFile/planSource, sessionId, view, chatFilters). PTYs are never serialized. `rebuildFromLayout` recreates panes on startup and respawns each PTY (resume-on-start uses `--resume <sessionId>`).
 
 ### pane
@@ -125,6 +127,27 @@ Created in `createPane` (`renderer.js:~4523`). The important fields:
 `pane.chat` (built in `initChatUI`, `renderer.js:~2309`) holds the chat DOM (`wrap, list, input, sendBtn, notice, chips, attachRow, topic, working, historyBtn/Menu/Bar`), render maps (`byKey` row-key→element, `toolByUseId`, `pendingResults`, `pendingQuestions`, `pendingEcho` — each entry carries an `ECHO_STALL_MS` timer that marks the bubble "⚠ no response yet" if the transcript never echoes it back and the pane isn't busy, cleared by `confirmEcho`), history-view state (`viewingHistory`, `historySession`), composer state (`attachments`, `history`, `histIdx`, `histDraft`, `ac`), and `pinned` (auto-scroll).
 
 ### xterm wiring
+
+**In-chat CLI interaction:** `setChatInteraction` moves the existing `.pane-term`
+host into `.chat-interaction`, below the message list. The **Interact** toolbar,
+question-card, sign-in, missing-transcript, and stalled-message buttons open it;
+**Done** returns the host to `.pane-body` and focuses the composer. There is one
+xterm and one PTY throughout. View changes and history browsing close the panel;
+the existing resize observer also watches its size. Clicking inside it must keep
+focus on xterm so arrows, Tab, paste, and custom answers reach the CLI.
+
+`chatComposerBlocked` distinguishes live menus, pending tool questions, sign-in,
+and explicit y/n or press-Enter prompts from ordinary prose questions. It gates
+the composer, `sendChatMessage`, `typePrompt`'s delayed Enter, and `confirmSubmit`.
+An `attention` status alone must not prevent a normal follow-up from submitting.
+Generic prompt-card quick keys also require the screen to match their rendered
+snapshot at click time.
+
+Claude 2.1.261 can flush an unanswered AskUserQuestion into the transcript.
+While a screen card is live, transcript question rows are temporarily hidden
+with `.screen-question-covered`, then restored when the menu disappears so the
+answered record remains visible. The screen card includes CLI-added custom-answer
+options; choosing **Type something** or **Chat about this** opens Interact.
 
 - Terminal options set in `createPane`: `fontFamily` Cascadia Code, `scrollback: 5000`, `theme: THEME` (a mutable object `applyTheme` rewrites), and on Windows `windowsPty: { backend: 'conpty' }` — required so full-screen TUI reflow matches ConPTY.
 - IO: `term.onData` → `sendToPane` → `window.api.writePty`; `window.api.onPtyData` → `pane.term.write` + `markActivity`; `onPtyExit` → state `'dead'`.
@@ -175,12 +198,80 @@ session file, so the resumed thread comes back at an empty composer and reads as
 `src/index.html` is a static skeleton; renderer.js fills and wires it. Main regions:
 
 - `#app` → `#sidebar` + `#sidebar-resizer` + `#workspace`.
-- **Sidebar**: `.sidebar-header` (logo, `#add-board` ＋), `#board-list` (hive `<li class="board-item">` rows with status dot, badge, ✎/🗑 actions, drag-reorder), six docked panels that replace the board list when open — `#files-panel`, `#git-panel` (`#git-body`, `#git-msgbar`), `#publish-panel` (`#publish-body`, `#publish-msgbar`), `#todo-panel` (`#todo-input`, `#todo-body`, `#todo-footer`), `#hm-chat` (`#hm-chat-log`, `#hm-chat-input`, `#hm-chat-send`), `#history-panel` — then `.sidebar-actions` (toggle buttons `#files-toggle`, `#git-toggle`, `#publish-toggle`, `#todo-toggle`, `#history-toggle`, `#hm-chat-toggle`). Panels are mutually exclusive: each `setXOpen(true)` closes the siblings, and the sidebar gets a `files-open`/`git-open`/`publish-open`/`todo-open`/`history-open`/`hm-open` class.
-- **Workspace**: `#board-bar` (`#board-title`, `#board-meta`, `#usage-btn` pill, `#voice-toggle` 🎤, `#settings-btn` ⚙, `#help-btn` ❔, `#add-term` "＋ Thread"), `#grid` (holds one `.board-grid` per opened hive; inside, `.column` > `.pane` separated by `.gutter-col`/`.gutter-row`), plus overlays `#voice-hud`, `#hm-toast`, `#voice-suggest`, `#empty-state`.
+- **Sidebar**: `.sidebar-header` (logo, `#add-board` ＋), `#board-list` (hive `<li class="board-item">` rows with status dot, badge, ✎/🗑 actions, drag-reorder), four docked panels that take over the board list's space when open — `#files-panel`, `#git-panel` (`#git-body`, `#git-msgbar`), `#hm-chat` (`#hm-chat-log`, `#hm-chat-input`, `#hm-chat-send`), `#history-panel` — then `.sidebar-actions` (toggle buttons `#files-toggle`, `#git-toggle`, `#history-toggle`, `#hm-chat-toggle`). Panels are mutually exclusive: each `setXOpen(true)` closes the siblings, and the sidebar gets a `files-open`/`git-open`/`publish-open`/`history-open`/`hm-open` class. `syncSidebarPanelState()` derives one more class from those, `panel-open`, which collapses `#board-list` to just `.board-item.active` — the hive you are working on stays pinned above whichever panel is showing. Clicking that pinned row toggles `hives-peek` on the sidebar (full list, capped at 45% height) so hives stay switchable without closing the panel; any panel open/close and any hive switch clears it.
+- **Workspace**: `#board-bar` (`#board-title`, `#board-meta`, `#usage-btn` pill (holds one `.usage-seg` span per agent, filled by `renderUsagePill`), `#voice-toggle` (inline SVG mic), `#settings-btn` ⚙, `#help-btn` ❔, `#add-term` "＋ Thread"), `#grid` (holds one `.board-grid` per opened hive; inside, `.column` > `.pane` separated by `.gutter-col`/`.gutter-row`), plus overlays `#voice-hud`, `#hm-toast`, `#voice-suggest`, `#boot-state` (see Boot state) and `#empty-state` (`.empty-actions` holds `#empty-setup` → the setup wizard and `#empty-add-board` → the New-hive modal).
 - **Pane** (all built in `createPane`, no HTML template): `.pane` > `.pane-header` (`.dot`, `.title-wrap`, `.pane-plan-chip`, `.cost`, `.status`, agent/model/codex/perm `<select class="model-select">`, `.view-btn`, `.font-btn` A−/A+, `.zoom-btn` ⛶, ✕) + `.find-bar` + `.pane-body` (`.pane-term` xterm host + `.chat-wrap` overlay from `initChatUI`). The chat view **covers** the terminal (absolute positioning); the terminal is never `display:none` so fit stays correct. `.pane` state classes: `focused`, `zoomed`, `done`, `drag-over`, `term-view`, `term-chat`.
-- **Modals** (all `<div id="X-backdrop" class="hidden"><div id="X-modal">…` and closed by clicking the backdrop): `#modal-backdrop` (hive create/edit: `#modal-name/dir/cmd/resume/muted`), `#diff-backdrop`, `#plan-backdrop` (plan review: `#plan-doc-body`, `#plan-doc-comments`, approve/request buttons), `#branch-backdrop`, `#gh-backdrop` (GitHub wizard), `#settings-backdrop` (tabs `.settings-tab[data-tab]` / panels `.settings-panel[data-panel]`; ids `set-theme`, `set-default-model`, `set-default-codex-model`, `set-default-font`, `set-notify`, `set-plan-autopopup`, `set-autocorrect`, `#build-group`/`#build-portable`, voice ids `voice-model`, `voice-hotkey-enabled`, `voice-auto-enter`, `voice-auto-space`, `voice-reply-enabled`, `voice-dict-*`), `#voice-train-backdrop`, `#help-backdrop` (**`#help-modal`** — see Invariants), `#usage-backdrop`.
+- **Modals** (all `<div id="X-backdrop" class="hidden"><div id="X-modal">…` and closed by clicking the backdrop): `#modal-backdrop` (hive create/edit: `#modal-name/dir/cmd/resume/muted`), `#diff-backdrop`, `#plan-backdrop` (plan review: `#plan-doc-body`, `#plan-doc-comments`, approve/request buttons), `#branch-backdrop`, `#gh-backdrop` (GitHub wizard), `#settings-backdrop` (tabs `.settings-tab[data-tab]` / panels `.settings-panel[data-panel]`; ids `set-theme`, `set-default-model`, `set-default-codex-model`, `set-default-font`, `set-notify`, `set-plan-autopopup`, `set-autocorrect`, `#build-group`/`#build-portable`, voice ids `voice-model`, `voice-hotkey-enabled`, `voice-auto-enter`, `voice-auto-space`, `voice-reply-enabled`, `voice-dict-*`), `#voice-train-backdrop`, `#help-backdrop` (**`#help-modal`** — see Invariants), `#usage-backdrop`, `#setup-backdrop` (first-run setup wizard: `#setup-title`, `#setup-steps`, `#setup-body`, `#setup-msg`).
 - The Help modal's "Hivemind commands" list `#hm-cmd-list` is **generated at startup** from `HM_COMMANDS[].help` by `renderHmCommandHelp` — never hand-edit that `<ul>`.
 - CSP in `index.html` head allows `hm:` (offline STT assets), `blob:` workers, and `wasm-unsafe-eval` — needed by the voice worker; don't tighten it casually.
+
+## Boot state
+
+`#boot-state` (`.empty.boot`, a spinner + *"Loading your hives…"*) and the
+`.board-skel` placeholder rows in `#board-list` are what the **first paint**
+shows. They exist because `#grid` and `#empty-state` can't both be right before
+`init` has read `boards.json`: the markup used to ship `#empty-state` visible,
+so every start flashed the *Welcome — Set up an agent* screen at users who had
+hives, reading as "this app is not set up yet" until the real workspace
+appeared seconds later.
+
+So the markup ships `#grid` **and** `#empty-state` hidden, `#board-title` reading
+*"Loading…"*, and `#boot-state` visible. Both routes out — `selectBoard` and
+`showEmpty` — call `hideBootState()`, which is the only thing that clears it;
+`init` awaits `refreshCodexAccounts` and `listBoards` together (they don't need
+each other, and both must land before a pane is built) with a `.catch` on each,
+because a rejection there would strand the app on the spinner.
+
+## First-run setup wizard
+
+`#setup-backdrop`, built entirely by `renderSetup*`. It exists because Hivemind
+runs agent CLIs and never talks to a model service itself: on a machine with no
+agent installed the app cannot do anything, and used to say nothing about it —
+the first thread just died on PowerShell's *"'claude' is not recognized as the
+name of a cmdlet"*.
+
+Three steps, over `setupState` (`{ step, agent, detect, dir, name, from, busy }`,
+null while closed):
+
+1. `renderSetupPick` — one `.setup-agent` card per `AGENTS` entry, each with a
+   `.setup-chip` computed by `setupAgentStatus` from the `agents:detect` record.
+   The chip is the point of the screen: *which of these can I use right now* is
+   exactly what a new user can't answer alone.
+2. `renderSetupConnect` — a two-item checklist (`setupCheckRow`): the CLI, and
+   the sign-in. A missing CLI gets `setupInstallBlock` (the install command with
+   a Copy button, or an `openExternal` link when `install` is a URL).
+3. `renderSetupHive` — name + directory, then `finishSetup` pushes a board in
+   the same shape the New-hive modal writes, persists, and calls `selectBoard`,
+   whose automatic first `addTerminal` runs on the chosen agent.
+
+Things that are load-bearing:
+
+- **The pick is saved as `defaultAgent`** (`hm.agent`), in `renderSetupHive` —
+  reaching step 3 is the commitment. Without it the wizard would end by opening
+  a Claude thread for someone who just picked ChatGPT.
+- **Step 2 polls** (`startSetupRecheck`, `SETUP_RECHECK_MS`) while the CLI is
+  missing or unsigned, because the user is expected to go and fix that in
+  *another window*; it re-renders only when the answer actually changed, and
+  stops as soon as the step is green or the wizard leaves step 2. This is why
+  `agents:detect` must stay filesystem-only (see `docs/main-process.md`).
+- **Sign-in is not done here, deliberately.** Each CLI signs in through its own
+  terminal flow, and the thread path already handles it well (`AUTH_PATTERNS` →
+  `setNeedsAuth` → the "sign in" header + 🔑 chat card). A modal copy would only
+  be a worse second implementation.
+- **An unknown sign-in state is never reported as "not signed in"** — `signedIn`
+  is `true`/`false`/`null` and null is worded as "the thread will ask you if it
+  needs to", which is always true. A false alarm sends the user off to
+  re-authenticate a working account.
+- **Every close path writes `hm.setupDone`** (`closeSetupWizard`), finished or
+  skipped. It is a welcome, not a gate; a second uninvited appearance would be
+  worse than never showing it. `maybeOpenSetupWizard` (called from `init` after
+  `showEmpty`) opens it only when there are no boards *and* that key is unset.
+- It is **first in the global Escape chain** and has the highest modal z-index
+  (80): it can be opened from Settings, and its last step is a hive form the
+  New-hive modal (z-index 50) must not cover.
+
+Reachable afterwards from `#empty-setup`, Settings → General → Agent setup
+(`#open-setup`), and the `setup` entry in `HM_COMMANDS`.
 
 ## Keyboard shortcuts
 
@@ -193,7 +284,8 @@ Global (capture-phase document listeners, so they win over xterm):
 | `Ctrl+Enter` | Maximize / restore focused thread | `renderer.js:~5352` (`toggleZoom`) |
 | `Ctrl+Shift+]` / `Ctrl+Shift+[` | Cycle focus next / previous thread | `renderer.js:~5356` (`cycleFocus`) |
 | `Ctrl+1`…`Ctrl+9` | Focus Nth thread on the active hive | `renderer.js:~5361` |
-| `Esc` | Close the top open dialog — priority order: voice training → clone-from-GitHub wizard → plan review → diff → branch → GitHub wizard → usage → help → settings | `renderer.js:~8143` |
+| Ctrl+F | Find in terminal scrollback. From chat, opens Interact and the find bar while keeping the conversation visible. Escape closes the find bar; Done closes Interact. | Pane navigation listener |
+| `Esc` | Close the top open dialog — priority order: voice training → clone-from-GitHub wizard → **New/Edit-hive dialog** → plan review → diff → branch → GitHub wizard → usage → help → settings | `renderer.js:~8143` |
 
 Inside a terminal pane (`term.attachCustomKeyEventHandler` in `createPane`):
 
@@ -220,7 +312,7 @@ Mouse extras: drag gutters resize splits; drag sidebar-resizer sets sidebar widt
 
 ## Settings & localStorage
 
-All persistence is `localStorage` (renderer-local) except boards/layouts (JSON via `window.api.saveBoards`) and per-project files (`.hivemind/todos.json`, `.hivemind/prompt-history.json`, `.hivemind/plans/*`).
+All persistence is `localStorage` (renderer-local) except boards/layouts (JSON via `window.api.saveBoards`) and per-project files (`.hivemind/prompt-history.json`, `.hivemind/plans/*`).
 
 | Key | Meaning / values | Read at |
 |---|---|---|
@@ -230,7 +322,9 @@ All persistence is `localStorage` (renderer-local) except boards/layouts (JSON v
 | `hm.codexModel` | Default ChatGPT/Codex model | `setPaneCodexModel`, Settings |
 | `hm.grokModel` | Default Grok Build model | `setPaneGrokModel`, Settings |
 | `hm.codexAccount` | Default ChatGPT account id for new threads. **The account list itself is not here** — it lives in userData (`codex.js`); this is only the default, reset to `default` when it names an account that's gone | `setPaneCodexAccount`, `refreshCodexAccounts`, Settings |
+| `hm.agent` | Default agent for new threads (`claude`/`codex`/`gemini`/`grok`). Read only by `createPane`'s fallback and `addTerminal`'s auto-name — **restored panes never reach it** (`rebuildFromLayout` resolves a missing agent to `claude` first), so changing it can't rewrite saved threads | `defaultAgent` / `setDefaultAgent`, Settings `set-default-agent`, the setup wizard's step 3 |
 | `hm.perm` | Default permission mode (`default`/`acceptEdits`/`auto`/`plan`/`bypass`) | `setPanePerm` |
+| `hm.setupDone` | `'1'` once the first-run setup wizard has been closed — finished **or** skipped. The only thing that stops it reappearing, so it is written on every close path | `maybeOpenSetupWizard`, `closeSetupWizard` (`SETUP_DONE_KEY`) |
 | `hm.muteNotifications` | `'1'` mutes OS notifications | `notifyMuted`, Settings `set-notify` (inverted) |
 | `hm.chatFilters` | JSON `{tool,thinking,meta,subagent}` — default filter chips for new panes | `globalChatFilters`, chip clicks |
 | `hm.sidebarWidth` | Sidebar width px (180–600) | sidebar-resizer IIFE |
@@ -259,20 +353,19 @@ Everything the renderer calls on `window.api`, grouped (names only — schemas l
 - **Transcript binder** (`window.api.transcript.*`): `bind`, `unbind`, `noteSent`, `refresh`, `listSessions`, `readSession`, `onEntries`, `onStatus`
 - **Git** (`window.api.git.*`): `status`, `fetch`, `pull`, `push`, `init`, `stage`, `unstage`, `stageAll`, `unstageAll`, `discard`, `commit`, `diff`, `branches`, `checkout`, `createBranch`, `setRemote`, `resetToRemote`, `ghCheck`, `ghCreateRepo`, `ghListRepos`, `ghClone`, `ghAuthStart`, `ghAuthCancel`, `onGhAuthStatus`, `aiCommitMessage`
 - **Files** (`window.api.files.*`): `list`, `open`, `reveal`
-- **Todo** (`window.api.todo.*`): `read`, `write`, `ensureIgnored`
 - **Prompt history** (`window.api.promptHistory.*`): `read`, `write`, `append`, `ensureIgnored`
 - **Plans** (`window.api.plan.*`): `read`, `readFile`, `write`, `readComments`, `writeComments`, `ensureIgnored`
 - **Build** (`window.api.build.*` + event): `isHivemind`, `portable`, `onBuildProgress`
 - **Hivemind AI command fallback**: `hm.interpret`
-- **Usage**: `usage.get`
+- **Usage**: `usage.get({ force })`
 - **Voice / STT**: `stt.ensureModel`, `onSttDownloadProgress`
 - **Misc**: `notify`, `onFocusPane`, `setWatch`, `onFsChanged`, `pickDir`, `pickFiles`, `saveTempImage`, `clipboardImage`, `stageAttachment`, `openExternal`, `spellCorrect` (synchronous), `platform`, `osBuild`, `appVersion`
 
 ## Styling conventions
 
 - **Theme = CSS custom properties on `:root`**: `--bg`, `--bg-alt`, `--panel`, `--surface`, `--text`, `--muted`, `--accent`, `--accent-2`, `--border`, `--danger`, `--peach`, `--yellow`, `--on-accent`, `--gutter`. `styles.css:1` hard-codes the Midnight defaults so the app paints before JS runs; `applyTheme` overwrites them live and simultaneously repaints every xterm palette. Light themes (Paper, Rose) work purely through these variables — there is no `prefers-color-scheme` handling and no `dark`/`light` class; **never hard-code colours, always use the variables** (`--on-accent` exists precisely so light themes can flip text on accent fills).
-- `styles.css` (~2,350 lines) is organized with banner comments (`/* ---------------- Section ---------------- */`) roughly mirroring renderer.js sections: Sidebar, Workspace, Grid, Chat wrapper, Empty state, Modal, File Explorer, Source Control, Publish, Todo, Prompt History, Plan review, Diff viewer, Branch menu, GitHub wizard, Voice typing, Chat with Hivemind, Settings modal, Usage modal, Help modal, "Added features".
-- Naming: plain kebab-case classes with a feature prefix — `chat-*` (chat view), `plan-*`, `git-*` (also reused by the other sidebar panels for headers/msgbars: `.git-header`, `.git-msgbar`, `.git-empty`), `todo-*`, `fx-*` (file explorer), `pub-*` (publish panel + its file picker), `hm-*` (Hivemind chat/toast), `vt-*`/`voice-*`, `gh-*`, `vd-*` (voice dict). Ids for singletons, classes for repeated widgets.
+- `styles.css` (~2,350 lines) is organized with banner comments (`/* ---------------- Section ---------------- */`) roughly mirroring renderer.js sections: Sidebar, Workspace, Grid, Chat wrapper, Empty state, Modal, File Explorer, Source Control, Prompt History, Plan review, Diff viewer, Branch menu, GitHub wizard, Voice typing, Chat with Hivemind, Settings modal, Usage modal, Help modal, "Added features".
+- Naming: plain kebab-case classes with a feature prefix — `chat-*` (chat view), `plan-*`, `git-*` (also reused by the other sidebar panels for headers/msgbars: `.git-header`, `.git-msgbar`, `.git-empty`), `fx-*` (file explorer), `hm-*` (Hivemind chat/toast), `vt-*`/`voice-*`, `gh-*`, `vd-*` (voice dict). Ids for singletons, classes for repeated widgets.
 - Visibility is done with a shared `.hidden` class (`display:none`), state with modifier classes (`active`, `sel`, `listening`, `answered`, `done`, `zoomed`, `perm-bypass`, `composer-locked`, `viewing-history`).
 - Chat text scales off the per-pane `--pane-font` variable set on `.pane` by `setPaneFontSize`; the composer height feeds `--chat-composer-h` (used by `.pane.term-chat` to inset the terminal).
 - Chat kind filtering is pure CSS: `.chat-wrap.hide-tool .chat-row[data-kind="tool"] { display:none }` etc. — flipping a chip never re-renders rows.
@@ -285,22 +378,40 @@ Everything the renderer calls on `window.api`, grouped (names only — schemas l
 2. **`HM_COMMANDS` is ordered** — first matching pattern wins. Specific commands must sit above generic ones (voice "stop listening" above the interrupt catch-all; `find` last). An entry can return `HM_PASS` to decline its match.
 3. **One xterm key handler.** `term.attachCustomKeyEventHandler` overwrites; every in-terminal shortcut must be added to the single handler in `createPane`.
 4. **Spawn-time fit must stay synchronous.** `spawnPanePty` calls `fitAddon.fit()` before `spawnPty`; deferring it (rAF) breaks in occluded windows and leaves phantom characters on Claude's input line. Similarly the chat view *covers* the terminal (never `display:none`) so fit/ConPTY sizing stay valid while hidden; `setPaneView` re-fits on reveal.
+   The *chat list* is the opposite case — `.pane.term-view .chat-wrap` **is** `display:none`, so while the terminal is showing the list has no layout box and every `scrollTop = scrollHeight` silently no-ops (`scrollTop` also reads back 0). `setPaneView` re-pins the list to the bottom in a `requestAnimationFrame` when revealing chat; without it, peeking at the terminal and coming back dropped the user at message #1 of the thread.
+   `fitBoard` only sends `resizePty` when `cols`/`rows` actually changed (`pane.sentCols/sentRows`) — ConPTY reflow is what strands phantom characters, and `fit()` runs on far more than real size changes. The `window` `resize` listener is debounced (120 ms trailing); dragging a window edge otherwise issued one fit + one IPC per pane per frame.
+4a. **The submit-retry loop must be able to see a wrapped prompt, and must not strand short ones.** `typePrompt` withholds its Enter whenever a menu is up and hands the whole responsibility to `confirmSubmit`. Two rules keep that honest:
+   - **`promptStuckOnScreen` reads the composer as a *block*, not a row.** A wrapped prompt puts its head on the block's **first** row, and in bordered builds every continuation row repeats the `│` prefix — so anchoring on the bottom-most prefixed row and slicing *downward* cut off the very text being looked for. It now finds the bottom-most composer row, extends **upward** across the contiguous block, and matches against the flattened block (`flattenRows`: strip box chrome, collapse whitespace) using a 24-char head. The old 40-char single-row `includes` could never match below ~45 columns — which is exactly what the app's own multi-column tiling produces on a normal window, so the retry silently never fired in the default layout.
+   - **`confirmSubmit(..., { owesEnter: true })` is how a withheld Enter gets delivered.** The `head.length < 3` early-return skips the *verification* loop, which is fine for a normal send (`typePrompt` already pressed Enter) but stranded every short reply typed while a menu was up — "ok", "yes", "no", "1" were pasted and then never submitted by any path. With `owesEnter`, the call waits the menu out and presses Enter once it clears; pressing it only after the menu is gone is what keeps invariant 8b intact.
+
 5. **`pane.id` changes on respawn** (`respawnPane`) so late data/exit events from the killed PTY can't reach the pane — always re-look-up panes via `findPane(id)` in event handlers, and call `window.api.transcript.unbind` before changing the id.
 6. **Session-resume rules**: never `--resume` a session id whose file hasn't been proven to exist (`pane.sessionBound`, set only when transcript entries arrive) — resuming an unwritten session dies with "No conversation found" and strands the pane. `'bound'` status alone does **not** prove the file exists.
 7. **Layout must be attached before spawning**: `createPane` returns a detached pane; callers must run `layout(boardId)` then `spawnPanePty` (see `addTerminal` / `rebuildFromLayout`).
 8. **Status detection is heuristic and version-pinned.** `MENU_PATTERNS`, `SELECT_FOOTER_RE`, `AUTH_PATTERNS`, `PERM_SCREEN_RE`, the plan-menu regexes and the AskUserQuestion screen parsers were verified against specific Claude Code (v2.1.20x–2.1.22x) and codex-rs TUI output; when CLI wording drifts, these regexes are what to update. `AUTH_PATTERNS` in particular must stay anchored on strings the CLI really prints (they were lifted from the v2.1.221 binary) — a false positive there locks the composer on a healthy thread. Screen scans are wrap-tolerant (`joinWrapped`/`testWrapped` — the TUI hard-wraps at pane width) and shed `│┃` box chrome (`stripBoxChrome`); option scans anchor on the "1." row closest above the footer and abort on out-of-sequence numbers so prose/diff lists can't become clickable options. Buttons deliberately degrade to "answer in the terminal" rather than sending blind digits.
 8a. **Two AskUserQuestion menu layouts, two answering rules** (verified v2.1.220). A plain menu answers on the digit alone. A menu whose options carry `preview` text renders side-by-side — option list left, the focused option's preview boxed on the right, a "Notes: press n to add notes" hint under it — and there a digit only *moves* the selection; **Enter commits it**. `parseScreenQuestion` therefore cuts every row at the preview box's left column (`previewCutColumn`, computed on the *raw* lines: `stripBoxChrome` eats that edge as if it were dialog chrome, which is what used to spill box art and preview code into option labels/descriptions) and returns `needsEnter`, which is the only case where a card click follows its digit with an Enter (re-checking `cardMenuLive` first). Never send that Enter for a menu that answers immediately — it would land in whatever screen came next. The unnumbered "Chat about this" row of that layout is menu chrome, like "Submit".
 8b. **Every card button re-verifies the live screen at click time before writing to the PTY.** Question-card options and Review⇥ go through `cardMenuLive` (screen cards must still match the rendered menu's question+labels; transcript cards need `menuOnScreen`); prompt-card quick keys require `state === 'attention'` plus `promptVisibleOnScreen`; single-select cards lock after one send (`card.dataset.sent`, self-expires); options ≥ 10 are disabled (two-keystroke digits would actuate option 1); `typePrompt`'s delayed Enter and `confirmSubmit` wait a menu out instead of actuating it. A stale click must never inject keys into a menu or turn it wasn't aimed at — keep this property when touching any card handler.
-8c. **Menu keystrokes must not become the thread caption.** `sendToPane(pane, data, { caption: false })` skips `feedCaptionInput`; every card/menu send (option digits, the preview-layout Enter, Review⇥, prompt-card quick keys, plan approve/feedback) passes it. Caption tracking rebuilds the *user's input line*, so a digit with no Enter behind it otherwise lingers in `capBuf` and glues itself to the front of the next real prompt, and pasted review feedback would replace the thread's task caption. Stranded transcript questions (a `tool_use` whose result never lands) age out via `syncQuestionExpiry` instead of pinning attention/composer-lock forever; pane death clears all pending-question state.
+8c. **Menu keystrokes must not become the thread caption.** `sendToPane(pane, data, { caption: false })` skips `feedCaptionInput`; every card/menu send (option digits, the preview-layout Enter, Review⇥, prompt-card quick keys, plan approve/feedback) passes it — **and so does each image path in `typePrompt`**, which is plumbing rather than something the user typed. Left on, the attached paths landed in `capBuf` and the trailing Enter committed `C:\…\shot.png` + the prompt as the thread's caption, which was then persisted into the layout. Caption tracking rebuilds the *user's input line*, so a digit with no Enter behind it otherwise lingers in `capBuf` and glues itself to the front of the next real prompt, and pasted review feedback would replace the thread's task caption. Stranded transcript questions (a `tool_use` whose result never lands) age out via `syncQuestionExpiry` instead of pinning attention/composer-lock forever; pane death clears all pending-question state.
 8d. **"Request changes" submits the feedback itself.** `planSendFeedback` presses the keep-planning option, waits for its inline input, pastes the comments, waits for that text to show up on screen, then sends Enter (with one bounded retry) — it must *not* route through `typePrompt`, which by design refuses to press Enter while a menu is on screen, so the feedback silently sat in the menu's input while the card/window claimed it had been sent. It returns `false` when the text is still visibly stuck in the menu, and both callers (`planReqChangesBtn`, the card's Request-changes button) say so instead of reporting success.
 8e. **The permission dropdown is read back from the screen, never inferred.** Claude Code owns the live mode — shift+tab cycles manual → accept edits → plan → auto, and approving a plan drops the thread out of plan mode — so `permScreenCheck` (called from both probes, next to `planScreenCheck`) matches the footer hint (`PERM_SCREEN_MODES`, v2.1.220 wording) and updates `pane.permMode` + the select + the persisted layout **without respawning**; only `setPanePerm` restarts a thread. It acts only on a positive match (a dialog covering the footer must not read as a mode change) and ignores the screen for `PERM_SETTLE_MS` after a deliberate switch (stamped by `restartForPerm`), so the dying process's last frame can't revert the new mode. A screen-read mode is also what the live process is running, so it updates `pane.permRunning` and clears a `permPending` that just came true — otherwise a queued switch would restart a thread that shift+tab already moved to that very mode. `auto` is a real CLI mode (`--permission-mode auto`) and must stay in `PERMS`, or the dropdown can't represent a thread that approved a plan with "Yes, and use auto mode".
-8f. **A permission switch never lands mid-turn.** `setPanePerm` on a `busy` Claude thread queues the mode in `pane.permPending` (dashed/dimmed dropdown via `paintPermSelect`) instead of restarting; `applyPendingPerm` fires it from the quiet path once the pane reaches `idle`/`error`. Restarting mid-turn discards the in-flight work — it never reaches the session file, so the resumed thread comes back at an empty composer and reads as "Claude stopped thinking and just sat there". Attention waits too: a restart under a blocking menu throws away the question being asked. Flipping back to `pane.permRunning` cancels the queue.
+8f. **A permission switch never lands mid-turn.** `setPanePerm` queues the mode in `pane.permPending` (dashed/dimmed dropdown via `paintPermSelect`) for **any** state that isn't `idle`/`error`, instead of restarting; `applyPendingPerm` fires it from the quiet path once the pane settles. Restarting mid-turn discards the in-flight work — it never reaches the session file, so the resumed thread comes back at an empty composer and reads as "Claude stopped thinking and just sat there". Attention waits for the same reason: a restart under a blocking menu throws away the question being asked. **Both functions must agree on the condition** — `setPanePerm` used to queue only on `busy` and send `attention` straight to a restart, so the one case `applyPendingPerm`'s comment called out was the one the entry path didn't honour. `applyPendingPerm` is the single arbiter of *when*; `setPanePerm` only decides *whether*. Flipping back to `pane.permRunning` cancels the queue.
+
+8g. **A dropdown must never type into a menu.** The model dropdowns apply live by typing `/model …\r` into the running thread, and a dropdown can be used at any moment — including while the thread sits on a permission prompt. Writing then puts the command in the menu's filter and the trailing `\r` actuates the highlighted row, i.e. approves something the user never read. `setPaneModel`/`setPaneGrokModel` therefore go through **`writeSlashWhenClear`**, which waits the menu out on `SLASH_RETRY_MS` (same cadence as `confirmSubmit`) and gives up rather than forcing it — a dropped model switch is recoverable, a mis-actuated approval is not. Both also check `changed` first, so re-picking the current model doesn't retype anything. This is invariant 8b applied to header controls: *every* write path re-verifies the live screen.
+8h. **The composer lock uses `readOnly`, never `disabled`, and always says why.** A `disabled` input cannot receive focus, so `focusPane`'s `chat.input.focus()` silently no-oped and clicking a locked thread left the keyboard pointed at the *previously* focused pane — the next thing typed went to the wrong thread's PTY. `readOnly` still blocks typing while staying focusable and scrollable; sending is blocked by `sendBtn.disabled` plus the guard in `sendChatMessage`, which **toasts** rather than returning silently (dictating into a locked thread and saying "send" used to drop the whole message with no feedback).
+
+8i. **`confirmEcho` matches, and declines to guess.** It tries the exact text, then the message's first line (an image send stores `text\n🖼 name` while the transcript records only `text`), and only falls back to "the oldest pending echo" when exactly one is outstanding. Blindly taking index 0 on any mismatch confirmed message A's bubble away using message B's line, cancelling A's `ECHO_STALL_MS` timer — so the "⚠ no response yet" warning that exists for precisely that case never fired. `resetChat` clears those timers along with the array.
+
 9. **Never `innerHTML` user/agent text.** User strings always go through `textContent`; markdown goes through the in-house `markdownToHtml` whose `escapeHtml` escapes quotes for attribute safety. Keep it that way.
-10. **Sidebar panels are mutually exclusive** — a new docked panel must close the others in its `setXOpen` and be closed by theirs, plus toggle a `sidebar` class, disable its toggle in `showEmpty`, and refresh in `selectBoard` via an `xOnBoardChange` hook.
+10. **Sidebar panels are mutually exclusive** — a new docked panel must close the others in its `setXOpen` and be closed by theirs, plus toggle a `sidebar` class, disable its toggle in `showEmpty`, and refresh in `selectBoard` via an `xOnBoardChange` hook. Note this is wired by hand in N² fashion (six `setXOpen` bodies cross-calling each other, plus a repeated block in `showEmpty`); it is the main reason `showEmpty` kept forgetting `hm-open`. Every one of those sites must end with `syncSidebarPanelState()` — the `panel-open`/pinned-hive class is derived, not set by hand, so a setter that skips it leaves the sidebar claiming the wrong project (or none). A registry would be the right shape if a seventh panel ever appears.
+
+12. **One pane teardown list: `disposePaneResources`.** `closePane` and `deleteBoard` both call it, and nothing else may hand-roll teardown. It clears the idle/question/echo timers, disconnects `composerResizeObserver`, revokes attachment blob URLs, closes the plan review if the pane owns it, drops `focusedPane` if it points here, kills the pty, unbinds the transcript, and disposes the terminal. `deleteBoard` used to carry a shorter copy, so deleting a hive with N threads leaked N ResizeObservers and every staged blob URL and left the plan review polling a deleted hive's directory.
+
+13. **`persist()` is debounced, not immediate.** Callers are hot — a caption update on every Enter in every thread, every screen-read permission change, every transcript status push, every dropdown and gutter drag — and each call re-serializes *every* board. `persist()` coalesces on a 400 ms trailing timer and chains writes so two `saveBoards` calls never overlap on the same file; it still returns a promise that resolves once the caller's data is on disk, so `await persist()` keeps its meaning. A `beforeunload` listener flushes a pending write. Don't reintroduce a direct `persistNow()` call from UI code.
+
+14. **`selectBoard` resolves before it commits.** Assigning `activeBoardId` ahead of the `boards.find` lookup left the app pointing at a hive that doesn't exist whenever the id was stale (a `focus-pane` notification for a deleted hive, a bad command target), after which the grid, `＋ Thread`, `fitBoard` and every `xOnBoardChange` silently no-oped.
 11. **`chatIngest` is suppressed while viewing history** (`c.viewingHistory`) — anything that must never miss a transcript entry (plan detection, cost) runs *before* it in the `transcript.onEntries` handler.
 12. **`upsertChatRow` keys rows by transcript uuid** so re-emitted lines update in place; re-renders must preserve open `<details>` folds and clicked-option echoes (see `addQuestionRow`'s `prevSel` logic) — a naive re-render loses in-flight interaction state.
-13. **Concurrent edits**: the user's own Hivemind threads edit this repo in parallel (see memory). Re-read files before editing; on-disk stores (`todos.json`, `prompt-history.json`) are re-read before append precisely because another thread may have written them.
-14. **Escape handling is centralized** for backdrop modals in one document listener (~`renderer.js:8143`) with an explicit priority chain; non-modal panels (hm-chat, find bar) handle Esc locally with `stopPropagation`. A new modal must be added to that chain.
+13. **Concurrent edits**: the user's own Hivemind threads edit this repo in parallel (see memory). Re-read files before editing; on-disk stores (`prompt-history.json`) are re-read before append precisely because another thread may have written them.
+15. **Escape handling is centralized** for backdrop modals in one document listener (~`renderer.js:8143`) with an explicit priority chain; non-modal panels (hm-chat, find bar) handle Esc locally with `stopPropagation`. A new modal must be added to that chain — the Help modal promises "Esc — close the open dialog", so a modal missing from the chain makes that text false. The New/Edit-hive dialog was missing, and it is the first modal a new user ever sees.
 15. Themes: `THEME` is **mutated in place** by `applyTheme` so new terminals pick up the current palette from the shared object — replace its contents, don't reassign it.
 
 ## How to extend
@@ -315,4 +426,4 @@ Everything the renderer calls on `window.api`, grouped (names only — schemas l
 
 **Add a Hivemind command**: append an entry `{ name, patterns: [regex…], help: '<strong>…</strong>', run(m, { board, pane }) { … } }` to `HM_COMMANDS` at the right position (specific before generic; before `task-in-thread`/`find`). `help: null` hides it from the Help list (use when a sibling documents it). Toast results with `hmToast(msg[, 'err'])` — it auto-mirrors into the Chat-with-Hivemind panel.
 
-**Add a docked sidebar panel**: copy the Prompt History panel — `<aside id="x-panel">` in `index.html` with a `.git-header`, a toggle button in `.sidebar-actions`; in renderer.js a `setXOpen(open)` that closes all sibling panels (and is called by each of theirs), toggles `sidebar.classList` (add the matching `.x-open` CSS), `xOnBoardChange()` called from `selectBoard`, and disable/hide handling in `showEmpty`.
+**Add a docked sidebar panel**: copy the Prompt History panel — `<aside id="x-panel">` in `index.html` with a `.git-header`, a toggle button in `.sidebar-actions`; in renderer.js a `setXOpen(open)` that closes all sibling panels (and is called by each of theirs), toggles `sidebar.classList` (add the matching `.x-open` CSS) **and calls `syncSidebarPanelState()`** (add the new `x-open` to the list it scans, or the active hive stops being pinned above your panel), `xOnBoardChange()` called from `selectBoard`, and disable/hide handling in `showEmpty`.
