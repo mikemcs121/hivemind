@@ -1737,14 +1737,18 @@ function sendToPane(pane, data, { caption = true } = {}) {
 // that paste is exactly one image path and nothing else, so each path goes
 // through as its own bracketed paste (its model can't view images from a path
 // in text — codex's view_image tool is unreliable in the Windows sandbox).
-function typePrompt(pane, text, images = []) {
-  // `caption: false` — an image path is plumbing, not something the user typed.
-  // Left on, feedCaptionInput folds every attached path into capBuf and the
+// `caption: false` — the prompt is Hivemind's own plumbing (a handoff request,
+// a takeover), so it must not become the thread's caption: the caller sets a
+// readable one instead. It has to cover the trailing Enter and confirmSubmit's
+// retries as well, or that Enter commits whatever was left in `capBuf`.
+function typePrompt(pane, text, images = [], { caption = true } = {}) {
+  // Same reasoning for images: an attached path is plumbing, not something the
+  // user typed. Left on, feedCaptionInput folds every path into capBuf and the
   // trailing Enter commits `C:\…\shot.png` + the real prompt as the thread's
   // caption, which then gets persisted into the layout.
   for (const p of images) sendToPane(pane, '\x1b[200~' + p + '\x1b[201~', { caption: false });
-  if (text && !text.includes('\n') && text.startsWith('/')) sendToPane(pane, text);
-  else if (text) sendToPane(pane, '\x1b[200~' + text + '\x1b[201~');
+  if (text && !text.includes('\n') && text.startsWith('/')) sendToPane(pane, text, { caption });
+  else if (text) sendToPane(pane, '\x1b[200~' + text + '\x1b[201~', { caption });
   const delay = (pane.agent === 'codex' ? 250 : 150) +
     Math.min(300, Math.ceil(text.length / 20));
   const ptyId = pane.id; // a respawn in the gap remaps pane.id to a fresh pty
@@ -1755,11 +1759,11 @@ function typePrompt(pane, text, images = []) {
     // the text in the composer; confirmSubmit waits the menu out and presses
     // Enter once it's gone.
     if (chatComposerBlocked(pane)) {
-      confirmSubmit(pane, ptyId, text, 5, { owesEnter: true });
+      confirmSubmit(pane, ptyId, text, 5, { owesEnter: true, caption });
       return;
     }
-    sendToPane(pane, '\r');
-    confirmSubmit(pane, ptyId, text, 2);
+    sendToPane(pane, '\r', { caption });
+    confirmSubmit(pane, ptyId, text, 2, { caption });
   }, delay);
 }
 
@@ -1813,7 +1817,7 @@ function promptStuckOnScreen(screen, head) {
 // prompt too short to verify by matching. Without it, every short reply sent
 // from the chat composer while a menu was up ("ok", "yes", "no", "1") was
 // pasted and then never submitted at all.
-function confirmSubmit(pane, ptyId, text, tries, { owesEnter = false } = {}) {
+function confirmSubmit(pane, ptyId, text, tries, { owesEnter = false, caption = true } = {}) {
   const head = flattenRows([String(text || '').split('\n', 1)[0]]).slice(0, 24);
   if (tries <= 0) return;
   if (!owesEnter && head.length < 3) return;
@@ -1824,24 +1828,24 @@ function confirmSubmit(pane, ptyId, text, tries, { owesEnter = false } = {}) {
     // user answers it in card or terminal; the stuck prompt is still worth
     // submitting afterwards), giving up once the tries run out.
     if (chatComposerBlocked(pane)) {
-      confirmSubmit(pane, ptyId, text, tries - 1, { owesEnter });
+      confirmSubmit(pane, ptyId, text, tries - 1, { owesEnter, caption });
       return;
     }
     // The menu is gone, so an Enter can no longer actuate a menu row. Deliver
     // the one we withheld, then fall back to the normal verify loop.
     if (owesEnter) {
-      sendToPane(pane, '\r');
-      confirmSubmit(pane, ptyId, text, tries - 1);
+      sendToPane(pane, '\r', { caption });
+      confirmSubmit(pane, ptyId, text, tries - 1, { caption });
       return;
     }
     if (!promptStuckOnScreen(screen, head)) return;
-    sendToPane(pane, '\r');
-    confirmSubmit(pane, ptyId, text, tries - 1);
+    sendToPane(pane, '\r', { caption });
+    confirmSubmit(pane, ptyId, text, tries - 1, { caption });
   }, SUBMIT_RETRY_MS);
 }
 
 // Send a full prompt to a live pane, exactly like the chat composer would.
-function deliverPrompt(pane, text, images = []) {
+function deliverPrompt(pane, text, images = [], { caption = true } = {}) {
   if (transcriptSupported(pane)) window.api.transcript.noteSent(pane.id, text);
   // Echo bubbles only make sense in the transcript-backed chat: the terminal-
   // backed layer keeps its list hidden (the TUI itself echoes the message), so
@@ -1850,8 +1854,552 @@ function deliverPrompt(pane, text, images = []) {
     const names = images.map((p) => '🖼 ' + (String(p).split(/[\\/]/).pop() || p));
     addEchoRow(pane, [text, ...names].filter(Boolean).join('\n'));
   }
-  typePrompt(pane, text, images);
+  typePrompt(pane, text, images, { caption });
 }
+
+// ---------------------------------------------------------------------------
+// Thread handoff
+//
+// Pass a conversation from one thread to another — a different agent, a fresh
+// context window, or just a thread that's free. The transfer medium is a
+// *brief the source thread writes itself* to `.hivemind/handoffs/<id>.md`:
+// only the source agent knows which parts of its own context mattered, and a
+// file survives both threads restarting (and is readable by any agent CLI,
+// which a transcript format is not).
+//
+// The sequence, all driven from here:
+//   1. resolve the target (an existing thread, or open a new one now so the
+//      user can see where the conversation is going),
+//   2. ask the source thread to write the brief (an ordinary prompt — the PTY
+//      is always the delivery path),
+//   3. poll for the file and wait for its mtime to settle, because an agent
+//      may write a draft and then revise it,
+//   4. point the target at the same path and focus it.
+//
+// A handoff is a *copy*: the source thread is untouched afterwards, so the
+// same conversation can be handed to several threads.
+// ---------------------------------------------------------------------------
+const HANDOFF_POLL_MS = 2000;
+// Writing a good brief is a full turn over a long conversation; give it room.
+const HANDOFF_TIMEOUT_MS = 5 * 60 * 1000;
+// Below this a "brief" is an apology or a stub, not a handoff.
+const HANDOFF_MIN_CHARS = 40;
+
+// Must match handoff.js's id guard (/^[A-Za-z0-9._-]+$/) and its path layout.
+function newHandoffId() {
+  return 'h-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 8);
+}
+function handoffRel(id) { return '.hivemind/handoffs/' + id + '.md'; }
+
+// How a thread is described *to another agent*: the name the user calls it
+// plus which CLI it is, since that's the part that explains why it is being
+// written to. Shared by handoffs and consults — both name the other thread.
+function threadDescFor(pane) {
+  return paneLabel(pane) + ' (' + agentFor(pane.agent).label + ')';
+}
+
+function handoffRequestPrompt(rel, targetDesc) {
+  return [
+    'Hand this conversation off to another agent thread — ' + targetDesc + ' — working in the same directory.',
+    'Write a handoff brief to ' + rel + ' (create the folder if it does not exist), then reply "handoff ready".',
+    '',
+    'Use this outline. Be specific: the other agent has none of your context.',
+    '# Handoff: <one-line topic>',
+    '## Goal — what the user is trying to achieve',
+    '## Done so far — what has actually changed on disk, with file paths',
+    '## Key decisions and constraints — including what the user insisted on, and what was ruled out and why',
+    '## Open questions and blockers',
+    '## Next step — the single next action to take',
+    '',
+    'Include exact paths, commands and identifiers, and do not summarise away specifics.',
+    'Write only that file — do not make any other changes.',
+  ].join('\n');
+}
+
+function handoffTakeoverPrompt(rel, sourceDesc) {
+  return 'You are taking over a conversation from another thread in this project — ' + sourceDesc + '. '
+    + 'Read ' + rel + ': it is a handoff brief with the goal, what has already been done, the decisions made, '
+    + 'open questions, and the next step. Read the files it points at, then continue that work from the next step. '
+    + 'Tell me how you understand the task before you change anything.';
+}
+
+// Start a handoff from `source`. `target` is either an existing pane
+// (`{ pane }`) or an agent to open a new thread on (`{ agent }`).
+async function startHandoff(source, target) {
+  const board = source.board;
+  const dir = board && board.dir;
+  if (!dir) { hmToast('This hive has no project directory to write a handoff brief in.', 'err'); return; }
+  if (source.state === 'dead') {
+    hmToast(paneLabel(source) + ' has exited — it can\'t write a handoff brief.', 'err');
+    return;
+  }
+  if (source.handoff) { hmToast(paneLabel(source) + ' is already handing off.', 'err'); return; }
+
+  let dest = target && target.pane;
+  if (dest === source) { hmToast('Pick a different thread to hand off to.', 'err'); return; }
+  if (dest && dest.disposed) dest = null;
+  if (!dest) {
+    dest = addTerminal(board, { agent: isValidAgent(target && target.agent) ? target.agent : defaultAgent });
+    if (!dest) { hmToast('Could not open a thread for the handoff.', 'err'); return; }
+  }
+
+  // Claim the pane before the first await: two fast clicks would otherwise
+  // both pass the guard above and hand off twice, from one thread, to two.
+  const id = newHandoffId();
+  const rel = handoffRel(id);
+  const h = { id, rel, dest, started: Date.now(), lastMtime: null, busy: false, timer: null };
+  source.handoff = h;
+  updateThreadMenuChip(source);
+
+  // `.hivemind/` out of Git, and old briefs out of the folder. Both are
+  // best-effort: neither is worth failing a handoff over.
+  try { await window.api.plan.ensureIgnored(dir); } catch (_) { /* gitignore is a nicety */ }
+  try { await window.api.handoff.sweep(dir); } catch (_) { /* stale briefs are harmless */ }
+  if (source.handoff !== h) return;                 // cancelled while we waited
+  if (source.disposed || dest.disposed) { endHandoff(source); return; }
+
+  // `caption: false` + an explicit caption: the request is a multi-line
+  // outline, and letting it through the caption tracker leaves the thread
+  // captioned with its last line ("Write only that file…") instead of its work.
+  deliverPrompt(source, handoffRequestPrompt(rel, threadDescFor(dest)), [], { caption: false });
+  setPaneCaption(source, 'Handing off to ' + paneLabel(dest));
+  hmToast('Asked ' + paneLabel(source) + ' to write a handoff brief for ' + paneLabel(dest) + '…');
+  source.handoff.timer = setInterval(() => handoffPoll(source), HANDOFF_POLL_MS);
+}
+
+async function handoffPoll(source) {
+  const h = source.handoff;
+  if (!h) return;
+  if (source.disposed) { endHandoff(source); return; }
+  if (h.busy) return; // a slow read must not stack up polls
+  if (h.dest.disposed) {
+    endHandoff(source, 'The thread ' + paneLabel(source) + ' was handing off to was closed.', 'err');
+    return;
+  }
+  if (Date.now() - h.started > HANDOFF_TIMEOUT_MS) {
+    endHandoff(source, paneLabel(source) + ' didn\'t write a handoff brief — check the thread and try again.', 'err');
+    return;
+  }
+  h.busy = true;
+  let res = null;
+  try { res = await window.api.handoff.read(source.board.dir, h.id); } catch (_) { /* retry next tick */ }
+  h.busy = false;
+  if (source.handoff !== h) return; // cancelled, or the pane closed, mid-read
+  if (!res || !res.ok || !res.content || res.content.trim().length < HANDOFF_MIN_CHARS) return;
+  // Settle: only act once the file looks the same two polls running, so a
+  // brief the thread is still revising isn't handed over half-written.
+  if (h.lastMtime !== res.mtime) { h.lastMtime = res.mtime; return; }
+
+  const dest = h.dest;
+  endHandoff(source);
+  deliverPrompt(dest, handoffTakeoverPrompt(h.rel, threadDescFor(source)), [], { caption: false });
+  setPaneCaption(dest, 'Taking over from ' + paneLabel(source));
+  focusPane(dest);
+  hmToast('Handed ' + paneLabel(source) + '’s conversation to ' + paneLabel(dest) + '.');
+}
+
+// Tear the handoff state down (poll timer included) and optionally say why.
+// Safe to call on a pane that isn't handing off.
+function endHandoff(pane, msg, kind) {
+  const h = pane.handoff;
+  if (h && h.timer) clearInterval(h.timer);
+  pane.handoff = null;
+  updateThreadMenuChip(pane);
+  if (msg) hmToast(msg, kind);
+}
+
+function cancelHandoff(pane) {
+  if (!pane.handoff) return;
+  endHandoff(pane, 'Stopped waiting for ' + paneLabel(pane) + '’s handoff brief.');
+}
+
+// ---------------------------------------------------------------------------
+// Thread consult — asking another thread for a second opinion
+//
+// A handoff moves a conversation; a consult keeps it and brings an answer back.
+// One thread asks another ("what does Gemini think of this schema?"), the other
+// answers, and the answer is delivered into the asking thread's own
+// conversation so it can carry on with it. Two files under
+// `.hivemind/consults/`, same reasoning as the handoff brief — only the asking
+// agent knows what context the question needs, only the answering agent has the
+// opinion, and a file is readable by every agent CLI:
+//
+//   <id>.md        the question + context, written by the ASKING thread
+//   <id>.reply.md  the answer, written by the ANSWERING thread
+//
+// So a consult runs in two legs, each one poll-and-settle exactly like a
+// handoff: `phase: 'question'` waits for the asking thread to write the
+// question, `phase: 'answer'` waits for the answering thread to write the
+// reply. In-flight state lives on the ASKING pane (`pane.consult`) — the
+// answering thread is just a thread that was sent a prompt, and needs no state.
+//
+// There are two ways in:
+//   1. the user asks Hivemind — the 💬 Ask another chip, or "Hivemind, ask Gemini what
+//      it thinks about the caching plan". Hivemind writes the id and drives both
+//      legs from the start.
+//   2. a thread asks on its own — the user says "go ask Codex" to the agent
+//      itself, and it writes `.hivemind/consults/ask-<slug>.md` naming `to:` and
+//      `from:`. `consultInboxTick` finds it and adopts it at the second leg.
+//      Agents learn that format from `.hivemind/consults/README.md`, which
+//      Hivemind writes (consult.js `ensureConsultDocs`), and their own thread
+//      name from `HIVEMIND_THREAD` in their environment (set at spawn).
+//
+// Like a handoff, a consult never touches the answering thread's own work: it
+// is asked one question and writes one file.
+// ---------------------------------------------------------------------------
+const CONSULT_POLL_MS = 2000;
+// Writing the question is one turn; forming an opinion means reading the code
+// the question points at, so the answer leg gets much longer.
+const CONSULT_QUESTION_TIMEOUT_MS = 5 * 60 * 1000;
+const CONSULT_ANSWER_TIMEOUT_MS = 15 * 60 * 1000;
+// Below this a "question" or an "answer" is an apology or a stub.
+const CONSULT_MIN_CHARS = 40;
+// How long a thread opened *for* this consult needs before it can be typed at:
+// main types the agent command into the shell 600 ms after the spawn and the CLI
+// takes seconds more to come up, so a prompt sent now would land in the shell.
+const CONSULT_BOOT_MS = 5000;
+// How often unsolicited `ask-*.md` requests are looked for, across every hive
+// that has a live thread. A readdir per hive, so this stays cheap.
+const CONSULT_INBOX_MS = 3000;
+
+// Must match consult.js's id guard (/^[A-Za-z0-9][A-Za-z0-9._-]*$/, no
+// `.reply`) and its path layout.
+function newConsultId() {
+  return 'c-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 8);
+}
+function consultRel(id) { return '.hivemind/consults/' + id + '.md'; }
+function consultReplyRel(id) { return '.hivemind/consults/' + id + '.reply.md'; }
+
+// A short human label for what the consult is about — the chip/caption text,
+// not anything an agent reads.
+function consultTopicLabel(topic) {
+  const t = String(topic || '').replace(/\s+/g, ' ').trim();
+  return t.length > 60 ? t.slice(0, 59) + '…' : t;
+}
+
+function consultQuestionPrompt(rel, targetDesc, topic) {
+  const about = topic
+    ? 'The user wants that thread\'s opinion on: ' + topic
+    : 'Pick the one question in this conversation where a second opinion would actually change what you do next.';
+  return [
+    'Ask another agent thread — ' + targetDesc + ', working in the same directory — for a second opinion.',
+    about,
+    '',
+    'Write the question to ' + rel + ' (create the folder if it does not exist), then reply "question ready".',
+    'Use this outline. That thread has none of your context, so the context section is the whole job:',
+    '# Question',
+    '<the single question you want answered, phrased so it can be answered>',
+    '## Context',
+    '<the goal, the relevant file paths, what you have already tried and ruled out, and the constraint that makes this a judgement call>',
+    '## What would change your mind',
+    '<what evidence or argument would make you switch>',
+    '',
+    'Include exact paths, commands and identifiers, and do not summarise away specifics.',
+    'Write only that file — do not make any other changes, and do not answer the question yourself.',
+    'Hivemind delivers the answer back into this conversation; you do not need to wait or poll for it.',
+  ].join('\n');
+}
+
+function consultAnswerPrompt(qRel, aRel, askerDesc) {
+  return [
+    'Another agent thread in this project — ' + askerDesc + ' — is asking for your opinion.',
+    'Read ' + qRel + ': it has the question and the context behind it.',
+    'Look at the files it points at so your answer is about this code, not the general case.',
+    '',
+    'Write your answer to ' + aRel + ', then reply "answer ready". Use this outline:',
+    '# Answer',
+    '<your position, in the first line>',
+    '## Why',
+    '<the reasoning, referring to what you actually read>',
+    '## What I would do differently',
+    '<concrete alternative, or "nothing" if you agree>',
+    '## Caveats',
+    '<what you could not check, and what would change your answer>',
+    '',
+    'Disagree if you disagree — a second opinion that just agrees is worth nothing.',
+    'Write only that file: this is someone else\'s task, so change nothing else in the project.',
+  ].join('\n');
+}
+
+function consultReturnPrompt(aRel, targetDesc, topic) {
+  // A topic that had to be truncated for the chip ends in "…" — fine on a
+  // caption, but a half-sentence reads as damage inside a prompt, and the
+  // thread has its own question in front of it either way. Drop it instead.
+  const named = topic && !topic.endsWith('…') ? ' on ' + topic : '';
+  return 'The second opinion you asked ' + targetDesc + ' for'
+    + named + ' is in ' + aRel + '. '
+    + 'Read it, then tell me where it agrees with you, where it does not, and what you now think — '
+    + 'say so plainly if you still disagree with it. Do not change any code until I say so.';
+}
+
+// Send a thread its half of a consult, waiting out the CLI's boot if the thread
+// was opened *for* this consult moments ago (`openedAt`; 0 for a thread that was
+// already running). Everything else about delivery is ordinary — the PTY is
+// always the path — and `confirmSubmit` still covers a composer that wasn't
+// quite ready.
+function deliverConsultPrompt(pane, text, openedAt) {
+  const wait = openedAt ? Math.max(0, CONSULT_BOOT_MS - (Date.now() - openedAt)) : 0;
+  if (!wait) { deliverPrompt(pane, text, [], { caption: false }); return; }
+  setTimeout(() => {
+    if (pane.disposed || pane.state === 'dead') return;
+    deliverPrompt(pane, text, [], { caption: false });
+  }, wait);
+}
+
+// Start a consult from `source`. `target` is either an existing pane
+// (`{ pane }`) or an agent to open a new thread on (`{ agent }`). `topic` is
+// what the user asked about, and may be empty — the source thread then picks
+// the question out of its own conversation.
+async function startConsult(source, target, topic) {
+  const board = source.board;
+  const dir = board && board.dir;
+  if (!dir) { hmToast('This hive has no project directory to write a consult in.', 'err'); return; }
+  if (source.state === 'dead') {
+    hmToast(paneLabel(source) + ' has exited — it can\'t ask anything.', 'err');
+    return;
+  }
+  if (source.consult) { hmToast(paneLabel(source) + ' is already waiting on a second opinion.', 'err'); return; }
+
+  let dest = target && target.pane;
+  if (dest === source) { hmToast('Pick a different thread to ask.', 'err'); return; }
+  if (dest && dest.disposed) dest = null;
+  let opened = 0;
+  if (!dest) {
+    dest = addTerminal(board, { agent: isValidAgent(target && target.agent) ? target.agent : defaultAgent });
+    if (!dest) { hmToast('Could not open a thread to ask.', 'err'); return; }
+    opened = Date.now();
+  }
+
+  // Claim the pane before the first await — see startHandoff.
+  const id = newConsultId();
+  const c = beginConsult(source, dest, id, 'question', consultTopicLabel(topic), opened);
+  await consultPrepare(dir);
+  if (source.consult !== c) return;                 // cancelled while we waited
+  if (source.disposed || dest.disposed) { endConsult(source); return; }
+
+  // `caption: false` + an explicit caption, for the same reason as a handoff:
+  // the request is a multi-line outline and must not become the thread's
+  // caption.
+  deliverPrompt(source, consultQuestionPrompt(consultRel(id), threadDescFor(dest), c.topic), [], { caption: false });
+  setPaneCaption(source, 'Asking ' + paneLabel(dest) + (c.topic ? ' about ' + c.topic : ''));
+  hmToast('Asked ' + paneLabel(source) + ' to write its question for ' + paneLabel(dest) + '…');
+}
+
+// Adopt a question a thread wrote on its own: the question file already exists,
+// so this joins the consult at the second leg and sends it straight to `dest`.
+function adoptConsult(source, dest, id, topic, opened) {
+  const c = beginConsult(source, dest, id, 'answer', consultTopicLabel(topic), opened);
+  deliverConsultPrompt(dest, consultAnswerPrompt(consultRel(id), consultReplyRel(id), threadDescFor(source)), opened);
+  setPaneCaption(dest, 'Answering ' + paneLabel(source) + (c.topic ? ' on ' + c.topic : ''));
+  hmToast(paneLabel(source) + ' asked ' + paneLabel(dest) + ' for a second opinion' + (c.topic ? ' on ' + c.topic : '') + '.');
+}
+
+// Put a consult on the asking pane and start its poll. `phase` is which file is
+// being waited for; the timeout clock restarts with each leg.
+function beginConsult(source, dest, id, phase, topic, destOpened) {
+  const c = {
+    id, dest, phase, topic, destOpened: destOpened || 0,
+    started: Date.now(), lastMtime: null, busy: false, timer: null,
+  };
+  source.consult = c;
+  c.timer = setInterval(() => consultPoll(source), CONSULT_POLL_MS);
+  updateThreadMenuChip(source);
+  return c;
+}
+
+// `.hivemind/` out of Git, stale consults out of the folder, and the protocol
+// README in it. All three are best-effort: none is worth failing a consult over
+// (a missing README only means threads can't start one unprompted).
+async function consultPrepare(dir) {
+  try { await window.api.plan.ensureIgnored(dir); } catch (_) { /* gitignore is a nicety */ }
+  try { await window.api.consult.sweep(dir); } catch (_) { /* stale consults are harmless */ }
+  try { await window.api.consult.ensureDocs(dir); } catch (_) { /* read-only project */ }
+}
+
+async function consultPoll(source) {
+  const c = source.consult;
+  if (!c) return;
+  if (source.disposed) { endConsult(source); return; }
+  if (c.busy) return; // a slow read must not stack up polls
+  if (c.dest.disposed || c.dest.state === 'dead') {
+    endConsult(source, 'The thread ' + paneLabel(source) + ' was asking has '
+      + (c.dest.disposed ? 'been closed.' : 'exited.'), 'err');
+    return;
+  }
+  const limit = c.phase === 'question' ? CONSULT_QUESTION_TIMEOUT_MS : CONSULT_ANSWER_TIMEOUT_MS;
+  if (Date.now() - c.started > limit) {
+    endConsult(source, c.phase === 'question'
+      ? paneLabel(source) + ' didn\'t write its question — check the thread and try again.'
+      : paneLabel(c.dest) + ' didn\'t answer — check the thread and try again.', 'err');
+    return;
+  }
+  c.busy = true;
+  let res = null;
+  try {
+    res = c.phase === 'question'
+      ? await window.api.consult.read(source.board.dir, c.id)
+      : await window.api.consult.readReply(source.board.dir, c.id);
+  } catch (_) { /* retry next tick */ }
+  c.busy = false;
+  if (source.consult !== c) return; // cancelled, or the pane closed, mid-read
+  if (!res || !res.ok || !res.content || res.content.trim().length < CONSULT_MIN_CHARS) return;
+  // Settle on the mtime before acting — agents write a draft and then revise
+  // it, and half a question (or half an answer) loses the rest.
+  if (c.lastMtime !== res.mtime) { c.lastMtime = res.mtime; return; }
+
+  if (c.phase === 'question') {
+    // Leg one done: hand the question to the answering thread and start
+    // waiting for the reply. The consult stays on the asking pane throughout.
+    c.phase = 'answer';
+    c.started = Date.now();
+    c.lastMtime = null;
+    updateThreadMenuChip(source);
+    deliverConsultPrompt(c.dest, consultAnswerPrompt(consultRel(c.id), consultReplyRel(c.id), threadDescFor(source)), c.destOpened);
+    setPaneCaption(c.dest, 'Answering ' + paneLabel(source) + (c.topic ? ' on ' + c.topic : ''));
+    hmToast('Asked ' + paneLabel(c.dest) + ' for its opinion…');
+    return;
+  }
+
+  // Leg two done: the answer goes back into the asking thread's conversation,
+  // which is the whole point — it asked, so it reads the reply and carries on.
+  const dest = c.dest;
+  const topic = c.topic;
+  endConsult(source);
+  deliverPrompt(source, consultReturnPrompt(consultReplyRel(c.id), threadDescFor(dest), topic), [], { caption: false });
+  setPaneCaption(source, 'Reading ' + paneLabel(dest) + '’s opinion');
+  focusPane(source);
+  hmToast(paneLabel(dest) + ' answered — sent it back to ' + paneLabel(source) + '.');
+}
+
+// Tear the consult state down (poll timer included) and optionally say why.
+// Safe to call on a pane that isn't consulting.
+function endConsult(pane, msg, kind) {
+  const c = pane.consult;
+  if (c && c.timer) clearInterval(c.timer);
+  pane.consult = null;
+  updateThreadMenuChip(pane);
+  if (msg) hmToast(msg, kind);
+}
+
+function cancelConsult(pane) {
+  if (!pane.consult) return;
+  const c = pane.consult;
+  endConsult(pane, c.phase === 'question'
+    ? 'Stopped waiting for ' + paneLabel(pane) + '’s question.'
+    : 'Stopped waiting for ' + paneLabel(c.dest) + '’s answer.');
+}
+
+// --- Unsolicited consults (a thread asking on its own) ----------------------
+//
+// The user tells the agent itself ("go ask Codex what it thinks"), so the
+// request arrives as a file, not as a Hivemind command. Every hive with a live
+// thread is scanned for `ask-*.md` questions nobody is driving yet.
+
+// Requests already picked up (or refused), keyed `<boardId>/<id>`, so a scan
+// can't adopt the same question twice — the file stays on disk until its answer
+// lands beside it, and a failed one must not be retried forever.
+const consultSeen = new Set();
+// Mtimes from the previous scan: an unsolicited question gets the same settle
+// treatment as a solicited one, since the thread is writing it as we look.
+const consultInboxMtimes = new Map();
+
+// Read one field out of a request's front matter. Deliberately loose — agents
+// write `to: gemini`, `to: "gemini"` or `- to: gemini` — and limited to the head
+// of the file so a mention in the body can't be mistaken for the header.
+function consultField(text, key) {
+  const head = String(text || '').split(/\r?\n/).slice(0, 40).join('\n');
+  const m = new RegExp('^[\\s>*-]*' + key + '\\s*:\\s*(.+)$', 'im').exec(head);
+  if (!m) return '';
+  return m[1].trim().replace(/^["'`]+|["'`,]+$/g, '').trim();
+}
+
+// Which pane wrote this request. `from:` is the thread's own name, which it
+// reads out of HIVEMIND_THREAD — so match the name the pane was *spawned*
+// under first (a rename since then never reached the running process), then the
+// current name. An agent that left the variable unexpanded (`$HIVEMIND_THREAD`)
+// or omitted the field leaves us to guess: the focused thread on that hive is
+// the one the user was just talking to, which is who asked.
+function consultAsker(board, from, dest) {
+  const q = String(from || '').trim();
+  const live = boardPanes(board).filter((p) => p !== dest && p.state !== 'dead');
+  if (q && !q.startsWith('$') && !/^%.*%$/.test(q)) {
+    const spawned = live.find((p) => (p.spawnName || '').toLowerCase() === q.toLowerCase());
+    if (spawned) return spawned;
+    const named = findPaneByName(board, q);
+    if (named && named !== dest && !named.disposed) return named;
+  }
+  if (focusedPane && live.includes(focusedPane)) return focusedPane;
+  return live[0] || null;
+}
+
+async function consultInboxTick() {
+  for (const board of boards) {
+    const dir = board.dir;
+    if (!dir) continue;
+    if (!boardPanes(board).some((p) => p.state !== 'dead')) continue;
+    let res = null;
+    try { res = await window.api.consult.requests(dir); } catch (_) { /* next tick */ }
+    if (!res || !res.ok) continue;
+    for (const req of res.requests) {
+      const key = board.id + '/' + req.id;
+      if (consultSeen.has(key)) continue;
+      // Settle, exactly as the in-flight polls do: the thread is writing this
+      // file while we are looking at it.
+      if (consultInboxMtimes.get(key) !== req.mtime) { consultInboxMtimes.set(key, req.mtime); continue; }
+      await consultAdoptRequest(board, req.id, key);
+    }
+    // Drop mtimes for requests that are gone, so the map can't grow forever.
+    const alive = new Set(res.requests.map((r) => board.id + '/' + r.id));
+    for (const key of consultInboxMtimes.keys()) {
+      if (key.startsWith(board.id + '/') && !alive.has(key)) consultInboxMtimes.delete(key);
+    }
+  }
+}
+
+async function consultAdoptRequest(board, id, key) {
+  let res = null;
+  try { res = await window.api.consult.read(board.dir, id); } catch (_) { return; }
+  if (!res || !res.ok || !res.content || res.content.trim().length < CONSULT_MIN_CHARS) return;
+
+  const to = consultField(res.content, 'to');
+  const target = hmResolveThreadTarget(board, null, to);
+  if (!target) {
+    consultSeen.add(key); // an unroutable request would be retried every 3s otherwise
+    hmToast('A thread asked to consult "' + (to || 'nobody') + '", which isn\'t a thread or agent on this hive.', 'err');
+    return;
+  }
+  // A named-but-exited thread can't answer anything; fall through to a fresh
+  // thread on the same agent rather than typing into a dead PTY.
+  const dest = (target.pane && target.pane.state !== 'dead' && !target.pane.disposed) ? target.pane : null;
+  if (target.pane && !dest) target.agent = target.pane.agent;
+  const source = consultAsker(board, consultField(res.content, 'from'), dest);
+  if (!source) { consultSeen.add(key); return; }
+  if (source === dest) {
+    consultSeen.add(key);
+    hmToast(paneLabel(source) + ' asked itself for a second opinion — ignored.', 'err');
+    return;
+  }
+  // A thread already waiting on an answer stays waiting: leave the request in
+  // the inbox (unseen) and adopt it once that consult finishes.
+  if (source.consult) return;
+
+  consultSeen.add(key);
+  await consultPrepare(board.dir);
+  if (source.disposed || source.state === 'dead') return;
+  let target2 = dest;
+  let opened = 0;
+  if (!target2 || target2.disposed) {
+    target2 = addTerminal(board, { agent: isValidAgent(target.agent) ? target.agent : defaultAgent });
+    if (!target2) { hmToast('Could not open a thread to answer ' + paneLabel(source) + '.', 'err'); return; }
+    opened = Date.now();
+  }
+  // The question's own `# Question` line is the best topic label available —
+  // Hivemind didn't choose this one, the thread did.
+  const heading = (/^#\s*Question\s*\r?\n+(.+)$/im.exec(res.content) || [])[1] || '';
+  adoptConsult(source, target2, id, heading, opened);
+}
+
+setInterval(consultInboxTick, CONSULT_INBOX_MS);
 
 // ---------------------------------------------------------------------------
 // Hivemind commands
@@ -2068,6 +2616,30 @@ function hmRouteTaskTo(board, who, task) {
   hmToast('Sent to ' + paneLabel(target) + ': ' + t);
 }
 
+// Which thread a cross-thread command means: a fresh thread on a named agent,
+// or an existing thread on this hive. Used by "hand off to <who>", by "ask
+// <who> what it thinks", and by the `to:` field of a consult a thread wrote
+// itself. The "a new …" phrasings are checked first on purpose — a thread
+// auto-named `claude 1` would otherwise swallow "a new claude thread" via
+// findPaneByName's partial matching.
+const HM_NEW_THREAD_RE =
+  /^(?:a\s+|an\s+)?(?:new|fresh|another|second|different)\s+(?:(claude|chat\s*gpt|codex|gemini|grok)\s+)?(?:thread|agent|terminal|pane)?$/i;
+const HM_AGENT_WORDS = { claude: 'claude', chatgpt: 'codex', codex: 'codex', gemini: 'gemini', grok: 'grok' };
+function hmAgentWord(w) {
+  return HM_AGENT_WORDS[String(w || '').toLowerCase().replace(/\s+/g, '')] || null;
+}
+
+function hmResolveThreadTarget(board, pane, who) {
+  const q = String(who || '').trim().replace(/^(?:the\s+)?thread\s+/i, '').replace(/[.!?]+$/, '');
+  const fresh = HM_NEW_THREAD_RE.exec(q);
+  if (fresh) return { agent: hmAgentWord(fresh[1]) || defaultAgent };
+  const named = findPaneByName(board, q);
+  if (named && named !== pane) return { pane: named };
+  // Bare agent name ("hand off to gemini", "ask gemini") means a fresh thread on it.
+  const agent = hmAgentWord(q.replace(/\s+(?:thread|agent)$/i, ''));
+  return agent ? { agent } : null;
+}
+
 // Strip the connective tissue between "open a new thread" and the task itself:
 // "and have it fix the bug" → "fix the bug".
 // "2" / "two" / "three"… → a thread count for "open N threads". Anything
@@ -2180,6 +2752,38 @@ const HM_COMMANDS = [
     run() { openModal(null); },
   },
   {
+    // "ask Gemini what it thinks about the caching plan" / "get Leo's opinion
+    // on this schema" / "ask a new Grok thread about the retry logic" — see the
+    // "Thread consult" section. Sits above `tell` on purpose: that entry claims
+    // any "ask <who> to <task>", and a topic with a "to" in it ("ask Gemini what
+    // it thinks about how to cache this") would otherwise be routed as a task
+    // to a thread that doesn't exist.
+    //
+    // Every form returns HM_PASS when the target doesn't resolve to a thread or
+    // an agent, because "ask about X" and "what do you think of X" are ordinary
+    // things to say to the thread itself — an unresolved target means this
+    // wasn't a consult at all, and the rest of the registry should have a go.
+    name: 'consult',
+    patterns: [
+      // "…'s opinion/take/view/thoughts on <topic>"
+      /^(?:get|ask\s+for|i\s+want)\s+(.+?)(?:'s|’s|s')\s+(?:second\s+)?(?:opinion|take|view|thoughts?|advice|read)\s+(?:on|about|of)\s+(.+)$/i,
+      // "a second opinion from <who> on <topic>"
+      /^(?:get|ask\s+for)?\s*(?:a\s+)?second\s+opinion\s+from\s+(.+?)\s+(?:on|about)\s+(.+)$/i,
+      // "ask <who> what it thinks about <topic>" / "ask <who> for its opinion on <topic>"
+      /^(?:ask|consult|check\s+with)\s+(.+?)\s+(?:what\s+(?:it|they|he|she)\s+thinks?\s+(?:of|about|on)|for\s+(?:its|their|a|an)?\s*(?:second\s+)?(?:opinion|take|view|thoughts?|advice)\s+(?:on|about)|about|on)\s+(.+)$/i,
+      // "ask <who>" with no topic — the thread picks the question itself.
+      /^(?:ask|consult|check\s+with)\s+(.+?)(?:\s+for\s+(?:a\s+)?second\s+opinion)?$/i,
+    ],
+    help: '<strong>ask &lt;thread&gt; what it thinks about &lt;topic&gt;</strong> / <strong>get Leo’s opinion on this</strong> — this thread writes the question, the other answers, and the answer comes back into this conversation.',
+    run(m, { board, pane }) {
+      if (!pane) return HM_PASS;
+      const who = m[1].trim().replace(/^(?:the\s+)?(?:thread\s+)?/i, '');
+      const target = hmResolveThreadTarget(board, pane, who);
+      if (!target) return HM_PASS;
+      startConsult(pane, target, hmExtractTask(m[2] || ''));
+    },
+  },
+  {
     // "tell <thread> to <task>" — route a task to another thread by name/caption.
     name: 'tell',
     patterns: [/^(?:tell|ask)\s+(?:thread\s+)?(.+?)\s+to\s+(.+)$/i],
@@ -2193,6 +2797,25 @@ const HM_COMMANDS = [
       const task = m[2].trim();
       deliverPrompt(target, task);
       hmToast('Sent to ' + paneLabel(target) + ': ' + task);
+    },
+  },
+  {
+    // "hand off to Leo" / "hand this conversation to a new ChatGPT thread" —
+    // see the "Thread handoff" section for what actually happens.
+    name: 'handoff',
+    patterns: [
+      /^(?:hand|pass)(?:\s+(?:this|it|that|the))?(?:\s+(?:conversation|thread|chat|context|work|session))?(?:\s+off)?(?:\s+over)?\s+to\s+(.+)$/i,
+    ],
+    help: '<strong>hand off to &lt;thread&gt;</strong> / <strong>hand off to a new ChatGPT thread</strong> — this thread writes a handoff brief and the other one picks the conversation up from it.',
+    run(m, { board, pane }) {
+      if (!pane) { hmToast('No thread to hand off.', 'err'); return; }
+      const who = m[1].trim();
+      const target = hmResolveThreadTarget(board, pane, who);
+      if (!target) {
+        hmToast('No thread called "' + who + '" on this hive — try “hand off to a new Claude thread”.', 'err');
+        return;
+      }
+      startHandoff(pane, target);
     },
   },
   {
@@ -2463,7 +3086,7 @@ const HM_COMMANDS = [
       /^(?:switch|change)\s+(?:(?:this|the\s+current)\s+thread\s+)?to\s+(claude|chat\s*gpt|codex|gemini|grok)$/i,
       /^use\s+(claude|chat\s*gpt|codex|gemini|grok)$/i,
     ],
-    help: '<strong>switch to claude / chatgpt / gemini / grok</strong> — restarts this thread on that agent (the conversation doesn\'t carry over).',
+    help: '<strong>switch to claude / chatgpt / gemini / grok</strong> — restarts this thread on that agent (the conversation doesn\'t carry over — to keep it, hand off to a new thread on that agent instead).',
     run(m, { pane }) {
       if (!pane) { hmToast('No thread to switch.', 'err'); return; }
       const raw = m[1].toLowerCase().replace(/\s+/g, '');
@@ -2472,7 +3095,9 @@ const HM_COMMANDS = [
       if (pane.agent === v) { hmToast('This thread is already running ' + agentFor(v).label + '.'); return; }
       setPaneAgent(pane, v);
       persistLayout(pane.board.id);
-      hmToast('Restarting this thread as ' + agentFor(v).label + ' — the conversation doesn\'t carry over.');
+      hmToast('Restarting this thread as ' + agentFor(v).label
+        + ' — the conversation doesn\'t carry over. To keep it, hand off to a new '
+        + agentFor(v).label + ' thread instead.');
     },
   },
   {
@@ -2518,6 +3143,21 @@ const HM_COMMANDS = [
       if (kind === 'git') { setGitOpen(open); if (open) refreshGit(); }
       else { setFilesOpen(open); if (open) refreshFiles(); }
       hmToast((kind === 'git' ? 'Source Control' : 'Explorer') + (open ? ' panel opened.' : ' panel closed.'));
+    },
+  },
+  {
+    name: 'sidebar',
+    patterns: [
+      /^(open|show|close|hide|collapse|expand|toggle)\s+(?:the\s+)?side\s?bar$/i,
+      /^side\s?bar$/i,
+    ],
+    help: '<strong>hide the sidebar</strong> / <strong>show the sidebar</strong> — collapses the whole sidebar for more room (Ctrl+Shift+B).',
+    run(m) {
+      const verb = (m[1] || 'toggle').toLowerCase();
+      const collapse = verb === 'toggle' ? !sidebarCollapsed
+        : (verb === 'close' || verb === 'hide' || verb === 'collapse');
+      setSidebarCollapsed(collapse);
+      hmToast(collapse ? 'Sidebar hidden.' : 'Sidebar shown.');
     },
   },
   {
@@ -2597,7 +3237,7 @@ const HM_COMMANDS = [
     run(m, { pane }) {
       if (!pane || !pane.chat || !historySupported(pane)) { hmToast('Past conversations are only available on Claude threads.', 'err'); return; }
       if (pane.view !== 'chat') setPaneView(pane, 'chat');
-      toggleHistoryMenu(pane);
+      openHistoryPage(pane);   // straight to that page of the conversation menu
     },
   },
   {
@@ -3177,17 +3817,21 @@ function initChatUI(pane, body) {
   // before this bar exists.
   filters.appendChild(pane.caption);
 
-  // History picker: a dropdown of this thread's past conversations. The button
-  // toggles a menu (populated on open via api.transcript.listSessions); picking
-  // an entry shows that session read-only over the live view (openHistorySession).
-  const historyBtn = document.createElement('button');
-  historyBtn.className = 'chat-chip chat-history-btn';
-  historyBtn.textContent = '🕘 History';
-  historyBtn.title = 'Browse this thread’s past conversations';
-  const historyMenu = document.createElement('div');
-  historyMenu.className = 'chat-history-menu hidden';
-  historyBtn.onclick = (e) => { e.stopPropagation(); toggleHistoryMenu(pane); };
-  filters.append(historyBtn, historyMenu);
+  // One overflow menu for everything you can do with the conversation itself:
+  // hand it to another thread, ask another thread for a second opinion, or
+  // browse this thread's past conversations. These were three chips once, and
+  // three of them plus the filter chips left the caption — the one thing on the
+  // bar that says what the thread is doing — shrunk to "Han…" in a two-across
+  // grid. The menu is two-level: pick the action, then pick the thread (or the
+  // past conversation). It anchors the chip group because it is the one chip
+  // shown for every agent; History alone is hidden on non-Claude threads, so
+  // anchoring on that would strand the rest of the chips mid-bar.
+  const menuBtn = document.createElement('button');
+  menuBtn.className = 'chat-chip chat-thread-menu-btn';
+  const threadMenu = document.createElement('div');
+  threadMenu.className = 'chat-thread-menu hidden';
+  menuBtn.onclick = (e) => { e.stopPropagation(); toggleThreadMenu(pane); };
+  filters.append(menuBtn, threadMenu);
 
   const interactBtn = document.createElement('button');
   interactBtn.className = 'chat-chip chat-interact-btn';
@@ -3241,12 +3885,38 @@ function initChatUI(pane, body) {
   workingText.textContent = 'working…';
   working.append(workingIcon, workingText);
 
+  // Conversation intro bar: a long conversation scrolls its opening prompt out
+  // of the window, so once that first message is above the visible top a
+  // one-line reminder of what this conversation is about pins itself over the
+  // message list (syncChatIntro). Clicking the bar expands the whole prompt;
+  // the ↑ button jumps back to the message itself.
+  const intro = document.createElement('div');
+  intro.className = 'chat-intro hidden';
+  const introChevron = document.createElement('span');
+  introChevron.className = 'chat-intro-chevron';
+  introChevron.textContent = '▸';
+  const introLabel = document.createElement('span');
+  introLabel.className = 'chat-intro-label';
+  introLabel.textContent = 'Prompt';
+  const introText = document.createElement('span');
+  introText.className = 'chat-intro-text';
+  const introTopBtn = document.createElement('button');
+  introTopBtn.className = 'chat-intro-btn';
+  introTopBtn.textContent = '↑';
+  introTopBtn.title = 'Go to the start of this conversation';
+  introTopBtn.onclick = (e) => { e.stopPropagation(); jumpToChatIntro(pane); };
+  intro.append(introChevron, introLabel, introText, introTopBtn);
+  intro.title = 'The prompt this conversation started from — click to see all of it';
+  intro.onclick = () => setChatIntroOpen(pane, !pane.chat.introOpen);
+
   // Message list.
   const list = document.createElement('div');
   list.className = 'chat-list';
   list.addEventListener('scroll', () => {
     const c = pane.chat;
-    if (c) c.pinned = list.scrollTop + list.clientHeight >= list.scrollHeight - 40;
+    if (!c) return;
+    c.pinned = list.scrollTop + list.clientHeight >= list.scrollHeight - 40;
+    syncChatIntro(pane);
   });
   list.appendChild(working);
 
@@ -3307,14 +3977,20 @@ function initChatUI(pane, body) {
   interactionClose.onclick = (e) => { e.stopPropagation(); setChatInteraction(pane, false); };
   interactionHead.append(interactionLabel, interactionClose);
   interaction.appendChild(interactionHead);
-  wrap.append(filters, notice, historyBar, list, interaction, composer);
+  wrap.append(filters, notice, historyBar, intro, list, interaction, composer);
   body.appendChild(wrap);
 
   pane.chat = {
     wrap, list, input, sendBtn, notice, chips, attachRow, topic, working,
+    intro, introText, introChevron,
+    introRow: null,          // the conversation's first user row (what the bar reflects)
+    introOpen: false,        // bar expanded to the full prompt
     interaction, interactBtn, interactionOpen: false,
     terminalHost: body.querySelector('.pane-term'), terminalHome: body,
-    historyBtn, historyMenu, historyBar, historyBarText,
+    menuBtn, threadMenu,
+    // The history list is one page of that same menu, so it writes into the
+    // same element; `historyMenu` is kept as the name the history code uses.
+    historyMenu: threadMenu, historyBar, historyBarText,
     viewingHistory: false,   // true while showing a past session over the live view
     historySession: null,    // the session being viewed (so the composer can resume it)
     attachments: [],         // { path, name, isImage, thumbUrl } chips awaiting send
@@ -3550,8 +4226,8 @@ function fileChipLabel(att) {
 
 // ---------------------------------------------------------------------------
 // Composer autocomplete. Two triggers:
-//   "/" as the first character  -> slash commands (built-ins below, plus the
-//        project's .claude/commands/*.md and .claude/skills/* directories)
+//   "/" as the first character  -> shared project skills, plus Claude native
+//        commands and legacy skills on Claude panes
 //   "@word" anywhere            -> file paths under the board's project
 //        directory, listed one level at a time via api.files.list
 // ↑/↓ select, Tab/Enter accept, Esc dismisses. Enter falls through to "send"
@@ -3584,6 +4260,191 @@ const SLASH_COMMANDS = [
   ['/vim', 'Toggle vim editing mode'],
 ];
 
+// Shared skills use a plain prompt so discovery does not depend on a CLI's
+// native skill syntax. Claude-only commands remain native slash commands.
+// list() uses the existing guarded files IPC; no contents cross the bridge.
+async function discoverProjectCommands(dir, agent, list) {
+  const byName = new Map();
+  async function entries(rel) {
+    try {
+      const res = await list(dir, rel);
+      return res && res.ok ? res.entries : [];
+    } catch (_) { return []; }
+  }
+  const roots = ['.agents/skills'];
+  if (agent === 'claude') roots.push('.claude/skills');
+  else if (agent === 'gemini') roots.push('.gemini/skills');
+  const catalogs = await Promise.all(roots.map(async root => {
+    const dirs = (await entries(root)).filter(e => e.isDir && /^[a-z0-9][a-z0-9-]{0,63}$/.test(e.name));
+    return Promise.all(dirs.map(async e => {
+      const rel = root + '/' + e.name;
+      const children = await entries(rel);
+      if (!children.some(child => !child.isDir && child.name === 'SKILL.md')) return null;
+      return {
+        label: '/' + e.name,
+        desc: 'Project skill · ' + root,
+        insert: root === '.claude/skills' ? '/' + e.name + ' ' :
+          'Read "AGENTS.md" if present, then read and follow ' +
+          JSON.stringify(rel + '/SKILL.md') + ' for this task. ',
+      };
+    }));
+  }));
+  // Canonical skills win over compatibility wrappers with the same name.
+  for (const catalog of catalogs) {
+    for (const item of catalog) if (item && !byName.has(item.label)) byName.set(item.label, item);
+  }
+  if (agent === 'claude') {
+    for (const e of await entries('.claude/commands')) {
+      if (e.isDir || !/\.md$/i.test(e.name)) continue;
+      const label = '/' + e.name.replace(/\.md$/i, '');
+      if (!byName.has(label)) byName.set(label, { label, desc: 'Project command', insert: label + ' ' });
+    }
+  }
+  return Array.from(byName.values());
+}
+
+// ----- @-mention file index -------------------------------------------------
+// "@" completes against every file in the hive, not just the folder you happen
+// to be in, so the index is fetched once per project directory and ranked in
+// the renderer — a project-wide fuzzy match per keystroke can't cross IPC. The
+// fs watcher invalidates it (a file a thread just wrote should be mentionable);
+// the TTL covers whatever the watcher misses.
+const FILE_INDEX_TTL_MS = 60000;
+const AC_MAX_FILES = 12;
+const FILE_MENTION_RECENT_MAX = 8;
+const EMPTY_FILE_INDEX = { files: [], dirs: [], truncated: false };
+const fileIndexCache = new Map();    // project dir -> { at, promise }
+const fileMentionRecent = new Map(); // project dir -> [rel, …], most recent first
+
+function invalidateFileIndex(dir) {
+  if (dir) fileIndexCache.delete(dir);
+  else fileIndexCache.clear();
+}
+
+function projectFileIndex(dir) {
+  const hit = fileIndexCache.get(dir);
+  if (hit && Date.now() - hit.at < FILE_INDEX_TTL_MS) return hit.promise;
+  const entry = { at: Date.now(), promise: null };
+  entry.promise = (async () => {
+    let res = null;
+    try { res = await window.api.files.index(dir); } catch (_) { res = null; }
+    if (res && res.ok) return res;
+    // Don't cache a failure for a minute — folder listing still completes, and
+    // the next keystroke should get a real chance at the index.
+    if (fileIndexCache.get(dir) === entry) fileIndexCache.delete(dir);
+    return EMPTY_FILE_INDEX;
+  })();
+  fileIndexCache.set(dir, entry);
+  return entry.promise;
+}
+
+// Mentioning a file is a strong hint you'll mention it again this session.
+function noteFileMention(dir, rel) {
+  if (!dir || !rel) return;
+  const prev = fileMentionRecent.get(dir) || [];
+  fileMentionRecent.set(dir, [rel, ...prev.filter((p) => p !== rel)].slice(0, FILE_MENTION_RECENT_MAX));
+}
+
+const AC_WORD_SEP = /[/._\- ]/;
+const pathDepth = (p) => { let d = 0; for (let i = 0; i < p.length; i++) if (p.charCodeAt(i) === 47) d++; return d; };
+
+// Greedy subsequence scan of `q` (lowercased, non-empty) through `lower`, in
+// one direction. Returns the matched indices, or null when `q` isn't a
+// subsequence at all — both directions agree on *whether* there is a match and
+// disagree only on which one.
+function greedyHits(lower, q, forward) {
+  const n = lower.length, m = q.length;
+  const hits = new Array(m);
+  if (forward) {
+    let ti = 0;
+    for (let qi = 0; qi < m; qi++) {
+      while (ti < n && lower.charCodeAt(ti) !== q.charCodeAt(qi)) ti++;
+      if (ti >= n) return null;
+      hits[qi] = ti++;
+    }
+  } else {
+    let ti = n - 1;
+    for (let qi = m - 1; qi >= 0; qi--) {
+      while (ti >= 0 && lower.charCodeAt(ti) !== q.charCodeAt(qi)) ti--;
+      if (ti < 0) return null;
+      hits[qi] = ti--;
+    }
+  }
+  return hits;
+}
+
+// How good a match those indices are: contiguous runs, word and camelCase
+// starts, and characters landing in the file name rather than a parent folder.
+function scoreHits(text, q, hits) {
+  const baseStart = text.lastIndexOf('/') + 1;
+  let score = 0, prev = -2;
+  for (let qi = 0; qi < hits.length; qi++) {
+    const i = hits[qi];
+    let s = 1;
+    if (i === prev + 1) s += 5;                                        // contiguous run
+    if (i === 0 || AC_WORD_SEP.test(text[i - 1])) s += 8;              // start of a word
+    else if (text[i - 1] >= 'a' && text[i - 1] <= 'z' &&
+             text[i] >= 'A' && text[i] <= 'Z') s += 6;                 // camelCase hump
+    if (i >= baseStart) s += 6;                                        // in the file name
+    score += s;
+    prev = i;
+  }
+  const lower = text.toLowerCase();
+  if (lower.startsWith(q)) score += 12;
+  if (lower.startsWith(q, baseStart)) score += 20;                     // file name prefix
+  score -= hits[0] * 0.4;                    // prefer matches that start early
+  score -= (text.length - q.length) * 0.15;  // ties break toward the shorter path
+  return score;
+}
+
+// Rank a project path against what's been typed. Returns `{ score, hits }` —
+// `hits` being indices into `text`, so the menu can show which characters
+// matched — or null when the path doesn't match at all.
+//
+// Both scan directions are scored because each is wrong in the opposite way.
+// Forward-greedy anchors every character on its first occurrence, so "rend"
+// against "src/renderer.js" lights up the "r" of "src" and reads as a scattered
+// match; backward-greedy anchors on the last, so the same query against
+// "docs/renderer.md" reaches past the name to the "d" of ".md". Whichever scores
+// higher is the run the typist meant, and one extra pass is nothing next to the
+// fuzzy match itself.
+function fuzzyMatchPath(q, text) {
+  if (q.length > text.length) return null;
+  const lower = text.toLowerCase();
+  const back = greedyHits(lower, q, false);
+  if (!back) return null;
+  const forward = greedyHits(lower, q, true);
+  const backScore = scoreHits(text, q, back);
+  const forwardScore = scoreHits(text, q, forward);
+  return forwardScore > backScore
+    ? { score: forwardScore, hits: forward }
+    : { score: backScore, hits: back };
+}
+
+// Fill `el` with `text`, wrapping the characters at `hits` so a suggestion
+// shows why it matched. Nodes only, never innerHTML — these are file names off
+// disk, and agent threads are what write files here.
+function renderAcText(el, text, hits) {
+  el.textContent = '';
+  if (!hits || !hits.length) { el.textContent = text; return; }
+  const marked = new Set(hits);
+  let i = 0;
+  while (i < text.length) {
+    const on = marked.has(i);
+    let j = i + 1;
+    while (j < text.length && marked.has(j) === on) j++;
+    if (on) {
+      const span = document.createElement('span');
+      span.className = 'chat-ac-hit';
+      span.textContent = text.slice(i, j);
+      el.appendChild(span);
+    } else {
+      el.appendChild(document.createTextNode(text.slice(i, j)));
+    }
+    i = j;
+  }
+}
+
 function initChatAutocomplete(pane, composer, input) {
   const menu = document.createElement('div');
   menu.className = 'chat-autocomplete hidden';
@@ -3592,7 +4453,8 @@ function initChatAutocomplete(pane, composer, input) {
   const st = {
     items: [], sel: 0, token: null,
     seq: 0,            // guards against stale async listings
-    customFor: null,   // board dir the cached project commands were read from
+    customFor: null,   // directory + agent; switching agents invalidates commands
+    customUntil: 0,
     custom: null,
   };
 
@@ -3618,11 +4480,13 @@ function initChatAutocomplete(pane, composer, input) {
     const tok = tokenAtCaret();
     if (!tok) { hide(); return; }
     const seq = ++st.seq;
-    const items = tok.type === 'slash' ? await slashItems(tok.query) : await fileItems(tok.query);
+    const items = tok.type === 'slash'
+      ? (await slashItems(tok.query)).slice(0, AC_MAX_ITEMS)
+      : await fileItems(tok.query); // already capped at AC_MAX_FILES
     if (seq !== st.seq || pane.disposed) return; // a newer refresh superseded this one
     if (document.activeElement !== input) return; // blurred while the listing was in flight
     st.token = tok;
-    st.items = items.slice(0, AC_MAX_ITEMS);
+    st.items = items;
     st.sel = 0;
     render();
   }
@@ -3630,59 +4494,104 @@ function initChatAutocomplete(pane, composer, input) {
   async function slashItems(query) {
     const q = query.toLowerCase();
     const byName = new Map();
-    for (const [name, desc] of SLASH_COMMANDS) byName.set(name, { label: name, desc, insert: name + ' ' });
+    if (pane.agent === 'claude') {
+      for (const [name, desc] of SLASH_COMMANDS) byName.set(name, { label: name, desc, insert: name + ' ' });
+    }
     for (const it of await projectCommands()) if (!byName.has(it.label)) byName.set(it.label, it);
     return Array.from(byName.values())
       .filter((it) => it.label.slice(1).toLowerCase().startsWith(q))
       .sort((a, b) => a.label.localeCompare(b.label));
   }
 
-  // Project slash commands, read once per board directory.
+  // Share an in-flight read while typing. Expire it so added skills appear
+  // without a reload, and key by agent as well as directory.
   async function projectCommands() {
     const dir = pane.board.dir;
     if (!dir) return [];
-    if (st.customFor === dir && st.custom) return st.custom;
-    st.customFor = dir;
-    st.custom = [];
-    try {
-      const [cmds, skills] = await Promise.all([
-        window.api.files.list(dir, '.claude/commands'),
-        window.api.files.list(dir, '.claude/skills'),
-      ]);
-      if (cmds && cmds.ok) {
-        for (const e of cmds.entries) {
-          if (e.isDir || !/\.md$/i.test(e.name)) continue;
-          const name = '/' + e.name.replace(/\.md$/i, '');
-          st.custom.push({ label: name, desc: 'Project command', insert: name + ' ' });
-        }
-      }
-      if (skills && skills.ok) {
-        for (const e of skills.entries) {
-          if (e.isDir) st.custom.push({ label: '/' + e.name, desc: 'Project skill', insert: '/' + e.name + ' ' });
-        }
-      }
-    } catch (_) { /* no project commands */ }
+    const key = JSON.stringify([dir, pane.agent]);
+    if (st.customFor === key && st.custom && Date.now() < st.customUntil) return st.custom;
+    st.customFor = key;
+    st.customUntil = Date.now() + 5000;
+    st.custom = discoverProjectCommands(dir, pane.agent, (cwd, rel) => window.api.files.list(cwd, rel));
     return st.custom;
   }
 
+  async function listDir(dir, rel) {
+    try {
+      const res = await window.api.files.list(dir, rel);
+      return res && res.ok ? res.entries : [];
+    } catch (_) { return []; }
+  }
+
+  // Rank the whole project against what's been typed after "@": any part of a
+  // name or path filters project-wide, the way an editor's quick-open does.
+  // The folder named by the last "/" is *also* listed straight from disk,
+  // because the index is .gitignore-filtered and pointing a thread at a build
+  // artifact or a .env is exactly when you need the path that isn't in it.
   async function fileItems(query) {
     const dir = pane.board.dir;
     if (!dir) return [];
-    const slash = query.lastIndexOf('/');
-    const parent = slash >= 0 ? query.slice(0, slash) : '';
-    const prefix = (slash >= 0 ? query.slice(slash + 1) : query).toLowerCase();
-    let res;
-    try { res = await window.api.files.list(dir, parent); } catch (_) { return []; }
-    if (!res || !res.ok) return [];
+    const cut = query.lastIndexOf('/');
+    const parent = cut >= 0 ? query.slice(0, cut) : '';
+    const prefix = query.slice(cut + 1).toLowerCase();
+    const q = query.toLowerCase();
+
+    // Only merge the on-disk listing once something is typed: it is unfiltered,
+    // so folding it into the bare "@" list would open the picker on
+    // node_modules/ and dist/ — the noise the index exists to keep out.
+    const [index, siblings] = await Promise.all([
+      projectFileIndex(dir),
+      query ? listDir(dir, parent) : [],
+    ]);
+    const recent = fileMentionRecent.get(dir) || [];
+    const seen = new Set();
+    const scored = [];
+
+    function add(p, isDir, indexed) {
+      if (seen.has(p)) return;
+      seen.add(p);
+      let hits = null, score;
+      if (q) {
+        const m = fuzzyMatchPath(q, p);
+        if (!m) return;
+        score = m.score;
+        hits = m.hits;
+      } else {
+        // Nothing typed yet: open on the top of the hive, shallowest first,
+        // rather than an arbitrary slice of a few thousand paths.
+        score = -pathDepth(p) * 40 - p.length * 0.1;
+      }
+      if (isDir) score += q ? -4 : 16;  // folders lead the unfiltered list, but a
+                                        // file beats its own folder on a tie
+      const at = recent.indexOf(p);
+      if (at >= 0) score += 60 - at;    // paths mentioned this session float up
+      if (!indexed) score -= 10;        // on-disk-only (ignored) ranks below the project
+      scored.push({ path: p, isDir, score, hits });
+    }
+
+    for (const f of index.files) add(f, false, true);
+    for (const d of index.dirs) add(d, true, true);
     const showHidden = prefix.startsWith('.');
-    return res.entries
-      .filter((e) => (showHidden || !e.name.startsWith('.')) && e.name.toLowerCase().startsWith(prefix))
-      .map((e) => ({
-        label: e.name + (e.isDir ? '/' : ''),
-        desc: e.path,
-        insert: '@' + e.path + (e.isDir ? '/' : ' '),
-        keepOpen: e.isDir, // completing a directory re-opens the menu inside it
-      }));
+    for (const e of siblings) {
+      if (!showHidden && e.name.startsWith('.')) continue;
+      if (!e.name.toLowerCase().startsWith(prefix)) continue;
+      add(e.path, e.isDir, false);
+    }
+
+    scored.sort((a, b) => b.score - a.score ||
+      a.path.length - b.path.length || a.path.localeCompare(b.path));
+    return scored.slice(0, AC_MAX_FILES).map((m) => {
+      const baseStart = m.path.lastIndexOf('/') + 1;
+      return {
+        label: m.path.slice(baseStart) + (m.isDir ? '/' : ''),
+        desc: baseStart ? m.path.slice(0, baseStart - 1) : '',
+        hits: m.hits,
+        hitBase: baseStart,
+        mention: m.isDir ? '' : m.path,
+        insert: '@' + m.path + (m.isDir ? '/' : ' '),
+        keepOpen: m.isDir, // completing a folder re-opens the menu inside it
+      };
+    });
   }
 
   function render() {
@@ -3691,12 +4600,15 @@ function initChatAutocomplete(pane, composer, input) {
     st.items.forEach((it, i) => {
       const row = document.createElement('div');
       row.className = 'chat-ac-item' + (i === st.sel ? ' sel' : '');
+      // Split the match across the two columns: hit indices are into the full
+      // path, the name column starts at `hitBase`, and `hitBase - 1` is the
+      // separating "/" that neither column shows.
       const name = document.createElement('span');
       name.className = 'chat-ac-name';
-      name.textContent = it.label;
+      renderAcText(name, it.label, it.hits && it.hits.filter((h) => h >= it.hitBase).map((h) => h - it.hitBase));
       const desc = document.createElement('span');
       desc.className = 'chat-ac-desc';
-      desc.textContent = it.desc || '';
+      renderAcText(desc, it.desc || '', it.hits && it.hits.filter((h) => h < it.hitBase - 1));
       row.append(name, desc);
       // mousedown (not click) with preventDefault keeps focus in the textarea.
       row.addEventListener('mousedown', (e) => { e.preventDefault(); e.stopPropagation(); accept(it); });
@@ -3714,6 +4626,7 @@ function initChatAutocomplete(pane, composer, input) {
   function accept(it) {
     const tok = st.token;
     if (!tok) return;
+    if (it.mention) noteFileMention(pane.board.dir, it.mention);
     input.setRangeText(it.insert, tok.start, tok.end, 'end');
     autosizeComposer(input);
     input.focus();
@@ -3760,10 +4673,15 @@ function initChatAutocomplete(pane, composer, input) {
 function updateViewBtn(pane) {
   if (!pane.viewBtn) return;
   const chat = pane.view === 'chat';
-  pane.viewBtn.textContent = chat ? '>_' : '💬';
+  const icon = pane.viewBtn.querySelector('.view-icon');
+  const label = pane.viewBtn.querySelector('.view-label');
+  if (icon) icon.textContent = chat ? '❯_' : '💬';
+  if (label) label.textContent = chat ? 'Terminal' : 'Chat';
+  pane.viewBtn.classList.toggle('to-term', chat);
   pane.viewBtn.title = chat
     ? 'Show the terminal running underneath this chat view'
     : 'Show the chat view';
+  pane.viewBtn.setAttribute('aria-label', pane.viewBtn.title);
 }
 
 // Reuse the actual xterm so every CLI interaction (including future menus)
@@ -3831,8 +4749,12 @@ function updateChatChrome(pane) {
   if (!c) return;
   const transcript = transcriptSupported(pane);
   c.wrap.classList.toggle('terminal-backed', !transcript);
-  c.historyBtn.style.display = historySupported(pane) ? '' : 'none';
-  c.historyMenu.classList.add('hidden');
+  // Handing off and consulting are files plus prompts through the PTY, so both
+  // work on any agent; only the History page inside the menu is Claude-only
+  // (buildThreadMenu leaves that row out). The chip itself is never hidden,
+  // only relabelled while something is in flight.
+  c.threadMenu.classList.add('hidden');
+  updateThreadMenuChip(pane);
   for (const kind of CHAT_KINDS) {
     if (c.chips[kind]) c.chips[kind].style.display = transcript ? '' : 'none';
   }
@@ -3887,6 +4809,12 @@ function resetChat(pane) {
   c.topic.textContent = '';
   c.topic.title = '';
   c.topicFromMsg = false;
+  // The rows are gone, so the intro bar's anchor is too — the rebuild that
+  // follows names the conversation again from its own first message.
+  c.introRow = null;
+  c.introText.textContent = '';
+  c.intro.classList.add('hidden');
+  setChatIntroOpen(pane, false);
   updateChatChrome(pane);
 }
 
@@ -3939,27 +4867,170 @@ function relTimeShort(ms) {
   return new Date(ms).toLocaleDateString();
 }
 
-function hideHistoryMenu(pane) {
+// --- The conversation menu: hand off / second opinion / history -------------
+//
+// One chip, one dropdown, two levels. The root page lists what you can do with
+// this conversation; picking an action swaps the same element to that action's
+// list — the threads on this hive, or this thread's past sessions — with a row
+// back. The engines live above: see the "Thread handoff" and "Thread consult"
+// sections, and openHistorySession below.
+
+function hideThreadMenu(pane) {
   const c = pane.chat;
-  if (c) c.historyMenu.classList.add('hidden');
+  if (c) c.threadMenu.classList.add('hidden');
 }
 
-async function toggleHistoryMenu(pane) {
+// The history code calls it by its own name; it is the same one menu.
+function hideHistoryMenu(pane) { hideThreadMenu(pane); }
+
+// The chip doubles as the status light for anything in flight, because a
+// handoff and a consult each take a turn to come back and the thread would
+// otherwise look idle. With both running the label can only name one, so it
+// names neither and the menu carries a "stop waiting" row for each.
+function updateThreadMenuChip(pane) {
+  const c = pane.chat;
+  if (!c || !c.menuBtn) return;
+  const h = pane.handoff;
+  const con = pane.consult;
+  let label = '⋯ More';
+  let title = 'Hand this conversation to another thread, ask one for a second opinion, or browse past conversations';
+  if (h && con) {
+    label = '⋯ 2 waiting…';
+    title = 'Waiting on a handoff brief and a second opinion — open to stop either';
+  } else if (h) {
+    label = '⇄ Handing off…';
+    title = 'Waiting for this thread to write its handoff brief — open to stop waiting';
+  } else if (con) {
+    label = con.phase === 'question'
+      ? '💬 Writing question…'
+      : '💬 Waiting on ' + paneLabel(con.dest) + '…';
+    title = con.phase === 'question'
+      ? 'Waiting for this thread to write its question — open to stop waiting'
+      : 'Waiting for ' + paneLabel(con.dest) + ' to answer — open to stop waiting';
+  }
+  c.menuBtn.textContent = label;
+  c.menuBtn.classList.toggle('active', !!(h || con));
+  c.menuBtn.title = title;
+}
+
+function toggleThreadMenu(pane) {
   const c = pane.chat;
   if (!c) return;
-  if (!c.historyMenu.classList.contains('hidden')) { hideHistoryMenu(pane); return; }
-  c.historyMenu.innerHTML = '<div class="chat-history-empty">Loading…</div>';
-  c.historyMenu.classList.remove('hidden');
+  if (!c.threadMenu.classList.contains('hidden')) { hideThreadMenu(pane); return; }
+  buildThreadMenu(pane);
+  c.threadMenu.classList.remove('hidden');
+}
+
+// One row on any page of the menu. An `onpick` that returns `true` leaves the
+// menu open, because it moved to another page; anything else closes it.
+function threadMenuRow(pane, title, meta, onpick) {
+  const item = document.createElement('button');
+  item.className = 'chat-history-item';
+  const t = document.createElement('span');
+  t.className = 'chat-history-item-title';
+  t.textContent = title;
+  const m = document.createElement('span');
+  m.className = 'chat-history-item-meta';
+  m.textContent = meta;
+  item.append(t, m);
+  item.title = meta ? title + ' — ' + meta : title;
+  item.onclick = (e) => {
+    e.stopPropagation();
+    if (onpick() !== true) hideThreadMenu(pane);
+  };
+  pane.chat.threadMenu.appendChild(item);
+  return item;
+}
+
+function threadMenuHead(pane, text) {
+  const head = document.createElement('div');
+  head.className = 'chat-history-empty';
+  head.textContent = text;
+  pane.chat.threadMenu.appendChild(head);
+}
+
+// Root page: whatever is in flight can be stopped from the top (that is why you
+// opened the menu while the chip was saying it was waiting), then the actions.
+// An action already running doesn't offer to start again — one handoff and one
+// consult per thread is what the engines allow.
+function buildThreadMenu(pane) {
+  const c = pane.chat;
+  c.threadMenu.innerHTML = '';
+  threadMenuHead(pane, 'This conversation');
+
+  if (pane.handoff) {
+    threadMenuRow(pane, 'Stop waiting for the handoff brief',
+      'to ' + paneLabel(pane.handoff.dest), () => cancelHandoff(pane));
+  }
+  if (pane.consult) {
+    threadMenuRow(pane, 'Stop waiting for the second opinion',
+      pane.consult.phase === 'question'
+        ? 'this thread is writing the question'
+        : paneLabel(pane.consult.dest) + ' is answering',
+      () => cancelConsult(pane));
+  }
+  if (!pane.handoff) {
+    threadMenuRow(pane, '⇄ Hand off to another thread',
+      'this thread writes a brief the other picks up from', () => {
+        buildThreadPicker(pane, 'Hand this conversation to…',
+          (target) => startHandoff(pane, target));
+        return true;
+      });
+  }
+  if (!pane.consult) {
+    threadMenuRow(pane, '💬 Ask for a second opinion',
+      'another thread answers, and the answer comes back here', () => {
+        buildThreadPicker(pane, 'Ask for a second opinion from…',
+          (target) => startConsult(pane, target, ''));
+        return true;
+      });
+  }
+  if (historySupported(pane)) {
+    threadMenuRow(pane, '🕘 Past conversations',
+      'browse or continue an earlier session', () => { openHistoryPage(pane); return true; });
+  }
+}
+
+// Second page for both cross-thread actions: every other live thread on this
+// hive first (a thread that's already warm is the common case), then a fresh
+// thread on each agent — which is what makes "same conversation, different
+// model" work. The two actions differ only in what they do with the pick.
+function buildThreadPicker(pane, headText, pick) {
+  const c = pane.chat;
+  c.threadMenu.innerHTML = '';
+  threadMenuHead(pane, headText);
+  threadMenuRow(pane, '‹ Back', '', () => { buildThreadMenu(pane); return true; });
+  for (const p of boardPanes(pane.board)) {
+    if (p === pane || p.state === 'dead') continue;
+    threadMenuRow(pane, paneLabel(p),
+      agentFor(p.agent).label + ' · ' + (paneStatusLabel(p, p.state) || 'ready'),
+      () => pick({ pane: p }));
+  }
+  for (const a of AGENTS) {
+    threadMenuRow(pane, 'New ' + a.label + ' thread', 'opens a fresh thread on this hive',
+      () => pick({ agent: a.value }));
+  }
+}
+
+// Second page for history: the session list has to be fetched, so this paints a
+// placeholder first. Claude threads only — the root page hides the row on the
+// others, whose sessions Hivemind can't list.
+async function openHistoryPage(pane) {
+  const c = pane.chat;
+  c.threadMenu.innerHTML = '<div class="chat-history-empty">Loading…</div>';
+  c.threadMenu.classList.remove('hidden');
   let res;
   try { res = await window.api.transcript.listSessions({ paneId: pane.id, cwd: pane.board.dir }); }
   catch (_) { res = null; }
-  if (pane.disposed || c.historyMenu.classList.contains('hidden')) return; // closed meanwhile
+  if (pane.disposed || c.threadMenu.classList.contains('hidden')) return; // closed meanwhile
   buildHistoryMenu(pane, (res && res.sessions) || []);
 }
 
 function buildHistoryMenu(pane, sessions) {
   const c = pane.chat;
   c.historyMenu.innerHTML = '';
+  threadMenuHead(pane, 'Past conversations');
+  threadMenuRow(pane, '‹ Back', '', () => { buildThreadMenu(pane); return true; });
   if (!sessions.length) {
     const empty = document.createElement('div');
     empty.className = 'chat-history-empty';
@@ -4029,7 +5100,9 @@ function updateHistoryChrome(pane, sess) {
   const on = !!sess;
   c.historyBar.classList.toggle('hidden', !on);
   c.wrap.classList.toggle('viewing-history', on);
-  c.historyBtn.classList.toggle('active', on);
+  // The menu chip is also the "you are browsing history" light; it drops the
+  // highlight again when a handoff/consult isn't holding it (updateThreadMenuChip).
+  c.menuBtn.classList.toggle('active', on || !!pane.handoff || !!pane.consult);
   if (on) {
     c.historyBarText.textContent =
       'Viewing a past conversation' + (sess.title ? ' · ' + sess.title : '');
@@ -4075,6 +5148,9 @@ function renderChatEntries(pane, entries, backfill) {
     try { renderChatEntry(pane, e); } catch (_) { /* one bad entry never kills the view */ }
   }
   if (c.pinned || backfill) c.list.scrollTop = c.list.scrollHeight;
+  // A backfill can bury the opening message in one go without ever firing a
+  // scroll event, so the bar is re-evaluated after every batch.
+  syncChatIntro(pane);
 }
 
 function renderChatEntry(pane, e) {
@@ -4254,10 +5330,60 @@ function addUserOrMetaRow(pane, e, text) {
     pane.chat.topicFromMsg = true;
     setChatTopic(pane, text);
   }
-  upsertChatRow(pane, chatKeyFor(e), 'user', (row) => {
+  const row = upsertChatRow(pane, chatKeyFor(e), 'user', (row) => {
     row.innerHTML = '<div class="chat-bubble user"></div>';
     row.firstChild.textContent = text;
   });
+  noteChatIntro(pane, text, row);
+}
+
+// -- Conversation intro bar --------------------------------------------------
+// What the conversation is about, kept reachable after it has scrolled away.
+// The source is the opening user message: the first one rendered wins and
+// nothing later replaces it (resetChat clears it when the view is rebuilt, so
+// a resumed or browsed conversation takes its own first message).
+
+const CHAT_INTRO_MAX = 4000; // an opening prompt can be a whole essay — cap what the bar holds
+
+function noteChatIntro(pane, text, row) {
+  const c = pane.chat;
+  if (!c || c.introRow) return;
+  const t = String(text || '').replace(/s+/g, ' ').trim();
+  if (!t) return;
+  c.introRow = row;
+  c.introText.textContent = t.slice(0, CHAT_INTRO_MAX);
+  syncChatIntro(pane);
+}
+
+function setChatIntroOpen(pane, on) {
+  const c = pane.chat;
+  if (!c) return;
+  c.introOpen = !!on;
+  c.intro.classList.toggle('open', c.introOpen);
+  c.introChevron.textContent = c.introOpen ? '▾' : '▸';
+  c.intro.title = c.introOpen
+    ? 'The prompt this conversation started from — click to collapse'
+    : 'The prompt this conversation started from — click to see all of it';
+}
+
+// Show the bar only while the opening message is scrolled off the top: with it
+// on screen the bar would just repeat what the user is already looking at.
+function syncChatIntro(pane) {
+  const c = pane.chat;
+  if (!c || !c.introRow) return;
+  const box = c.list.getBoundingClientRect();
+  if (!box.height) return; // pane not visible (other hive, terminal view) — leave the bar as it is
+  const show = c.introRow.isConnected && c.introRow.getBoundingClientRect().bottom < box.top + 2;
+  if (!show && c.introOpen) setChatIntroOpen(pane, false);
+  c.intro.classList.toggle('hidden', !show);
+}
+
+// ↑ on the bar: back to the opening message, flashed like a Prompt History jump.
+function jumpToChatIntro(pane) {
+  const c = pane.chat;
+  if (!c || !c.introRow || !c.introRow.isConnected) return;
+  setChatIntroOpen(pane, false);
+  jumpToChatRow(pane, c.introRow);
 }
 
 // The latest summary wins; a bare/blank one never wipes an existing topic.
@@ -5075,6 +6201,44 @@ const SIDEBAR_W_DEFAULT = 230;
   handle.addEventListener('dblclick', () => { applyW(SIDEBAR_W_DEFAULT); refit(); });
 })();
 
+// -- Sidebar collapse -------------------------------------------------------
+// Hide the sidebar outright (hive list, docked panels, action buttons) so a
+// wide hive gets the whole window. This is a *view* setting, not a mode: the
+// panels keep whatever open/closed state they had, so restoring brings the
+// sidebar back exactly as it was. Remembered across restarts.
+//
+// The way back must never be inside the thing that's hidden, so the board bar
+// carries a `»` button that only exists while collapsed, and Ctrl+Shift+B
+// toggles from anywhere. Anything that *opens* a docked panel while collapsed
+// restores the sidebar first (see syncSidebarPanelState) — otherwise the
+// Explorer/Git/History/🐝 commands and Ctrl+Shift+H would silently do nothing.
+const SIDEBAR_COLLAPSE_KEY = 'hm.sidebarCollapsed';
+let sidebarCollapsed = false;
+
+function setSidebarCollapsed(on, { persist = true, refit = true } = {}) {
+  const sidebar = $('sidebar');
+  const expandBtn = $('sidebar-expand');
+  if (!sidebar) return;
+  sidebarCollapsed = !!on;
+  sidebar.classList.toggle('collapsed', sidebarCollapsed);
+  if (expandBtn) expandBtn.classList.toggle('hidden', !sidebarCollapsed);
+  if (persist) localStorage.setItem(SIDEBAR_COLLAPSE_KEY, sidebarCollapsed ? '1' : '0');
+  // The panes just got wider/narrower — re-fit xterm and tell the PTYs.
+  if (refit && typeof fitBoard === 'function' && activeBoardId) fitBoard(activeBoardId);
+}
+function toggleSidebar() { setSidebarCollapsed(!sidebarCollapsed); }
+
+(() => {
+  // Apply the saved state before the first paint; no board exists yet, so no fit.
+  if (localStorage.getItem(SIDEBAR_COLLAPSE_KEY) === '1') {
+    setSidebarCollapsed(true, { persist: false, refit: false });
+  }
+  const collapseBtn = $('sidebar-collapse');
+  const expandBtn = $('sidebar-expand');
+  if (collapseBtn) collapseBtn.onclick = () => setSidebarCollapsed(true);
+  if (expandBtn) expandBtn.onclick = () => setSidebarCollapsed(false);
+})();
+
 const boardListEl = $('board-list');
 const gridEl = $('grid');
 const emptyState = $('empty-state');
@@ -5228,6 +6392,10 @@ function syncSidebarPanelState() {
   // A peek is a glance at the list, not a mode: any panel opening or closing
   // ends it (switching hives clears it too, in the row's click handler).
   sb.classList.remove('hives-peek');
+  // A panel opening into a collapsed sidebar would be invisible — Ctrl+Shift+H
+  // and the Explorer/Git/History commands would read as broken. Opening one is
+  // a request to see it, so it wins over the collapse.
+  if (open && sidebarCollapsed) setSidebarCollapsed(false);
 }
 
 // ---------------------------------------------------------------------------
@@ -5673,6 +6841,14 @@ function spawnPanePty(pane, { resume, initialPrompt } = {}) {
     resume: resume || false, // true → --continue, session-id string → --resume <id>
     initialPrompt: ((pane.agent === 'claude' || pane.agent === 'codex') && initialPrompt) || undefined,
     sessionId: (pane.agent === 'claude' && !resume && pane.sessionId) || undefined,
+    // Who this thread is, put in its environment as HIVEMIND_THREAD /
+    // HIVEMIND_HIVE. A thread that starts a consult on its own has to name
+    // itself in the request so the answer comes back to the right conversation,
+    // and its own name is not otherwise knowable from inside the shell.
+    // `spawnName` is remembered here because a later rename doesn't reach the
+    // running process's environment — the consult resolver falls back to it.
+    threadName: (pane.spawnName = paneLabel(pane)),
+    hiveName: pane.board.name || undefined,
   });
   // Transcript-backed chat (Claude, ChatGPT): bind this pane to the session
   // log its CLI is about to create (or, on resume, continue) for the board's
@@ -5742,14 +6918,6 @@ function createPane(board, col, opts = {}) {
   titleWrap.className = 'title-wrap';
   titleWrap.append(title);
 
-  const fontDownBtn = document.createElement('button');
-  fontDownBtn.className = 'font-btn';
-  fontDownBtn.textContent = 'A−';
-  fontDownBtn.title = 'Smaller text (Ctrl+−)';
-  const fontUpBtn = document.createElement('button');
-  fontUpBtn.className = 'font-btn';
-  fontUpBtn.textContent = 'A+';
-  fontUpBtn.title = 'Bigger text (Ctrl+=)';
   const zoomBtn = document.createElement('button');
   zoomBtn.className = 'zoom-btn';
   zoomBtn.textContent = '⛶';
@@ -5815,9 +6983,16 @@ function createPane(board, col, opts = {}) {
   closeBtn.textContent = '✕';
   closeBtn.title = 'Close thread';
   // Chat/terminal view toggle (Claude threads only — see initChatUI).
+  // Labelled pill (icon + word) rather than a bare glyph: the view you'd
+  // switch to is the one thing people hunt for most in a crowded header.
   const viewBtn = document.createElement('button');
-  viewBtn.className = 'font-btn view-btn';
-  header.append(dot, titleWrap, planChip, costEl, statusEl, agentSelect, modelSelect, codexAccountSelect, codexModelSelect, grokModelSelect, permSelect, viewBtn, fontDownBtn, fontUpBtn, zoomBtn, closeBtn);
+  viewBtn.className = 'view-btn';
+  const viewIcon = document.createElement('span');
+  viewIcon.className = 'view-icon';
+  const viewLabel = document.createElement('span');
+  viewLabel.className = 'view-label';
+  viewBtn.append(viewIcon, viewLabel);
+  header.append(dot, titleWrap, planChip, costEl, statusEl, agentSelect, modelSelect, codexAccountSelect, codexModelSelect, grokModelSelect, permSelect, viewBtn, zoomBtn, closeBtn);
 
   const termWrap = document.createElement('div');
   termWrap.className = 'pane-term';
@@ -5887,6 +7062,10 @@ function createPane(board, col, opts = {}) {
     // backfill on every bind; costFile detects /clear session rollovers.
     costSeen: new Set(), costByModel: {}, costFile: null,
     planId: opts.planId || null, // assigned lazily the first time a ⟳ plan request needs it
+    // In-flight handoff of this thread's conversation ({ id, rel, dest, … } —
+    // see "Thread handoff"). Deliberately not persisted: a brief still being
+    // written when the app closes has no waiting thread on the other side.
+    handoff: null,
     // Plan-review lifecycle (see the "Plan review" section). The file/source
     // survive restarts via the layout; the rest is rebuilt from transcript
     // backfill and the screen probe.
@@ -6064,8 +7243,6 @@ function createPane(board, col, opts = {}) {
   closeBtn.onclick = (e) => { e.stopPropagation(); closePane(pane); };
 
   // Font sizing: header buttons, Ctrl +/-/0, and Ctrl+scroll.
-  fontDownBtn.onclick = (e) => { e.stopPropagation(); setPaneFontSize(pane, pane.fontSize - 1); focusPane(pane); };
-  fontUpBtn.onclick = (e) => { e.stopPropagation(); setPaneFontSize(pane, pane.fontSize + 1); focusPane(pane); };
   // One custom key handler covers every shortcut. xterm stores a SINGLE handler
   // (calling attachCustomKeyEventHandler twice overwrites), so paste-passthrough,
   // font sizing, find, and pane nav all live here.
@@ -6166,6 +7343,13 @@ function disposePaneResources(pane) {
   clearTimeout(pane.idleTimer);
   clearTimeout(pane.qExpireTimer);
   stopAttentionProbe(pane);
+  // A handoff poll outlives its pane otherwise, reading a brief nobody wants.
+  if (pane.handoff && pane.handoff.timer) clearInterval(pane.handoff.timer);
+  pane.handoff = null;
+  // Same for a consult: its poll would keep reading an answer for a
+  // conversation that no longer exists.
+  if (pane.consult && pane.consult.timer) clearInterval(pane.consult.timer);
+  pane.consult = null;
   if (pane.composerResizeObserver) {
     try { pane.composerResizeObserver.disconnect(); } catch (_) { /* ignore */ }
     pane.composerResizeObserver = null;
@@ -6422,17 +7606,20 @@ window.api.transcript.onStatus(({ paneId, status, file }) => {
   chatBindStatus(pane, status);
 });
 
-// Click anywhere outside an open history menu closes it. Early-out with a single
-// cheap DOM query so the common case (no menu open) skips the per-pane walk.
+// Click anywhere outside an open chat dropdown (history or handoff) closes it.
+// Early-out with a single cheap DOM query so the common case (no menu open)
+// skips the per-pane walk.
 document.addEventListener('mousedown', (e) => {
-  if (!document.querySelector('.chat-history-menu:not(.hidden)')) return;
+  if (!document.querySelector('.chat-thread-menu:not(.hidden)')) return;
   for (const g of grids.values()) {
     for (const col of g.columns) {
       for (const pane of col.panes) {
         const c = pane.chat;
-        if (!c || c.historyMenu.classList.contains('hidden')) continue;
-        if (c.historyMenu.contains(e.target) || e.target === c.historyBtn) continue;
-        hideHistoryMenu(pane);
+        if (!c) continue;
+        if (!c.threadMenu.classList.contains('hidden') &&
+            !c.threadMenu.contains(e.target) && e.target !== c.menuBtn) {
+          hideThreadMenu(pane);
+        }
       }
     }
   }
@@ -6636,6 +7823,15 @@ document.addEventListener('keydown', (e) => {
     t.isContentEditable || t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.tagName === 'SELECT'
   );
   if (editable) return; // don't hijack our own text fields
+
+  // Ctrl+Shift+B — collapse / restore the sidebar. Checked before the board
+  // guard below so it also works on the welcome screen. (Ctrl+B is left alone:
+  // the agent CLIs in the panes use it.)
+  if (e.shiftKey && e.code === 'KeyB') {
+    e.preventDefault(); e.stopImmediatePropagation();
+    toggleSidebar();
+    return;
+  }
   if (!activeBoardId) return;
 
   if (e.key === 'Enter' && !e.shiftKey) {
@@ -6669,6 +7865,8 @@ document.addEventListener('keydown', (e) => {
 // panel live. The File Explorer is left to its manual ⟳ so expanded folders don't
 // collapse out from under you on every keystroke a thread makes.
 window.api.onFsChanged(({ cwd }) => {
+  // A thread just wrote a file — it should be mentionable with "@" right away.
+  invalidateFileIndex(cwd);
   const dir = activeDir();
   if (!dir || dir !== cwd) return;
   // Don't rebuild the panel while the ⋯ menu is open — that would tear the open
@@ -10155,8 +11353,8 @@ let voiceReplyEnabled = localStorage.getItem('hm.voiceReply') === '1';     // sp
 //  - `native: true` models, decoded by sherpa-onnx in a main-process utility
 //    process (STT_NATIVE in main.js) — far more accurate, needs the one-time
 //    big download. The voice worker still runs, VAD-only, for Silero.
-// Every entry must be English-only, so the worker's audio-only transcribe
-// path (no language/task) stays valid.
+// Cloud entries send phrase audio through main-process IPC; the worker only
+// runs Silero VAD. Local worker models must remain English-only.
 const STT_MODELS = [
   { value: 'onnx-community/moonshine-base-ONNX', label: 'Moonshine Base — fast, bundled (default)',
     dtype: { encoder_model: 'q8', decoder_model_merged: 'q8' } },
@@ -10164,10 +11362,12 @@ const STT_MODELS = [
     label: 'Parakeet TDT 0.6B — best accuracy (~630 MB one-time download)', native: true },
   { value: 'onnx-community/whisper-base.en', label: 'Whisper Base (English) — downloads on first use',
     dtype: { encoder_model: 'q8', decoder_model_merged: 'q8' } },
+  { value: 'openai/gpt-transcribe', label: 'OpenAI (cloud) — GPT-Transcribe', cloud: true },
 ];
+const DEFAULT_STT_MODEL = 'onnx-community/moonshine-base-ONNX';
 const isValidSttModel = (m) => STT_MODELS.some((x) => x.value === m);
-let sttModelId = localStorage.getItem('hm.voiceModel') || STT_MODELS[0].value;
-if (!isValidSttModel(sttModelId)) sttModelId = STT_MODELS[0].value;
+let sttModelId = localStorage.getItem('hm.voiceModel') || DEFAULT_STT_MODEL;
+if (!isValidSttModel(sttModelId)) sttModelId = DEFAULT_STT_MODEL;
 
 function saveVoiceDict() {
   try { localStorage.setItem('hm.voiceDict', JSON.stringify(voiceDict)); } catch (_) { /* quota */ }
@@ -10186,12 +11386,24 @@ let voiceTargetHmChat = false;  // dictation goes to the Chat with Hivemind dial
 let sttWorker = null;
 let sttReady = false;           // the active engine (worker or native) finished loading
 let sttNative = false;          // segments go to the main-process sherpa engine, not the worker
+let sttCloud = false;
+let sttEpoch = 0;               // ignore results from an engine that was reset
+let sttCloudQueue = Promise.resolve(); // keep phrases in spoken order
 let sttLoadPromise = null;      // in-flight load(), resolves on 'ready'
 let sttSegId = 0;               // ids correlate transcribe requests/results
 let sttInFlight = 0;            // segments currently being transcribed
 let sttPending = [];            // segments spoken while the model was still loading
+// Load progress owns the HUD detail line until the engine is ready. `sttLoadNote`
+// is the latest stage from the download / transformers.js progress handlers; the
+// ticker re-renders it with elapsed seconds, because the slow part is *after* the
+// last file reports 100% (building the ONNX sessions and running the warm-up
+// inference takes ~25 s cold for Moonshine) and a frozen "100%" reads as a hang.
+let sttLoadNote = '';
+let sttLoadStartedAt = 0;
+let sttLoadTimer = null;
 
 // Mic capture graph (built on start, torn down on stop).
+let micLive = false;            // getUserMedia + the AudioContext graph are actually delivering frames
 let micStream = null;
 let audioCtx = null;
 let micSource = null;
@@ -10234,8 +11446,49 @@ let vadDegraded = false;           // worker stopped answering — energy gate f
 const voiceToggleBtn = $('voice-toggle');
 const VOICE_BTN_TITLE = voiceToggleBtn ? voiceToggleBtn.title : '';
 const voiceHud = $('voice-hud');
+const voiceHudState = $('voice-hud-state');
 const voiceHudText = $('voice-hud-text');
 const voiceHudTarget = $('voice-hud-target');
+
+// Toggling voice on is not the same as being able to hear you: the mic has to
+// open (getUserMedia + AudioContext + worklet) and the speech engine has to
+// finish loading. Until both are true the UI must say so — a red pulsing mic
+// next to the word "Listening…" while the model is still loading reads as
+// "speak now" and loses the user's first sentence.
+//   'mic'   — mic not open yet: audio spoken now is gone for good.
+//   'model' — mic open, engine loading: speech is buffered (see sttPending)
+//             and typed once the engine is ready.
+//   'ready' — actually listening.
+function voicePhase() {
+  if (!micLive) return 'mic';
+  if (!sttReady) return 'model';
+  return 'ready';
+}
+
+// Latest load stage → HUD, with a running elapsed count so a long session build
+// doesn't look frozen. Only renders in the 'model' phase (mic open, engine not
+// ready); every other phase owns its own text.
+function renderSttLoading() {
+  // The load runs on regardless of the mic (so a second start is instant), so
+  // the ticker has to retire itself once nothing is showing it any more.
+  if (!voiceActive || sttReady) { stopSttLoadTicker(); return; }
+  if (!micLive || voiceNoticeTimer) return;
+  const secs = sttLoadStartedAt ? Math.round((Date.now() - sttLoadStartedAt) / 1000) : 0;
+  setVoiceHudText((sttLoadNote || 'Loading speech model…') + ' ' + secs + 's — speech is saved until it is ready');
+}
+
+function setSttLoadNote(note) {
+  sttLoadNote = note;               // kept even with voice off: the load continues either way
+  if (!voiceActive || sttReady) return;
+  if (!sttLoadStartedAt) sttLoadStartedAt = Date.now();
+  if (!sttLoadTimer) sttLoadTimer = setInterval(renderSttLoading, 1000);
+  renderSttLoading();
+}
+
+function stopSttLoadTicker() {
+  if (sttLoadTimer) { clearInterval(sttLoadTimer); sttLoadTimer = null; }
+  sttLoadStartedAt = 0;
+}
 
 // -- Dictionary application --------------------------------------------------
 function escapeRegex(s) { return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
@@ -10505,12 +11758,18 @@ function commitVoiceText(raw) {
 // the user switches speech models (the worker holds one loaded model for its
 // lifetime, so a new model means a new worker).
 function resetSttWorker() {
+  sttEpoch++;
+  if (sttCloud) window.api.stt.openaiCancel();
+  sttCloud = false;
+  sttCloudQueue = Promise.resolve();
   if (sttWorker) { try { sttWorker.terminate(); } catch (_) { /* already gone */ } }
   sttWorker = null;
   sttReady = false;
   sttLoadPromise = null;
   sttInFlight = 0;
   sttPending = [];
+  stopSttLoadTicker();
+  sttLoadNote = '';  // a different engine means a fresh load, not a resumed one
   vadGen++;          // verdicts from the dying worker must not pair with new frames
   vadAwait = [];
   if (sttNative) { sttNative = false; try { window.api.stt.nativeStop(); } catch (_) { /* main handles */ } }
@@ -10519,13 +11778,27 @@ function resetSttWorker() {
 function ensureSttWorker() {
   if (sttLoadPromise) return sttLoadPromise;
 
-  const entry = STT_MODELS.find((m) => m.value === sttModelId) || STT_MODELS[0];
+  const entry = STT_MODELS.find((m) => m.value === sttModelId) || STT_MODELS.find((m) => m.value === DEFAULT_STT_MODEL);
 
   // Two async steps: make sure the model's files are on disk (a non-default one
   // downloads on first use), then boot the engine and wait for it to load them.
   // Native models load in the main process; the worker still boots (VAD-only)
   // so Silero keeps scoring frames — its failure is non-fatal (energy gate).
   sttLoadPromise = (async () => {
+    if (entry.cloud) {
+      const status = await window.api.stt.openaiStatus();
+      if (!status.ok || !status.configured) {
+        throw new Error(status.error || 'Add an OpenAI API key in Settings → Voice before using cloud transcription.');
+      }
+      sttCloud = true;
+      await bootSttWorker(entry, { vadOnly: true }).catch(() => {
+        if (sttWorker) sttWorker.terminate();
+        sttWorker = null; // use the energy gate immediately if Silero cannot boot
+      });
+      sttReady = true;
+      clearVoiceError();
+      return;
+    }
     if (entry.native) {
       const vadBoot = bootSttWorker(entry, { vadOnly: true });
       vadBoot.catch(() => {});
@@ -10533,6 +11806,7 @@ function ensureSttWorker() {
       if (!ensured || !ensured.ok) {
         throw new Error((ensured && ensured.error) || 'could not fetch the speech model');
       }
+      setSttLoadNote('Preparing speech model…');
       const loaded = await window.api.stt.nativeLoad(entry.value);
       if (!loaded || !loaded.ok) {
         throw new Error((loaded && loaded.error) || 'native speech engine failed to load');
@@ -10547,6 +11821,7 @@ function ensureSttWorker() {
     if (!ensured || !ensured.ok) {
       throw new Error((ensured && ensured.error) || 'could not fetch the speech model');
     }
+    setSttLoadNote('Preparing speech model…');
     await bootSttWorker(entry);
   })();
   // A failed load clears the cache so the next attempt can retry from scratch.
@@ -10594,9 +11869,13 @@ function bootSttWorker(entry, opts = {}) {
         resolve();
       } else if (msg.type === 'progress') {
         // Surface the one-time model download/warm-up so the HUD isn't silent.
-        if (!sttReady && msg.data && msg.data.status === 'progress' && msg.data.file) {
+        // 'progress' covers reading the model files; everything after the last
+        // file hits 100% (ONNX session build + the warm-up inference) is the
+        // long pole, so say "Preparing" rather than leaving a stuck "100%".
+        if (!sttReady && msg.data && msg.data.file) {
           const pct = Math.round(msg.data.progress || 0);
-          setVoiceHudText('Loading speech model… ' + pct + '%');
+          if (msg.data.status === 'progress' && pct < 100) setSttLoadNote('Loading speech model… ' + pct + '%');
+          else setSttLoadNote('Preparing speech model…');
         }
       } else if (msg.type === 'error') {
         sttLoadPromise = null;
@@ -10633,7 +11912,16 @@ function onSttResult(text, error) {
   // A per-utterance inference failure comes back as an empty result with
   // an error string. Surface it instead of silently typing nothing — an
   // engine that fails every segment would otherwise look "stuck listening".
-  if (error) flagVoiceError(voiceErrMessage(new Error(error)));
+  if (error) {
+    flagVoiceError(voiceErrMessage(new Error(error)));
+    // A failed cloud phrase must not auto-send a partial Hivemind command.
+    if (sttCloud) {
+      hmChatSendOnStop = false;
+      voiceTrainCheckOnStop = false;
+      if (voiceActive) stopVoice({ send: false });
+      resetSttWorker();
+    }
+  }
   if (text) commitVoiceText(text);
   // An empty transcription with no error means the model heard the
   // segment but made nothing of it. Say so briefly — silence here is
@@ -10693,8 +11981,28 @@ function flushSegment() {
 }
 
 function postSegment(audio) {
+  if (sttCloud && sttInFlight >= 4) {
+    flagVoiceError('OpenAI transcription is falling behind. Wait for queued phrases, then repeat the last phrase.');
+    hmChatSendOnStop = false;
+    voiceTrainCheckOnStop = false;
+    stopVoice({ send: false });
+    return;
+  }
   sttInFlight++;
   renderVoiceListening();
+  if (sttCloud) {
+    const epoch = sttEpoch;
+    sttCloudQueue = sttCloudQueue.then(async () => {
+      if (epoch !== sttEpoch) return;
+      try {
+        const result = await window.api.stt.openaiTranscribe(audio);
+        if (epoch === sttEpoch) onSttResult(result.text || '', result.ok ? undefined : result.error);
+      } catch (_) {
+        if (epoch === sttEpoch) onSttResult('', 'OpenAI transcription could not complete. Try again.');
+      }
+    });
+    return;
+  }
   if (sttNative) {
     // Native engine: the segment goes over IPC to the sherpa utility process.
     // Same result funnel as the worker path, so stop/send bookkeeping holds.
@@ -10844,9 +12152,11 @@ async function startCapture() {
   vadGen++;
   vadAwait = [];
   vadDegraded = false;
+  micLive = true;   // frames are flowing now — anything said before this was never captured
 }
 
 function stopCapture() {
+  micLive = false;
   if (micProcessor) {
     try {
       micProcessor.disconnect();
@@ -10867,6 +12177,7 @@ function stopCapture() {
 // -- Public controls ---------------------------------------------------------
 async function startVoice() {
   if (voiceActive) return;
+  if (sttInFlight > 0) { flagVoiceError('Wait for the previous dictation to finish before starting again.'); return; }
   // The training modal takes dictation over everything; otherwise an open
   // Chat with Hivemind dialog takes it in preference to a thread — the ~
   // hotkey lands here while either is open.
@@ -10876,12 +12187,15 @@ async function startVoice() {
   if (!pane && !voiceTargetHmChat && !training) { flagVoiceError('Open or click a thread first, then start voice typing.'); return; }
   voiceTargetPane = pane;
   voiceActive = true;
+  micLive = false;            // the mic is not open yet — say so rather than showing "Listening…"
   sttInFlight = 0;
   sttPending = [];
   hmChatSendOnStop = false;   // a fresh session voids any armed auto-send
+  stopSttLoadTicker();
+  sttLoadStartedAt = Date.now();
   clearVoiceError();
   renderVoiceState();
-  setVoiceHudText(sttReady ? 'Listening…' : 'Loading speech model… (you can start speaking)');
+  setVoiceHudText('Opening the microphone — wait before speaking…');
   try {
     // Open the mic and load the model concurrently: the VAD holds segments
     // spoken during the load (see flushSegment), so early words aren't lost.
@@ -10889,8 +12203,15 @@ async function startVoice() {
     loading.catch(() => {});                        // handled below; avoid unhandled rejection if capture throws first
     await startCapture();
     if (!voiceActive) { stopCapture(); return; }    // toggled off while the mic was opening
+    // The mic is capturing, so speech is no longer lost — but the engine may
+    // still be loading, and until it is ready the HUD says so instead of
+    // "Listening…". Segments spoken now queue in sttPending and flush below.
+    renderVoiceState();
+    if (!sttReady) setSttLoadNote(sttLoadNote || 'Loading speech model…');
     await loading;
     if (!voiceActive) return;                       // toggled off while loading
+    stopSttLoadTicker();
+    sttLoadNote = '';
     const backlog = sttPending;
     sttPending = [];
     for (const audio of backlog) postSegment(audio);
@@ -10916,6 +12237,7 @@ function stopVoice({ send = true } = {}) {
   sttPending = [];
   voiceActive = false;
   stopCapture();
+  stopSttLoadTicker();
   setVoiceHudText('');
   renderVoiceState();
   // Chat dictation: stopping the mic sends the command. If a transcription is
@@ -10940,6 +12262,7 @@ function voiceErrMessage(err) {
   // part in .name (NotAllowedError, …), while model/worker failures carry it in
   // .message. Using only .name would mask real messages as a bare "Error".
   const m = String((err && [err.name, err.message].filter(Boolean).join(': ')) || err || '');
+  if (/OpenAI/i.test(m)) return (err && err.message) || m;
   if (/NotAllowedError|Permission/i.test(m)) {
     return 'Microphone access was blocked. Allow the mic for Hivemind, then toggle voice again.';
   }
@@ -10963,10 +12286,22 @@ function voiceErrMessage(err) {
 
 // -- HUD / button state ------------------------------------------------------
 function renderVoiceState() {
-  if (voiceToggleBtn) voiceToggleBtn.classList.toggle('listening', voiceActive);
+  const phase = voiceActive ? voicePhase() : 'off';
+  if (voiceToggleBtn) {
+    voiceToggleBtn.classList.toggle('listening', phase === 'ready');
+    voiceToggleBtn.classList.toggle('warming', phase === 'mic' || phase === 'model');
+  }
   voiceTrainSyncMic();
   if (!voiceHud) return;
   voiceHud.classList.toggle('hidden', !voiceActive);
+  voiceHud.classList.toggle('warming', phase === 'mic' || phase === 'model');
+  if (voiceHudState) {
+    // Only the 'ready' phase may say Listening/Transcribing — 'off' falls in with
+    // 'mic' so a hidden HUD never holds a stale "Listening…" for the next start.
+    voiceHudState.textContent = phase === 'ready' ? (sttInFlight > 0 ? 'Transcribing…' : 'Listening…')
+      : phase === 'model' ? 'Not ready yet…'
+      : 'Starting…';
+  }
   if (voiceActive) updateVoiceHudTarget();
 }
 function updateVoiceHudTarget() {
@@ -10982,8 +12317,18 @@ function setVoiceHudText(t) { if (voiceHudText) voiceHudText.textContent = t || 
 // interim text; instead the HUD shows whether we're listening or working.
 function renderVoiceListening() {
   if (!voiceActive) return;
+  renderVoiceState();             // mic/model/ready styling and the vh-state label
   if (voiceNoticeTimer) return;   // a transient notice is showing; don't stomp it
-  setVoiceHudText(sttInFlight > 0 ? 'Transcribing…' : 'Listening…');
+  const phase = voicePhase();
+  // While the mic is opening or the engine is loading, the detail line is owned
+  // by the load/download progress handlers — don't overwrite their percentages
+  // with a generic status, and never claim to be listening.
+  if (phase === 'mic') { setVoiceHudText('Opening the microphone — wait before speaking…'); return; }
+  if (phase === 'model') return;
+  // Ready: the vh-state label already says Listening…/Transcribing…, so the
+  // detail line stays empty (its :empty::before renders a quiet ellipsis)
+  // rather than repeating it.
+  setVoiceHudText('');
   updateVoiceHudTarget();
 }
 
@@ -11126,6 +12471,8 @@ function syncVoiceFields() {
     }
     vModel.value = sttModelId;
   }
+  $('voice-openai-key').value = '';
+  syncOpenAiVoiceFields();
   renderVoiceDict();
   setVoiceModalMsg('');
 }
@@ -11268,7 +12615,10 @@ function openSettings(tab) {
   setSettingsTab(tab || 'general');
   settingsBackdrop.classList.remove('hidden');
 }
-function closeSettings() { settingsBackdrop.classList.add('hidden'); }
+function closeSettings() {
+  $('voice-openai-key').value = '';
+  settingsBackdrop.classList.add('hidden');
+}
 
 // -- Wire it all up ----------------------------------------------------------
 if (voiceToggleBtn) voiceToggleBtn.onclick = toggleVoice;
@@ -11335,8 +12685,13 @@ function voiceTrainSetMsg(text, kind) {
 // Mirror the mic state on the modal's big toggle (called from renderVoiceState).
 function voiceTrainSyncMic() {
   if (!vtMicBtn || !voiceTrainIsOpen()) return;
-  vtMicBtn.classList.toggle('listening', voiceActive);
-  vtMicBtn.textContent = voiceActive ? '🎤 Listening — click (or ~) to stop & check' : '🎤 Start reading';
+  const phase = voiceActive ? voicePhase() : 'off';
+  vtMicBtn.classList.toggle('listening', phase === 'ready');
+  vtMicBtn.classList.toggle('warming', phase === 'mic' || phase === 'model');
+  vtMicBtn.textContent = phase === 'mic' ? '🎤 Opening the microphone…'
+    : phase === 'model' ? '🎤 Loading speech model — don’t read yet…'
+    : phase === 'ready' ? '🎤 Listening — click (or ~) to stop & check'
+    : '🎤 Start reading';
   voiceTrainRenderHeard();
 }
 
@@ -11505,8 +12860,12 @@ function voiceTrainRenderHeard() {
   if (!vtHeardEl || !voiceTrainState) return;
   const heard = voiceTrainState.heardSegs.join(' ');
   vtHeardEl.classList.toggle('vt-heard-empty', !heard);
+  const phase = voiceActive ? voicePhase() : 'off';
   vtHeardEl.textContent = heard
-    || (voiceActive ? 'Listening — read the sentence aloud…' : 'Mic is off — click Start reading.');
+    || (phase === 'mic' ? 'Opening the microphone — wait before reading…'
+      : phase === 'model' ? 'Loading the speech model — wait before reading…'
+      : phase === 'ready' ? 'Listening — read the sentence aloud…'
+      : 'Mic is off — click Start reading.');
 }
 
 function voiceTrainRender() {
@@ -12045,12 +13404,24 @@ const addAcctInput = $('codex-account-name');
 if (addAcctInput) addAcctInput.addEventListener('keydown', (e) => {
   if (e.key === 'Enter') { e.preventDefault(); addCodexAccountFromSettings(); }
 });
+// Font size is a Settings control now (threads no longer carry A−/A+ buttons
+// in their headers), so it has to reach the threads that are already open —
+// otherwise the only way left to resize one is Ctrl+scroll.
+function applyDefaultFontSize(size) {
+  defaultFontSize = clampFont(size);
+  localStorage.setItem('hm.fontSize', String(defaultFontSize));
+  const input = $('set-default-font');
+  if (input) input.value = String(defaultFontSize);
+  for (const p of allPanes()) setPaneFontSize(p, defaultFontSize);
+}
 const setFontInput = $('set-default-font');
 if (setFontInput) setFontInput.addEventListener('change', () => {
-  defaultFontSize = clampFont(parseInt(setFontInput.value, 10) || FONT_DEFAULT);
-  setFontInput.value = String(defaultFontSize);
-  localStorage.setItem('hm.fontSize', String(defaultFontSize));
+  applyDefaultFontSize(parseInt(setFontInput.value, 10) || FONT_DEFAULT);
 });
+const setFontDownBtn = $('set-font-down');
+if (setFontDownBtn) setFontDownBtn.addEventListener('click', () => applyDefaultFontSize(defaultFontSize - 1));
+const setFontUpBtn = $('set-font-up');
+if (setFontUpBtn) setFontUpBtn.addEventListener('click', () => applyDefaultFontSize(defaultFontSize + 1));
 const setNotify = $('set-notify');
 if (setNotify) setNotify.addEventListener('change', () => {
   notifyMuted = !setNotify.checked;
@@ -12086,17 +13457,55 @@ if (vReply) vReply.addEventListener('change', () => {
   localStorage.setItem('hm.voiceReply', voiceReplyEnabled ? '1' : '0');
   if (!voiceReplyEnabled && window.speechSynthesis) speechSynthesis.cancel();
 });
+async function syncOpenAiVoiceFields() {
+  const panel = $('voice-openai-settings');
+  panel.classList.toggle('hidden', !STT_MODELS.find((m) => m.value === sttModelId)?.cloud);
+  try {
+    const status = await window.api.stt.openaiStatus();
+    $('voice-openai-status').textContent = !status.ok ? status.error
+      : status.saved ? 'API key saved securely.'
+      : status.configured ? 'Using OPENAI_API_KEY from your environment.'
+      : 'Add an OpenAI API key to use cloud transcription.';
+    $('voice-openai-remove').disabled = !status.saved;
+  } catch (_) { $('voice-openai-status').textContent = 'Could not read OpenAI key settings. Restart Hivemind and try again.'; }
+}
+
+async function changeOpenAiVoiceKey(remove) {
+  if (voiceActive || sttInFlight > 0 || (sttLoadPromise && !sttReady)) {
+    setVoiceModalMsg('Stop dictation and wait for transcription to finish before changing the API key.', 'err');
+    return;
+  }
+  const input = $('voice-openai-key');
+  const save = $('voice-openai-save');
+  const forget = $('voice-openai-remove');
+  save.disabled = forget.disabled = true;
+  try {
+    const result = await (remove ? window.api.stt.openaiRemoveKey() : window.api.stt.openaiSaveKey(input.value));
+    if (!result.ok) throw new Error(result.error);
+    input.value = '';
+    if (sttCloud) resetSttWorker();
+    setVoiceModalMsg(remove ? 'Saved API key removed.' : 'API key saved securely. It will be checked when you dictate.', 'ok');
+  } catch (err) { setVoiceModalMsg(err.message || 'Could not update OpenAI settings.', 'err'); }
+  finally { save.disabled = false; await syncOpenAiVoiceFields(); }
+}
+$('voice-openai-save').onclick = () => changeOpenAiVoiceKey(false);
+$('voice-openai-remove').onclick = () => changeOpenAiVoiceKey(true);
+$('voice-openai-key').addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') { e.preventDefault(); changeOpenAiVoiceKey(false); }
+});
+
 if (vModel) vModel.addEventListener('change', () => {
   if (!isValidSttModel(vModel.value) || vModel.value === sttModelId) return;
+  if (voiceActive || sttInFlight > 0 || (sttLoadPromise && !sttReady)) {
+    vModel.value = sttModelId;
+    setVoiceModalMsg('Stop dictation and wait for transcription to finish before switching models.', 'err');
+    return;
+  }
   sttModelId = vModel.value;
   localStorage.setItem('hm.voiceModel', sttModelId);
-  // The worker holds one model for its life, so switching means a fresh worker.
-  // If we're mid-dictation, restart so the new model loads (and downloads, if
-  // it's the first time) right away instead of on the next toggle.
-  const wasActive = voiceActive;
-  if (wasActive) stopVoice();
   resetSttWorker();
-  if (wasActive) startVoice();
+  syncOpenAiVoiceFields();
+  setVoiceModalMsg('');
 });
 // Model download progress (first use of a non-bundled model) → HUD. Big files
 // (the native Parakeet encoder is ~620 MB) report byte progress so the HUD
@@ -12104,11 +13513,11 @@ if (vModel) vModel.addEventListener('change', () => {
 if (window.api.onSttDownloadProgress) window.api.onSttDownloadProgress((p) => {
   if (sttReady || !p || !p.total) return;
   if (p.totalBytes > 20e6) {
-    setVoiceHudText('Downloading speech model… ' + Math.round((p.bytes || 0) / 1e6) + ' / '
+    setSttLoadNote('Downloading speech model… ' + Math.round((p.bytes || 0) / 1e6) + ' / '
       + Math.round(p.totalBytes / 1e6) + ' MB'
       + (p.total > 1 ? ' (file ' + Math.min(p.done + 1, p.total) + ' of ' + p.total + ')' : ''));
   } else {
-    setVoiceHudText('Downloading speech model… ' + p.done + '/' + p.total + ' files');
+    setSttLoadNote('Downloading speech model… ' + p.done + '/' + p.total + ' files');
   }
 });
 

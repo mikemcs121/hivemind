@@ -242,7 +242,7 @@ from `main.js` (e.g. a `setInterval` after `main.js:935`), but keep the
 `PORTABLE_EXECUTABLE_FILE` guard and make sure a second prompt can't stack on an
 in-flight download (add a module-level in-progress flag). If you change dialog text or
 add user-visible update behavior, update the Help modal in `src/index.html` per
-CLAUDE.md.
+AGENTS.md.
 
 **Add a build step** (e.g. bundle another asset, run a check before packaging): put it
 in `scripts/before-build.js` — that is the only hook that runs for **both** `npm run

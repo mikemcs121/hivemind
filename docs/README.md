@@ -19,18 +19,22 @@ subsystem doc that covers the files you're about to touch.
 | Agent model discovery (Claude/Codex/Grok CLI catalogs and fallbacks) | `main-process.md` + `renderer.md` | `agent-models.js` |
 | Finding an agent CLI that isn't on PATH (Codex desktop app) | `main-process.md` | `agent-cli.js` |
 | First-run setup wizard: which agent CLIs are installed/signed in, connecting one | `main-process.md` + `renderer.md` | `agent-setup.js`, `src/renderer.js` |
-| Chat-view transcripts, session binding, plans, prompt history, usage pill | `sidecar-modules.md` | `transcript.js`, `plan.js`, `promptHistory.js`, `usage.js` |
+| Chat-view transcripts, session binding, plans, thread handoff, thread consult (second opinions), prompt history, usage pill | `sidecar-modules.md` | `transcript.js`, `plan.js`, `handoff.js`, `consult.js`, `promptHistory.js`, `usage.js` |
 | Voice typing, STT models, mic/VAD, Settings → Voice | `voice-dictation.md` | `src/voice-worker.js`, `scripts/fetch-model.mjs` |
 | Building, packaging, releasing, auto-update | `build-and-release.md` | `build.js`, `updater.js`, `scripts/before-build.js` |
 | Running/testing the app, dev pitfalls, Electron pin | `development.md` | — |
 | Testing the new-user/first-run experience (empty profile) | `development.md` | `scripts/fresh-run.js`, `Fresh Hivemind.cmd` |
 
-## Procedures (project skills, in `.claude/skills/`)
+## Procedures (shared project skills, in `.agents/skills/`)
 
-- **verify** — launch an isolated Hivemind instance (`HM_USER_DATA`) and drive
+Start from [AGENTS.md](../AGENTS.md) for shared project rules. See
+[agent-instructions.md](agent-instructions.md) for discovery across agents,
+compatibility entry points, and adding skills.
+
+- [**verify**](../.agents/skills/verify/SKILL.md) — launch an isolated Hivemind instance (`HM_USER_DATA`) and drive
   its UI over CDP to verify changes end-to-end. Use for any non-trivial
   renderer/main change.
-- **release** — the exact ordered checklist to cut and publish a portable
+- [**release**](../.agents/skills/release/SKILL.md) — the exact ordered checklist to cut and publish a portable
   release.
 
 ## Non-negotiable project rules

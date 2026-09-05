@@ -42,6 +42,17 @@ function load(msg) {
         debug: 0,
       },
     });
+    // Warm-up: the first decode pays one-off graph/allocation costs that can
+    // run into seconds for a 0.6B model. Run half a second of silence through
+    // it before reporting ready, so 'ready' means 'the next utterance comes
+    // back fast', not just 'the constructor returned'. The renderer shows a
+    // not-ready HUD until this resolves.
+    try {
+      const warm = recognizer.createStream();
+      warm.acceptWaveform({ sampleRate: 16000, samples: new Float32Array(8000) });
+      recognizer.decode(warm);
+      recognizer.getResult(warm);
+    } catch (_) { /* non-fatal: a warm-up failure still leaves a usable engine */ }
     post({ type: 'ready' });
   } catch (err) {
     recognizer = null;

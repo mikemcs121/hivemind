@@ -18,7 +18,8 @@ glance whether it is working, waiting on you, or done.
 - Each thread can run a different agent: **Claude**, **ChatGPT** (Codex CLI),
   **Gemini**, or **Grok**. One hive can mix them.
 - Each thread shows a **chat view** by default — the conversation, rendered —
-  with the raw terminal one click away (`>_` / `💬` in the thread header).
+  with the raw terminal one click away (the `❯_ Terminal` / `💬 Chat` toggle
+  in the thread header).
 
 ## The conversation view
 
@@ -53,12 +54,17 @@ the prompt you send goes through the PTY either way.
   thread's prompt.
 - **Prompt History** — a per-hive log of the prompts you've sent, stored in
   `.hivemind/`. Click one to jump to it in the conversation, or resend it.
-- **Voice typing** — dictate into the focused thread, transcribed on-device and
-  fully offline. Toggle with `~`.
+- **Voice typing** — dictate into the focused thread. Use a local model for
+  offline English recognition, or choose **OpenAI (cloud)** in **Settings → Voice**
+  and save your OpenAI API key for GPT-Transcribe. Cloud mode sends recorded phrases
+  to OpenAI and requires internet access and separate API billing. Saved keys are
+  encrypted on this computer; `OPENAI_API_KEY` is also supported when no key is saved.
+  Toggle with `~`.
 - **Hivemind commands** — start a message with "Hivemind," to address the app
   instead of the thread: *"Hivemind, tell Leo to fix the login bug"*, *"Hivemind,
   open a new thread"*.
-- **Usage**, **themes**, per-thread font size, and an in-app **Help** modal that
+- **Usage**, **themes**, font size (Settings → General — the `A−`/`A+` stepper
+  resizes every open thread as well as new ones), and an in-app **Help** modal that
   documents all of the above.
 
 ## Running it

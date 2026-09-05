@@ -1,6 +1,6 @@
 'use strict';
 
-const { app, BrowserWindow, Menu, MenuItem, ipcMain, dialog, Notification, clipboard, protocol, net, shell, utilityProcess } = require('electron');
+const { app, BrowserWindow, Menu, MenuItem, ipcMain, dialog, Notification, clipboard, protocol, net, shell, utilityProcess, safeStorage } = require('electron');
 const path = require('path');
 const { pathToFileURL } = require('url');
 const fs = require('fs');
@@ -132,6 +132,8 @@ const pty = require('@homebridge/node-pty-prebuilt-multiarch');
 const git = require('./git');
 const files = require('./files');
 const plan = require('./plan');
+const handoff = require('./handoff');
+const consult = require('./consult');
 const promptHistory = require('./promptHistory');
 const codexAccounts = require('./codex');
 const agentCli = require('./agent-cli');
@@ -307,7 +309,16 @@ function defaultShell() {
   return process.env.SHELL || 'bash';
 }
 
-function spawnPty({ id, cwd, cols, rows, startupCommand, model, resume, permissionMode, initialPrompt, sessionId, codexAccount }, win) {
+// Sanitize a renderer-supplied string before it becomes an environment value.
+// Nothing here is spliced into a command line — it goes into the child's
+// environment — but a thread name is user-typed, so strip control characters
+// (a stray CR/LF would be echoed into the TUI by anything that prints it) and
+// cap the length.
+function envValue(s) {
+  return String(s == null ? '' : s).replace(/[\x00-\x1f\x7f]/g, ' ').trim().slice(0, 120);
+}
+
+function spawnPty({ id, cwd, cols, rows, startupCommand, model, resume, permissionMode, initialPrompt, sessionId, codexAccount, threadName, hiveName }, win) {
   const shell = defaultShell();
   let safeCwd = cwd;
   try {
@@ -331,6 +342,15 @@ function spawnPty({ id, cwd, cols, rows, startupCommand, model, resume, permissi
   // bundled codex.exe lives in a per-build directory nothing adds to PATH —
   // so append the known install locations (see agent-cli.js).
   agentCli.augmentEnv(env);
+  // Who this thread is, in its own environment. An agent that starts a consult
+  // on its own has to name itself in the request (`from:`) so Hivemind knows
+  // which conversation to deliver the answer back into, and the environment is
+  // the only channel a thread can read its own identity from — it is handed a
+  // shell, not an argv. See `.hivemind/consults/README.md` (consult.js).
+  const tName = envValue(threadName);
+  const hName = envValue(hiveName);
+  if (tName) env.HIVEMIND_THREAD = tName;
+  if (hName) env.HIVEMIND_HIVE = hName;
 
   const proc = pty.spawn(shell, [], {
     name: 'xterm-color',
@@ -580,6 +600,10 @@ function createWindow() {
   });
 
   mainWindow.removeMenu();
+  // Start filling the screen. A hive is a grid of threads, so the tiled layout
+  // is only readable at size; the 1400x900 above stays as the restore bounds
+  // for when the user un-maximizes.
+  mainWindow.maximize();
   mainWindow.loadFile(path.join(__dirname, 'src', 'index.html'));
 
   // The renderer is the only thing that knows which pane owns which pty id. If
@@ -1126,6 +1150,9 @@ app.whenReady().then(() => {
   // Operate inside the active board's project directory. `rel` is empty for the
   // root and a "/"-separated path under it for nested entries.
   ipcMain.handle('files:list', guardCwd((_e, { cwd, rel }) => files.list(cwd, rel)));
+  // Flat whole-project path index behind the composer's "@" picker. Read-only
+  // path names, no file contents; the renderer filters it locally.
+  ipcMain.handle('files:index', guardCwd((_e, { cwd }) => files.index(cwd)));
   ipcMain.handle('files:open', guardCwd((_e, { cwd, rel }) => files.open(cwd, rel)));
   ipcMain.handle('files:reveal', guardCwd((_e, { cwd, rel }) => files.reveal(cwd, rel)));
 
@@ -1168,6 +1195,30 @@ app.whenReady().then(() => {
   ipcMain.handle('plan:clear', guardCwd((_e, { cwd, planId }) => plan.clearPlan(cwd, planId)));
   // Add `.hivemind/` to the project's .gitignore so plan files stay out of Git.
   ipcMain.handle('plan:ensureIgnored', guardCwd((_e, { cwd }) => plan.ensureIgnored(cwd)));
+
+  // -- IPC: Thread handoff ----------------------------------------------------
+  // Passing a conversation between threads: the source thread writes a brief to
+  // `.hivemind/handoffs/<id>.md` and Hivemind polls for it before pointing the
+  // target thread at the same path. Hivemind never writes the brief itself, so
+  // there is no write channel here.
+  ipcMain.handle('handoff:read', guardCwd((_e, { cwd, id }) => handoff.readHandoff(cwd, id)));
+  ipcMain.handle('handoff:clear', guardCwd((_e, { cwd, id }) => handoff.clearHandoff(cwd, id)));
+  ipcMain.handle('handoff:sweep', guardCwd((_e, { cwd }) => handoff.sweepHandoffs(cwd)));
+
+  // -- IPC: Thread consult ----------------------------------------------------
+  // One thread asking another for a second opinion: the asking thread writes the
+  // question to `.hivemind/consults/<id>.md`, the answering thread writes its
+  // answer to `<id>.reply.md`, and Hivemind polls for each before carrying the
+  // next prompt. `requests` is the inbox of questions a thread wrote unprompted
+  // (`ask-*.md`). Hivemind writes neither side — the only write channel here is
+  // `ensureDocs`, which lays down the protocol README that lets an agent start a
+  // consult on its own.
+  ipcMain.handle('consult:read', guardCwd((_e, { cwd, id }) => consult.readConsult(cwd, id)));
+  ipcMain.handle('consult:readReply', guardCwd((_e, { cwd, id }) => consult.readReply(cwd, id)));
+  ipcMain.handle('consult:requests', guardCwd((_e, { cwd }) => consult.listRequests(cwd)));
+  ipcMain.handle('consult:clear', guardCwd((_e, { cwd, id }) => consult.clearConsult(cwd, id)));
+  ipcMain.handle('consult:sweep', guardCwd((_e, { cwd }) => consult.sweepConsults(cwd)));
+  ipcMain.handle('consult:ensureDocs', guardCwd((_e, { cwd }) => consult.ensureConsultDocs(cwd)));
 
   // -- IPC: Prompt History panel ----------------------------------------------
   // A per-hive log of sent prompts stored in `.hivemind/prompt-history.json`.
@@ -1226,6 +1277,15 @@ app.whenReady().then(() => {
   // the first time it's selected, then served offline over hm://models forever
   // after (the protocol handler above prefers userData). Renderer calls this and
   // waits for { ok:true } before booting the worker with that model.
+  const openAiStt = require('./stt-openai').createOpenAiStt({ userData: app.getPath('userData'), safeStorage });
+  ipcMain.handle('stt:openaiStatus', () => openAiStt.status());
+  ipcMain.handle('stt:openaiSaveKey', (_e, key) => openAiStt.saveKey(key));
+  ipcMain.handle('stt:openaiRemoveKey', () => openAiStt.removeKey());
+  ipcMain.handle('stt:openaiTranscribe', (_e, { audio }) => openAiStt.transcribe(audio));
+  ipcMain.on('stt:openaiCancel', () => openAiStt.cancel());
+  app.on('will-quit', () => openAiStt.cancel());
+  app.on('window-all-closed', () => openAiStt.cancel());
+
   ipcMain.handle('stt:ensureModel', async (evt, { repo }) => {
     const files = STT_DOWNLOADS[repo];
     if (!files) return { ok: true, alreadyPresent: true };   // bundled/default: nothing to fetch

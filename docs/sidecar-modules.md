@@ -1,9 +1,10 @@
 # Sidecar feature modules
 
 Main-process modules that back the persistent, per-project features wrapped around the
-terminal panes: `plan.js`, `promptHistory.js`, `transcript.js`, `usage.js`.
+terminal panes: `plan.js`, `handoff.js`, `consult.js`, `promptHistory.js`, `transcript.js`,
+`usage.js`.
 
-All four live at the repo root, run in the **Electron main process**, and are wired into
+All six live at the repo root, run in the **Electron main process**, and are wired into
 IPC in one block of `main.js` (`main.js:787-850`). The renderer reaches them through the
 `window.api.*` bridge defined in `preload.js:113-185`.
 
@@ -11,7 +12,9 @@ IPC in one block of `main.js` (`main.js:787-850`). The renderer reaches them thr
 
 A Hivemind "hive" (board) is a project directory with several agent CLI panes running in
 it. These modules add persistence and insight around those panes: a reviewable plan
-document per thread (`plan.js`), a log of every prompt sent (`promptHistory.js`), a rendered chat view of each pane's conversation
+document per thread (`plan.js`), the brief that carries a conversation from one thread to
+another (`handoff.js`), the question-and-answer pair that gets one thread a second opinion
+from another (`consult.js`), a log of every prompt sent (`promptHistory.js`), a rendered chat view of each pane's conversation
 (`transcript.js`), and a per-agent subscription-usage readout (`usage.js`). Except for `usage.js`
 (machine-global), each is scoped to the project directory: state lives in a `.hivemind/`
 folder inside the project (kept out of Git by `plan.ensureIgnored`), or — for
@@ -53,6 +56,113 @@ by quoted text (`{ id, quote, occurrence, body, resolved, sent }`,
 `<project>/.hivemind/plans` (`plan.js:41-49`). `ensureIgnored` is the shared
 keep-out-of-Git helper: `promptHistory:ensureIgnored` and the
 attachment stager (`main.js:688`) all delegate to it.
+
+## handoff.js
+
+Backs **thread handoff**: passing a conversation from one thread to another — a different
+agent, a fresh context window, or a thread that's free. Renderer side is the "Thread
+handoff" section of `src/renderer.js` (`startHandoff`, `handoffPoll`, `endHandoff`,
+`cancelHandoff`, driven from the *Hand off to another thread* page of the chat top
+bar's `⋯` conversation menu — `buildThreadMenu` / `buildThreadPicker`).
+
+The transfer medium is a markdown **brief the source thread writes itself** to
+`.hivemind/handoffs/<id>.md`. That choice is the design: only the source agent knows which
+parts of its own context mattered, a file survives both threads restarting, and every
+agent CLI can read markdown — a transcript format is neither portable nor summarised.
+**Hivemind never writes a brief**, which is why this module has no write export and the
+bridge exposes no write channel.
+
+| Export | Does | IPC channel |
+|---|---|---|
+| `readHandoff(root, id)` | read the brief; `{ok, content, mtime}` or `reason: 'not-found'/'no-dir'/'error'` | `handoff:read` |
+| `clearHandoff(root, id)` | delete one brief; ENOENT is `ok` | `handoff:clear` |
+| `sweepHandoffs(root)` | delete briefs older than a week (`MAX_AGE_MS`) | `handoff:sweep` |
+| `handoffRelPath(id)` | `.hivemind/handoffs/<id>.md` — the path both prompts name | — |
+
+`id` must match `/^[A-Za-z0-9._-]+$/` and every resolved path must stay inside
+`<project>/.hivemind/handoffs` — same guard as plan.js. The renderer generates the id
+(`newHandoffId`, `h-<base36 ts>-<rand>`) and builds the same relative path in
+`handoffRel`; keep the two in step.
+
+The renderer's sequence, for reference:
+
+1. resolve the target — an existing pane, or `addTerminal(board, { agent })` for a fresh
+   thread, opened immediately so the user can see where the conversation is going;
+2. `plan.ensureIgnored` + `handoff:sweep` (both best-effort — neither is worth failing a
+   handoff over);
+3. `deliverPrompt(source, …, { caption: false })` asking for the brief at that path — an
+   ordinary prompt, because the PTY is always the delivery path, but kept out of the
+   caption tracker (it is a multi-line outline; the thread is captioned
+   "Handing off to <target>" instead);
+4. poll `handoff:read` every `HANDOFF_POLL_MS` = 2 s until the content is non-trivial
+   **and its `mtime` is unchanged since the previous poll** — agents write a draft and
+   then revise it, and a half-written brief loses the rest — giving up after
+   `HANDOFF_TIMEOUT_MS` = 5 min (a brief over a long conversation is a full turn);
+5. `deliverPrompt(target, …)` pointing it at the same path, then focus it.
+
+A handoff is a **copy**: the source thread is untouched afterwards, so the same
+conversation can be handed to several threads. In-flight state lives on `pane.handoff`
+and is deliberately **not** persisted into the layout — a brief still being written when
+the app closes has no waiting thread on the other side. `disposePaneResources` clears the
+poll interval, and a closed target ends the handoff with a notice.
+
+## consult.js
+
+Backs **thread consult**: one thread asking another for a **second opinion**, and getting
+the answer back. Where a handoff *moves* a conversation, a consult keeps it — only a
+question and an answer travel — so the asking thread carries on with the reply in hand.
+Renderer side is the "Thread consult" section of `src/renderer.js` (`startConsult`,
+`consultPoll`, `endConsult`, `cancelConsult`, `adoptConsult`, `consultInboxTick`), plus
+the *Ask for a second opinion* page of the chat top bar's `⋯` conversation menu
+(`buildThreadMenu` / `buildThreadPicker`), which also holds the handoff and the
+past-conversation list.
+
+Two files, same medium and same reasoning as the handoff brief — only the asking agent
+knows what context its question needs, only the answering agent has the opinion, and
+markdown is readable by every agent CLI:
+
+```
+.hivemind/consults/<id>.md         the question + context   (written by the ASKING thread)
+.hivemind/consults/<id>.reply.md   the answer               (written by the ANSWERING thread)
+.hivemind/consults/README.md       the protocol             (the one file Hivemind writes)
+```
+
+So a consult is a handoff with a return leg: `phase: 'question'` polls for the first
+file, `phase: 'answer'` polls for the second, each with the same settle-on-mtime rule.
+In-flight state lives on the **asking** pane (`pane.consult`); the answering thread is
+just a thread that was sent a prompt and needs no state.
+
+| Export | Does | IPC channel |
+|---|---|---|
+| `readConsult(root, id)` | read the question; `{ok, content, mtime}` or `reason: 'not-found'/'no-dir'/'error'` | `consult:read` |
+| `readReply(root, id)` | read the answer, same shape | `consult:readReply` |
+| `listRequests(root)` | `ask-*.md` questions with no answer beside them yet — `{ok, requests: [{id, mtime}]}` | `consult:requests` |
+| `clearConsult(root, id)` | delete both sides; ENOENT is `ok` | `consult:clear` |
+| `sweepConsults(root)` | delete consults older than a week (`MAX_AGE_MS`), keeping `README.md` | `consult:sweep` |
+| `ensureConsultDocs(root)` | write `README.md` (the request protocol) if missing or stale | `consult:ensureDocs` |
+| `consultRelPath(id)` / `replyRelPath(id)` | the paths both threads are told to use | — |
+
+Ids must match `/^[A-Za-z0-9][A-Za-z0-9._-]*$/`, must **not contain `.reply`** (the id
+`x.reply` would otherwise resolve its question onto `x`'s answer file), and every resolved
+path must stay inside `<project>/.hivemind/consults` — same guard as plan.js. The renderer
+generates solicited ids (`newConsultId`, `c-<base36 ts>-<rand>`) and rebuilds the same
+relative paths in `consultRel` / `consultReplyRel`; keep the two in step.
+
+**Two ways a consult starts.** The id prefix is what tells them apart, and it is load-bearing:
+
+- `c-…` — **the user asked Hivemind**: the ⋯ menu's *Ask for a second opinion*, or "Hivemind, ask Gemini
+  what it thinks about the caching plan". Hivemind generates the id and drives both legs
+  from the start, so the poller already knows about it.
+- `ask-…` — **a thread asked on its own**: the user told the agent itself ("go ask Codex"),
+  and it wrote `.hivemind/consults/ask-<slug>.md` with `to:` / `from:` front matter. Nobody
+  is driving it, so `listRequests` surfaces it and `consultInboxTick` (every
+  `CONSULT_INBOX_MS` = 3 s, over every hive with a live thread) adopts it at the second leg.
+  `README.md` is what teaches agents that format, and `HIVEMIND_THREAD` in each thread's
+  environment (set in `spawnPty`) is how a thread knows its own name for `from:`.
+
+`ensureConsultDocs` is the module's **only** write, and it writes neither side of a
+consult — same rule as handoff.js. It is versioned by a marker line (`README_MARKER`), so
+bumping the protocol rewrites stale copies in every project on the next consult.
 
 ## promptHistory.js
 
@@ -285,6 +395,10 @@ This module is machine-global (not per-project) and writes nothing.
 | `prompt-history.json` | promptHistory.js | `[{ id, text, ts, agent }]` oldest→newest, ≤200 | every delivered prompt (append), Clear (write `[]`) |
 | `plans/<planId>.md` | plan.js | markdown | by the *thread* (Hivemind-requested plans) or by Hivemind on in-panel edits |
 | `plans/<planId>.comments.json` | plan.js | `[{ id, quote, occurrence, body, resolved, sent }]` | every comment add/resolve/send |
+| `handoffs/<id>.md` | the *thread* (handoff.js only reads/sweeps) | markdown brief: goal, done so far, decisions, open questions, next step | when a handoff is started; entries older than a week are swept on the next handoff |
+| `consults/<id>.md` | the *asking thread* (consult.js only reads/sweeps) | markdown: question, context, what would change its mind | when a consult is started (`c-…`) or a thread asks unprompted (`ask-…`); swept after a week |
+| `consults/<id>.reply.md` | the *answering thread* (consult.js only reads/sweeps) | markdown: answer, why, what it would do differently, caveats | when the answering thread replies; swept after a week |
+| `consults/README.md` | consult.js (`ensureConsultDocs`) | the request protocol agents read to start a consult themselves | first consult on the hive, and whenever `README_MARKER` changes |
 | `attachments/` | main.js (`attach:stage`, `main.js:683`) | staged file copies for codex threads | on attach; entries older than a week are swept |
 | `kanban.json` | **nobody — legacy** | `[]` | was the Board (Kanban) panel, removed in commit `7172134`; safe to ignore/delete |
 
@@ -320,7 +434,7 @@ Claude Code session transcripts and native plan files are *read* but never owned
    and both agents' token scans cover *all* projects on the machine, not just the open
    hive. ChatGPT's limits are a **recorded snapshot**, never live: any UI that shows them
    must show `observedAt` too, or it is claiming a stale number is current.
-8. **CLAUDE.md rule**: any user-facing change to these features (buttons, shortcuts,
+8. **AGENTS.md rule**: any user-facing change to these features (buttons, shortcuts,
    panels) must update the Help modal in `src/index.html` in the same change.
 
 ## How to extend: adding a new per-project sidecar feature
@@ -349,7 +463,7 @@ Follow the promptHistory.js template — it is the smallest complete example.
    assume agent threads may edit it concurrently — re-read before append-style
    mutations (see `promptHistory.appendPrompt`) rather than trusting in-memory state.
 6. **Help modal**: document the new panel/shortcut in `#help-modal`
-   (`src/index.html`) — per CLAUDE.md the change isn't done without it.
+   (`src/index.html`) — per AGENTS.md the change isn't done without it.
 
 If the feature must react to files changing on disk (like the chat view), do the
 watching in the main process (transcript.js's ref-counted watcher + poll pattern) and

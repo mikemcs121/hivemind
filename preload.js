@@ -116,6 +116,8 @@ contextBridge.exposeInMainWorld('api', {
   // is a "/"-separated path under it ('' for the root).
   files: {
     list: (cwd, rel) => ipcRenderer.invoke('files:list', { cwd, rel }),
+    // Every project-relative file path at once, for @-mention completion.
+    index: (cwd) => ipcRenderer.invoke('files:index', { cwd }),
     open: (cwd, rel) => ipcRenderer.invoke('files:open', { cwd, rel }),
     reveal: (cwd, rel) => ipcRenderer.invoke('files:reveal', { cwd, rel }),
   },
@@ -152,6 +154,31 @@ contextBridge.exposeInMainWorld('api', {
     writeComments: (cwd, planId, comments) => ipcRenderer.invoke('plan:comments:write', { cwd, planId, comments }),
     clear: (cwd, planId) => ipcRenderer.invoke('plan:clear', { cwd, planId }),
     ensureIgnored: (cwd) => ipcRenderer.invoke('plan:ensureIgnored', { cwd }),
+  },
+
+  // Thread handoff. `cwd` is the active board's project directory; `id` keys the
+  // brief the source thread writes to `.hivemind/handoffs/<id>.md`. Read-only by
+  // design — the brief is the source agent's own summary, never Hivemind's.
+  handoff: {
+    read: (cwd, id) => ipcRenderer.invoke('handoff:read', { cwd, id }),
+    clear: (cwd, id) => ipcRenderer.invoke('handoff:clear', { cwd, id }),
+    sweep: (cwd) => ipcRenderer.invoke('handoff:sweep', { cwd }),
+  },
+
+  // Thread consult: one thread asking another for a second opinion. `cwd` is the
+  // active board's project directory; `id` keys the pair of files the two threads
+  // write under `.hivemind/consults/` — `<id>.md` (the question) and
+  // `<id>.reply.md` (the answer). `requests` is the inbox of questions a thread
+  // wrote unprompted. Neither side is writable from here by design: the question
+  // is the asking agent's, the answer is the answering agent's. `ensureDocs` only
+  // lays down the protocol README that teaches threads the request format.
+  consult: {
+    read: (cwd, id) => ipcRenderer.invoke('consult:read', { cwd, id }),
+    readReply: (cwd, id) => ipcRenderer.invoke('consult:readReply', { cwd, id }),
+    requests: (cwd) => ipcRenderer.invoke('consult:requests', { cwd }),
+    clear: (cwd, id) => ipcRenderer.invoke('consult:clear', { cwd, id }),
+    sweep: (cwd) => ipcRenderer.invoke('consult:sweep', { cwd }),
+    ensureDocs: (cwd) => ipcRenderer.invoke('consult:ensureDocs', { cwd }),
   },
 
   // Prompt History panel. `cwd` is the active board's project directory; the
@@ -220,6 +247,11 @@ contextBridge.exposeInMainWorld('api', {
   // nativeLoad boots it, nativeTranscribe sends one utterance's Float32Array
   // and resolves { ok, text } | { ok:false, error }, nativeStop kills it.
   stt: {
+    openaiStatus: () => ipcRenderer.invoke('stt:openaiStatus'),
+    openaiSaveKey: (key) => ipcRenderer.invoke('stt:openaiSaveKey', key),
+    openaiRemoveKey: () => ipcRenderer.invoke('stt:openaiRemoveKey'),
+    openaiTranscribe: (audio) => ipcRenderer.invoke('stt:openaiTranscribe', { audio }),
+    openaiCancel: () => ipcRenderer.send('stt:openaiCancel'),
     ensureModel: (repo) => ipcRenderer.invoke('stt:ensureModel', { repo }),
     nativeLoad: (repo) => ipcRenderer.invoke('stt:nativeLoad', { repo }),
     nativeTranscribe: (audio) => ipcRenderer.invoke('stt:nativeTranscribe', { audio }),

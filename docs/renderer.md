@@ -46,21 +46,24 @@ UI says hive/thread.
 | 845–978 | **Pane state machine** (busy/idle/attention/error/dead) | `markActivity`, `evaluateIdle`, `setDoneGlow`, `setNeedsAuth`, `setPaneState`, `notify` |
 | 980–1020 | Sidebar per-board status dots/badges | `boardStatus`, `updateBoardStatus` |
 | 1022–1103 | Thread captions (rebuilt from keystrokes) | `feedCaptionInput`, `REPLY_WORDS`, `isReplyLike`, `commitCaption`, `setPaneCaption`, `sendToPane` |
-| 1105–1170 | Prompt delivery to a PTY — bracketed paste, size-scaled Enter delay, screen-verified Enter retry when the submit gets swallowed as part of the paste burst | `typePrompt`, `SUBMIT_RETRY_MS`, `confirmSubmit`, `deliverPrompt` |
-| 1136–1310 | **Hivemind command** plumbing: wake word, fuzzy match, toast | `HM_WAKE_RE`, `HM_WAKE_MISHEARD`, `hmLooksLikeWake`, `matchHivemindCommand`, `hmToast`, `boardPanes`, `findPaneByName`, `HM_PASS`, `hmRouteTaskTo`, `hmExtractTask`, `hmResolveModel` |
-| 1311–1842 | **HM_COMMANDS registry** — ordered command list; `help` HTML per entry feeds the Help modal | `HM_COMMANDS` (entries: help, open-chat, new-thread, new-hive, tell, close-thread, rename-thread, maximize, voice-*, interrupt, focus-thread, switch-hive, font-*, theme, model, agent, permission-mode, panel, show-plan, show-diff, show-terminal/chat, attach, history, settings, usage, build, task-in-thread, find, …) |
+| 1105–1170 | Prompt delivery to a PTY — bracketed paste, size-scaled Enter delay, screen-verified Enter retry when the submit gets swallowed as part of the paste burst, opt-out of caption tracking (`{ caption: false }`) for Hivemind-composed prompts | `typePrompt`, `SUBMIT_RETRY_MS`, `confirmSubmit`, `deliverPrompt` |
+| (after prompt delivery) | **Thread handoff** — pass a conversation to another thread: ask the source thread for a brief at `.hivemind/handoffs/<id>.md`, poll until it settles, then point the target at it (see `docs/sidecar-modules.md` → handoff.js) | `HANDOFF_POLL_MS`, `HANDOFF_TIMEOUT_MS`, `HANDOFF_MIN_CHARS`, `newHandoffId`, `handoffRel`, `threadDescFor`, `handoffRequestPrompt`, `handoffTakeoverPrompt`, `startHandoff`, `handoffPoll`, `endHandoff`, `cancelHandoff` |
+| (after thread handoff) | **Thread consult** — ask another thread for a second opinion and bring the answer back: the asking thread writes the question to `.hivemind/consults/<id>.md`, the answering thread writes `<id>.reply.md`, and the reply is delivered into the asking thread's own conversation. Two poll-and-settle legs (`phase: 'question'` then `'answer'`) with state on the **asking** pane. `consultInboxTick` additionally adopts `ask-*.md` questions a thread wrote unprompted, on every hive with a live thread (see `docs/sidecar-modules.md` → consult.js) | `CONSULT_POLL_MS`, `CONSULT_QUESTION_TIMEOUT_MS`, `CONSULT_ANSWER_TIMEOUT_MS`, `CONSULT_MIN_CHARS`, `CONSULT_INBOX_MS`, `CONSULT_BOOT_MS`, `deliverConsultPrompt`, `newConsultId`, `consultRel`, `consultReplyRel`, `consultQuestionPrompt`, `consultAnswerPrompt`, `consultReturnPrompt`, `startConsult`, `beginConsult`, `adoptConsult`, `consultPrepare`, `consultPoll`, `endConsult`, `cancelConsult`, `consultField`, `consultAsker`, `consultInboxTick`, `consultAdoptRequest` |
+| 1136–1310 | **Hivemind command** plumbing: wake word, fuzzy match, toast | `HM_WAKE_RE`, `HM_WAKE_MISHEARD`, `hmLooksLikeWake`, `matchHivemindCommand`, `hmToast`, `boardPanes`, `findPaneByName`, `HM_PASS`, `hmRouteTaskTo`, `hmExtractTask`, `hmResolveModel`, `HM_NEW_THREAD_RE`, `hmAgentWord`, `hmResolveThreadTarget` |
+| 1311–1842 | **HM_COMMANDS registry** — ordered command list; `help` HTML per entry feeds the Help modal | `HM_COMMANDS` (entries: help, open-chat, new-thread, new-hive, consult, tell, handoff, close-thread, rename-thread, maximize, voice-*, interrupt, focus-thread, switch-hive, font-*, theme, model, agent, permission-mode, panel, show-plan, show-diff, show-terminal/chat, attach, history, settings, usage, build, task-in-thread, find, …) |
 | 1844–1965 | Command dispatch + AI fallback | `renderHmCommandHelp` (generates `#hm-cmd-list`), `hmDispatch`, `hmNormalize`, `hmInterpretRequest` (`window.api.hm.interpret`), `runHivemindCommand` |
 | 1967–2206 | **Chat with Hivemind** sidebar panel | `hmChatLog`, `hmChatOpen/Close/Toggle`, `setHmChatOpen`, `hmChatSubmit`, `hmChatDispatch`, `hmChatEditStart`, `hmChatVoiceCommit`, `hmChatVoiceSend`, `hmSpeak`, `wireHmChat`, Ctrl+Shift+H listener |
 | 2208–2262 | Image drop/paste helpers, codex attachment staging | `isImageFile`, `persistImage`, `quotePath`, `pathInsideDir`, `stagePathForPane`, `typePathIntoPane` |
 | 2264–2593 | **Chat wrapper** — the structured chat view over a thread | `CHAT_KINDS`, `globalChatFilters`, `transcriptSupported`, `historySupported`, `chatSupported`, `CHAT_PLACEHOLDER`, `initChatUI` (builds the whole chat DOM + wiring), `autosizeComposer` |
 | 2595–2676 | Composer attachment chips | `fileUrlFor`, `addChatAttachment`, `removeChatAttachment`, `renderChatAttachments` |
-| 2678–2885 | Composer autocomplete (`/` commands, `@` files) | `SLASH_COMMANDS`, `initChatAutocomplete` |
+| 2678–2885 | Composer autocomplete (`/` commands, `@` files) | `SLASH_COMMANDS`, `discoverProjectCommands`, `projectFileIndex`, `fuzzyMatchPath`, `renderAcText`, `initChatAutocomplete` |
 | 2887–3007 | View toggle & chat chrome | `updateViewBtn`, `setPaneView`, `updateChatChrome`, `updateChatAvailability`, `applyChatFilters`, `resetChat`, `chatBindStatus` |
-| 3009–3124 | Past-conversation history overlay (Claude only) | `relTimeShort`, `toggleHistoryMenu`, `buildHistoryMenu`, `openHistorySession`, `exitHistory`, `updateHistoryChrome` |
-| 3126–3635 | **Chat rendering** from transcript entries | `chatIngest`, `renderChatEntries`, `renderChatEntry`, `chatKeyFor`, `upsertChatRow`, `wireCopyButton`, `addBubbleCopyBtn`, `addCodeCopyBtns`, `addUserOrMetaRow`, `setChatTopic`, `addMetaRow`, `addErrorRow`, `addSidechainRow`, `toolSummary`, `addToolRow`, `addQuestionRow`, `attachToolResult` |
+| 3009–3124 | Past-conversation history overlay (Claude only) | `relTimeShort`, `openHistoryPage`, `buildHistoryMenu`, `openHistorySession`, `exitHistory`, `updateHistoryChrome` |
+| (with the history overlay) | **The conversation menu** — one `⋯` chip and one dropdown in the chat top bar holding hand off, second opinion and past conversations (engines: the Thread handoff / Thread consult sections, and the history overlay). Two levels: the root page lists the actions plus a *stop waiting* row per in-flight operation; picking one rebuilds the same element as that action's list with a `‹ Back` row. The chip is also the status light — `⇄ Handing off…` / `💬 Waiting on ‹thread›…` / `⋯ 2 waiting…`. It was three chips until the caption had nowhere left to render | `updateThreadMenuChip`, `toggleThreadMenu`, `hideThreadMenu`, `hideHistoryMenu`, `threadMenuRow`, `threadMenuHead`, `buildThreadMenu`, `buildThreadPicker`, `openHistoryPage` |
+| 3126–3635 | **Chat rendering** from transcript entries | `chatIngest`, `renderChatEntries`, `renderChatEntry`, `chatKeyFor`, `upsertChatRow`, `wireCopyButton`, `addBubbleCopyBtn`, `addCodeCopyBtns`, `addUserOrMetaRow`, `CHAT_INTRO_MAX`, `noteChatIntro`, `setChatIntroOpen`, `syncChatIntro`, `jumpToChatIntro`, `setChatTopic`, `addMetaRow`, `addErrorRow`, `addSidechainRow`, `toolSummary`, `addToolRow`, `addQuestionRow`, `attachToolResult` |
 | 3637–3800 | Composer send path | `chatHistoryNav` (↑/↓ recall), `sendChatMessage`, `continueHistorySession`, `ECHO_STALL_MS`, `flagStalledEcho`, `addEchoRow`, `confirmEcho` |
 | 3802–3935 | Attention prompt card + composer lock | `PROMPT_CARD_KEY`, `PROMPT_LOCK_PLACEHOLDER`, `AUTH_LOCK_PLACEHOLDER`, `promptCardText`, `renderPromptCard`, `removePromptCard`, `updateComposerLock`, `updateChatBanner` |
-| 3937–3996 | `$` helper; sidebar-resizer drag; top-level DOM refs | `$`, `SIDEBAR_W_*`, `boardListEl`, `gridEl`, `emptyState`, `boardTitle`, `addTermBtn`, `buildBtn` |
+| 3937–3996 | `$` helper; sidebar-resizer drag; **sidebar collapse**; top-level DOM refs | `$`, `SIDEBAR_W_*`, `SIDEBAR_COLLAPSE_KEY`, `sidebarCollapsed`, `setSidebarCollapsed`, `toggleSidebar`, `boardListEl`, `gridEl`, `emptyState`, `boardTitle`, `addTermBtn`, `buildBtn` |
 | 3998–4082 | **Layout persistence** | `persist`, `serializeLayout`, `persistLayout`, `rebuildFromLayout` |
 | 4084–4221 | Board list render + reorder; board switching | `renderBoardList`, `reorderBoards`, `selectBoard` |
 | 4223–4395 | **Grid layout** (columns/panes/gutters, tmux-style zoom) | `MAX_COLS`, `layout`, `toggleZoom`, `paneLabel`, `buildZoomTabs`, `refreshZoomTabs`, `makeGutter`, `startDrag` |
@@ -121,10 +124,35 @@ Created in `createPane` (`renderer.js:~4523`). The important fields:
 | `sessionId`, `sessionBound` | Claude session UUID (passed as `--session-id`); `sessionBound` only true once the transcript proves the file exists — **never `--resume` an unbound id** |
 | `costSeen`, `costByModel`, `costFile` | cost-estimate accumulator (Claude only) |
 | `planId`, `plan` | plan-review lifecycle (`panePlan` lazily fills `plan`: state/file/source/menu/exitIds/cardText/cardComments/…) |
+| `handoff` | in-flight handoff of this thread's conversation (`{ id, rel, dest, started, lastMtime, busy, timer }`) or `null`. **Not persisted** — an unfinished brief has no waiting thread after a restart; `disposePaneResources` clears the poll timer |
+| `consult` | in-flight second opinion this thread asked for (`{ id, dest, phase: 'question'\|'answer', topic, destOpened, started, lastMtime, busy, timer }`) or `null`. Lives on the **asking** pane only. **Not persisted**, same reasoning as `handoff`; `disposePaneResources` clears the poll timer |
+| `spawnName` | the name this pane's *process* was spawned under, put in its environment as `HIVEMIND_THREAD`. A rename never reaches the running process, so `consultAsker` matches this before the current name |
 | `view`, `chatFilters`, `chat` | `'chat'`\|`'term'`, filter chips, and the chat object built by `initChatUI` |
 | `termFallback` | terminal shown only because the transcript was missing — snaps back to chat on bind |
 
-`pane.chat` (built in `initChatUI`, `renderer.js:~2309`) holds the chat DOM (`wrap, list, input, sendBtn, notice, chips, attachRow, topic, working, historyBtn/Menu/Bar`), render maps (`byKey` row-key→element, `toolByUseId`, `pendingResults`, `pendingQuestions`, `pendingEcho` — each entry carries an `ECHO_STALL_MS` timer that marks the bubble "⚠ no response yet" if the transcript never echoes it back and the pane isn't busy, cleared by `confirmEcho`), history-view state (`viewingHistory`, `historySession`), composer state (`attachments`, `history`, `histIdx`, `histDraft`, `ac`), and `pinned` (auto-scroll).
+`pane.chat` (built in `initChatUI`, `renderer.js:~2309`) holds the chat DOM (`wrap, list, input, sendBtn, notice, chips, attachRow, topic, working, menuBtn/threadMenu — with `historyMenu` aliased to that same element, since the history list is one page of it — historyBar`), render maps (`byKey` row-key→element, `toolByUseId`, `pendingResults`, `pendingQuestions`, `pendingEcho` — each entry carries an `ECHO_STALL_MS` timer that marks the bubble "⚠ no response yet" if the transcript never echoes it back and the pane isn't busy, cleared by `confirmEcho`), history-view state (`viewingHistory`, `historySession`), composer state (`attachments`, `history`, `histIdx`, `histDraft`, `ac`), intro-bar state
+(`intro`, `introText`, `introChevron`, `introRow`, `introOpen`), and `pinned` (auto-scroll).
+
+### Conversation intro bar
+
+A conversation that outgrows the pane scrolls its opening message away, so
+`.chat-intro` — a one-line bar between the history bar and the message list —
+pins the prompt the conversation started from above the messages. `noteChatIntro`
+takes the text from the **first** user row rendered (`addUserOrMetaRow`, after its
+meta/plumbing filter, so a `<command-name>` line never wins) and remembers the row
+as `introRow`; nothing later replaces it, and `resetChat` clears it so a respawn,
+session rollover, or a session opened from 🕘 History names itself from its own
+first message.
+
+`syncChatIntro` decides visibility geometrically — the bar shows only while
+`introRow`'s rect sits above the list's top edge — and runs on list scroll and
+after every `renderChatEntries` batch (a backfill buries the opening message
+without firing a scroll event). It no-ops when the list has zero height, so a
+pane on a hidden hive or in terminal view keeps the state it had when last
+visible instead of resolving every rect to 0 and showing the bar. Clicking the
+bar toggles `introOpen` (full prompt, capped at `CHAT_INTRO_MAX` chars and
+`30vh`); `jumpToChatIntro` (the ↑ button) reuses `jumpToChatRow` so the jump
+flashes the message like a Prompt History jump does.
 
 ### xterm wiring
 
@@ -197,13 +225,59 @@ session file, so the resumed thread comes back at an empty composer and reads as
 
 `src/index.html` is a static skeleton; renderer.js fills and wires it. Main regions:
 
-- `#app` → `#sidebar` + `#sidebar-resizer` + `#workspace`.
+- `#app` → `#sidebar` + `#sidebar-resizer` + `#workspace`. `#sidebar.collapsed` (and, via `+`, the resizer) is `display:none` — the whole sidebar hides; `setSidebarCollapsed`/`toggleSidebar` own that class, persist `hm.sidebarCollapsed`, swap the `«` (`#sidebar-collapse`, sidebar header) and `»` (`#sidebar-expand`, first child of `#board-bar`) buttons, and re-fit the panes. Ctrl+Shift+B toggles it; the `sidebar` HM command does too. **The way back is never inside the hidden thing**: `#sidebar-expand` lives in the board bar, and `syncSidebarPanelState` restores the sidebar whenever a docked panel opens while collapsed — otherwise Ctrl+Shift+H and the Explorer/Git/History commands would silently do nothing.
 - **Sidebar**: `.sidebar-header` (logo, `#add-board` ＋), `#board-list` (hive `<li class="board-item">` rows with status dot, badge, ✎/🗑 actions, drag-reorder), four docked panels that take over the board list's space when open — `#files-panel`, `#git-panel` (`#git-body`, `#git-msgbar`), `#hm-chat` (`#hm-chat-log`, `#hm-chat-input`, `#hm-chat-send`), `#history-panel` — then `.sidebar-actions` (toggle buttons `#files-toggle`, `#git-toggle`, `#history-toggle`, `#hm-chat-toggle`). Panels are mutually exclusive: each `setXOpen(true)` closes the siblings, and the sidebar gets a `files-open`/`git-open`/`publish-open`/`history-open`/`hm-open` class. `syncSidebarPanelState()` derives one more class from those, `panel-open`, which collapses `#board-list` to just `.board-item.active` — the hive you are working on stays pinned above whichever panel is showing. Clicking that pinned row toggles `hives-peek` on the sidebar (full list, capped at 45% height) so hives stay switchable without closing the panel; any panel open/close and any hive switch clears it.
 - **Workspace**: `#board-bar` (`#board-title`, `#board-meta`, `#usage-btn` pill (holds one `.usage-seg` span per agent, filled by `renderUsagePill`), `#voice-toggle` (inline SVG mic), `#settings-btn` ⚙, `#help-btn` ❔, `#add-term` "＋ Thread"), `#grid` (holds one `.board-grid` per opened hive; inside, `.column` > `.pane` separated by `.gutter-col`/`.gutter-row`), plus overlays `#voice-hud`, `#hm-toast`, `#voice-suggest`, `#boot-state` (see Boot state) and `#empty-state` (`.empty-actions` holds `#empty-setup` → the setup wizard and `#empty-add-board` → the New-hive modal).
-- **Pane** (all built in `createPane`, no HTML template): `.pane` > `.pane-header` (`.dot`, `.title-wrap`, `.pane-plan-chip`, `.cost`, `.status`, agent/model/codex/perm `<select class="model-select">`, `.view-btn`, `.font-btn` A−/A+, `.zoom-btn` ⛶, ✕) + `.find-bar` + `.pane-body` (`.pane-term` xterm host + `.chat-wrap` overlay from `initChatUI`). The chat view **covers** the terminal (absolute positioning); the terminal is never `display:none` so fit stays correct. `.pane` state classes: `focused`, `zoomed`, `done`, `drag-over`, `term-view`, `term-chat`.
+- **Pane** (all built in `createPane`, no HTML template): `.pane` > `.pane-header` (`.dot`, `.title-wrap`, `.pane-plan-chip`, `.cost`, `.status`, agent/model/codex/perm `<select class="model-select">`, `.view-btn` (pill: `.view-icon` + `.view-label`, showing the view it switches *to*), `.zoom-btn` ⛶, ✕) + `.find-bar` + `.pane-body` (`.pane-term` xterm host + `.chat-wrap` overlay from `initChatUI`). The chat view **covers** the terminal (absolute positioning); the terminal is never `display:none` so fit stays correct. `.pane` state classes: `focused`, `zoomed`, `done`, `drag-over`, `term-view`, `term-chat`.
 - **Modals** (all `<div id="X-backdrop" class="hidden"><div id="X-modal">…` and closed by clicking the backdrop): `#modal-backdrop` (hive create/edit: `#modal-name/dir/cmd/resume/muted`), `#diff-backdrop`, `#plan-backdrop` (plan review: `#plan-doc-body`, `#plan-doc-comments`, approve/request buttons), `#branch-backdrop`, `#gh-backdrop` (GitHub wizard), `#settings-backdrop` (tabs `.settings-tab[data-tab]` / panels `.settings-panel[data-panel]`; ids `set-theme`, `set-default-model`, `set-default-codex-model`, `set-default-font`, `set-notify`, `set-plan-autopopup`, `set-autocorrect`, `#build-group`/`#build-portable`, voice ids `voice-model`, `voice-hotkey-enabled`, `voice-auto-enter`, `voice-auto-space`, `voice-reply-enabled`, `voice-dict-*`), `#voice-train-backdrop`, `#help-backdrop` (**`#help-modal`** — see Invariants), `#usage-backdrop`, `#setup-backdrop` (first-run setup wizard: `#setup-title`, `#setup-steps`, `#setup-body`, `#setup-msg`).
 - The Help modal's "Hivemind commands" list `#hm-cmd-list` is **generated at startup** from `HM_COMMANDS[].help` by `renderHmCommandHelp` — never hand-edit that `<ul>`.
 - CSP in `index.html` head allows `hm:` (offline STT assets), `blob:` workers, and `wasm-unsafe-eval` — needed by the voice worker; don't tighten it casually.
+
+## Shared skill autocomplete
+
+The composer discovers canonical project skills in `.agents/skills/`
+and inserts plain instructions to read their SKILL.md files. Claude panes also
+offer Claude built-ins and legacy project commands/skills. Shared skills win
+over duplicate legacy wrappers. Discovery uses the guarded files IPC and a
+five-second cache keyed by project directory and agent. See
+[agent-instructions.md](agent-instructions.md) for the complete behavior and
+tests; the implementation is `discoverProjectCommands` and
+`initChatAutocomplete`.
+
+## @-mention file picker
+
+`@` completes against **every** file in the hive, not just the folder the token
+names: typing filters the whole project the way an editor's quick-open does.
+
+`projectFileIndex(dir)` fetches the flat path list once per project directory
+over `files:index` (see `docs/git-and-files.md`) and caches it in
+`fileIndexCache`; `fileItems` ranks it locally with `fuzzyMatchPath` on every
+keystroke, because a project-wide fuzzy match per keypress cannot cross IPC.
+The cache is dropped by `invalidateFileIndex` from the `fs:changed` handler — a
+file a thread just wrote has to be mentionable immediately — and by a 60 s TTL
+for whatever the watcher misses.
+
+`fuzzyMatchPath` scores **both** greedy scan directions (`greedyHits`) and keeps
+the better one. Each is wrong in the opposite way: forward-greedy anchors on
+first occurrences, so `rend` against `src/renderer.js` lights up the `r` of
+`src`; backward-greedy anchors on last ones, so the same query against
+`docs/renderer.md` reaches past the name to the `d` of `.md`. `scoreHits`
+rewards contiguous runs, word and camelCase starts, and characters landing in
+the file name rather than a parent folder. The returned `hits` are indices into
+the path, which `renderAcText` uses to bold and underline the matched characters
+across the two columns (`hitBase` splits name from folder) — built from text
+nodes, never `innerHTML`, since these are file names an agent thread wrote.
+
+Two things rank above raw score: paths mentioned earlier in the session
+(`fileMentionRecent`, recorded by `noteFileMention` on accept), and — with
+nothing typed yet — shallow paths, so bare `@` opens on the top of the hive.
+
+The index is `.gitignore`-filtered, so it deliberately omits `node_modules/`,
+`dist/`, and friends. Once something *is* typed, `fileItems` also merges a plain
+`files:list` of the folder named by the last `/`, ranked below the indexed
+matches: pointing a thread at a build artifact or a `.env` is exactly when you
+need the path the index doesn't carry. That listing is skipped for an empty
+query, or the bare `@` menu would open on `node_modules/`.
 
 ## Boot state
 
@@ -281,6 +355,7 @@ Global (capture-phase document listeners, so they win over xterm):
 |---|---|---|
 | `~` (Backquote, no modifiers) | Toggle voice typing (dictates into focused thread / open Chat-with-Hivemind / training modal) | `renderer.js:~9262`; disabled by `hm.voiceHotkey='0'`; a literal backtick still types in non-thread text fields |
 | `Ctrl+Shift+H` | Toggle Chat with Hivemind panel | `renderer.js:~2201` |
+| `Ctrl+Shift+B` | Hide / show the sidebar | Pane navigation listener, before the `activeBoardId` guard (`toggleSidebar`) |
 | `Ctrl+Enter` | Maximize / restore focused thread | `renderer.js:~5352` (`toggleZoom`) |
 | `Ctrl+Shift+]` / `Ctrl+Shift+[` | Cycle focus next / previous thread | `renderer.js:~5356` (`cycleFocus`) |
 | `Ctrl+1`…`Ctrl+9` | Focus Nth thread on the active hive | `renderer.js:~5361` |
@@ -302,6 +377,7 @@ Composer / field-local:
 |---|---|
 | `Enter` / `Shift+Enter` in chat composer | Send / newline (`sendChatMessage`) |
 | `↑` / `↓` in composer (caret on first/last line) | Recall sent-message history (`chatHistoryNav`); while autocomplete is open they navigate it, `Tab`/`Enter` accept, `Esc` dismisses |
+| `@` in composer | Project-wide file picker — see **@-mention file picker** |
 | `Enter` in `#hm-chat-input` | Send command; `Esc` inside the panel closes it |
 | `Ctrl+Enter` in git commit box (`#git-msg`) | Push |
 | `Ctrl/Cmd+Enter` in plan comment textarea | Save comment |
@@ -317,7 +393,7 @@ All persistence is `localStorage` (renderer-local) except boards/layouts (JSON v
 | Key | Meaning / values | Read at |
 |---|---|---|
 | `hm.theme` | Theme id (`midnight`, `forest`, `ember`, `grape`, `paper`, `rose`) | `renderer.js:161`, written by `applyTheme` |
-| `hm.fontSize` | Default font size for new threads (8–32); updated on *every* per-pane change | `setPaneFontSize`, Settings `set-default-font` |
+| `hm.fontSize` | Default font size for new threads (8–32); updated on *every* per-pane change. Settings' `A−`/`A+` stepper (`applyDefaultFontSize`) also pushes the new size to every open pane — there is no per-thread font button any more, only `Ctrl+=`/`−`/`0` and `Ctrl+scroll` | `setPaneFontSize`, `applyDefaultFontSize`, Settings `set-default-font` |
 | `hm.model` | Default Claude model (`default`/`fable`/`opus`/`sonnet`/`haiku`); updated on every per-pane pick | `setPaneModel`, Settings |
 | `hm.codexModel` | Default ChatGPT/Codex model | `setPaneCodexModel`, Settings |
 | `hm.grokModel` | Default Grok Build model | `setPaneGrokModel`, Settings |
@@ -374,7 +450,7 @@ Everything the renderer calls on `window.api`, grouped (names only — schemas l
 
 ## Invariants & gotchas
 
-1. **CLAUDE.md rule — keep `#help-modal` in sync.** Any user-facing feature, shortcut, button, or setting change must update the Help modal content in `index.html` in the same change; the change is not done until it does. Exception: the "Hivemind commands" `<ul id="hm-cmd-list">` is generated from `HM_COMMANDS[].help` — update the registry entry's `help` string, not the HTML.
+1. **AGENTS.md rule — keep `#help-modal` in sync.** Any user-facing feature, shortcut, button, or setting change must update the Help modal content in `index.html` in the same change; the change is not done until it does. Exception: the "Hivemind commands" `<ul id="hm-cmd-list">` is generated from `HM_COMMANDS[].help` — update the registry entry's `help` string, not the HTML.
 2. **`HM_COMMANDS` is ordered** — first matching pattern wins. Specific commands must sit above generic ones (voice "stop listening" above the interrupt catch-all; `find` last). An entry can return `HM_PASS` to decline its match.
 3. **One xterm key handler.** `term.attachCustomKeyEventHandler` overwrites; every in-terminal shortcut must be added to the single handler in `createPane`.
 4. **Spawn-time fit must stay synchronous.** `spawnPanePty` calls `fitAddon.fit()` before `spawnPty`; deferring it (rAF) breaks in occluded windows and leaves phantom characters on Claude's input line. Similarly the chat view *covers* the terminal (never `display:none`) so fit/ConPTY sizing stay valid while hidden; `setPaneView` re-fits on reveal.
@@ -390,7 +466,7 @@ Everything the renderer calls on `window.api`, grouped (names only — schemas l
 8. **Status detection is heuristic and version-pinned.** `MENU_PATTERNS`, `SELECT_FOOTER_RE`, `AUTH_PATTERNS`, `PERM_SCREEN_RE`, the plan-menu regexes and the AskUserQuestion screen parsers were verified against specific Claude Code (v2.1.20x–2.1.22x) and codex-rs TUI output; when CLI wording drifts, these regexes are what to update. `AUTH_PATTERNS` in particular must stay anchored on strings the CLI really prints (they were lifted from the v2.1.221 binary) — a false positive there locks the composer on a healthy thread. Screen scans are wrap-tolerant (`joinWrapped`/`testWrapped` — the TUI hard-wraps at pane width) and shed `│┃` box chrome (`stripBoxChrome`); option scans anchor on the "1." row closest above the footer and abort on out-of-sequence numbers so prose/diff lists can't become clickable options. Buttons deliberately degrade to "answer in the terminal" rather than sending blind digits.
 8a. **Two AskUserQuestion menu layouts, two answering rules** (verified v2.1.220). A plain menu answers on the digit alone. A menu whose options carry `preview` text renders side-by-side — option list left, the focused option's preview boxed on the right, a "Notes: press n to add notes" hint under it — and there a digit only *moves* the selection; **Enter commits it**. `parseScreenQuestion` therefore cuts every row at the preview box's left column (`previewCutColumn`, computed on the *raw* lines: `stripBoxChrome` eats that edge as if it were dialog chrome, which is what used to spill box art and preview code into option labels/descriptions) and returns `needsEnter`, which is the only case where a card click follows its digit with an Enter (re-checking `cardMenuLive` first). Never send that Enter for a menu that answers immediately — it would land in whatever screen came next. The unnumbered "Chat about this" row of that layout is menu chrome, like "Submit".
 8b. **Every card button re-verifies the live screen at click time before writing to the PTY.** Question-card options and Review⇥ go through `cardMenuLive` (screen cards must still match the rendered menu's question+labels; transcript cards need `menuOnScreen`); prompt-card quick keys require `state === 'attention'` plus `promptVisibleOnScreen`; single-select cards lock after one send (`card.dataset.sent`, self-expires); options ≥ 10 are disabled (two-keystroke digits would actuate option 1); `typePrompt`'s delayed Enter and `confirmSubmit` wait a menu out instead of actuating it. A stale click must never inject keys into a menu or turn it wasn't aimed at — keep this property when touching any card handler.
-8c. **Menu keystrokes must not become the thread caption.** `sendToPane(pane, data, { caption: false })` skips `feedCaptionInput`; every card/menu send (option digits, the preview-layout Enter, Review⇥, prompt-card quick keys, plan approve/feedback) passes it — **and so does each image path in `typePrompt`**, which is plumbing rather than something the user typed. Left on, the attached paths landed in `capBuf` and the trailing Enter committed `C:\…\shot.png` + the prompt as the thread's caption, which was then persisted into the layout. Caption tracking rebuilds the *user's input line*, so a digit with no Enter behind it otherwise lingers in `capBuf` and glues itself to the front of the next real prompt, and pasted review feedback would replace the thread's task caption. Stranded transcript questions (a `tool_use` whose result never lands) age out via `syncQuestionExpiry` instead of pinning attention/composer-lock forever; pane death clears all pending-question state.
+8c. **Menu keystrokes must not become the thread caption.** `sendToPane(pane, data, { caption: false })` skips `feedCaptionInput`; every card/menu send (option digits, the preview-layout Enter, Review⇥, prompt-card quick keys, plan approve/feedback) passes it — **and so does each image path in `typePrompt`**, which is plumbing rather than something the user typed. `typePrompt` / `deliverPrompt` / `confirmSubmit` also take the flag for the *whole* prompt (`deliverPrompt(pane, text, [], { caption: false })`) — used by thread handoff and thread consult, whose request prompts are multi-line outlines that would otherwise caption the thread with its last line; the caller sets a readable caption itself. The flag has to reach the trailing Enter and every `confirmSubmit` retry, or that Enter commits whatever was left in `capBuf`. Left on, the attached paths landed in `capBuf` and the trailing Enter committed `C:\…\shot.png` + the prompt as the thread's caption, which was then persisted into the layout. Caption tracking rebuilds the *user's input line*, so a digit with no Enter behind it otherwise lingers in `capBuf` and glues itself to the front of the next real prompt, and pasted review feedback would replace the thread's task caption. Stranded transcript questions (a `tool_use` whose result never lands) age out via `syncQuestionExpiry` instead of pinning attention/composer-lock forever; pane death clears all pending-question state.
 8d. **"Request changes" submits the feedback itself.** `planSendFeedback` presses the keep-planning option, waits for its inline input, pastes the comments, waits for that text to show up on screen, then sends Enter (with one bounded retry) — it must *not* route through `typePrompt`, which by design refuses to press Enter while a menu is on screen, so the feedback silently sat in the menu's input while the card/window claimed it had been sent. It returns `false` when the text is still visibly stuck in the menu, and both callers (`planReqChangesBtn`, the card's Request-changes button) say so instead of reporting success.
 8e. **The permission dropdown is read back from the screen, never inferred.** Claude Code owns the live mode — shift+tab cycles manual → accept edits → plan → auto, and approving a plan drops the thread out of plan mode — so `permScreenCheck` (called from both probes, next to `planScreenCheck`) matches the footer hint (`PERM_SCREEN_MODES`, v2.1.220 wording) and updates `pane.permMode` + the select + the persisted layout **without respawning**; only `setPanePerm` restarts a thread. It acts only on a positive match (a dialog covering the footer must not read as a mode change) and ignores the screen for `PERM_SETTLE_MS` after a deliberate switch (stamped by `restartForPerm`), so the dying process's last frame can't revert the new mode. A screen-read mode is also what the live process is running, so it updates `pane.permRunning` and clears a `permPending` that just came true — otherwise a queued switch would restart a thread that shift+tab already moved to that very mode. `auto` is a real CLI mode (`--permission-mode auto`) and must stay in `PERMS`, or the dropdown can't represent a thread that approved a plan with "Yes, and use auto mode".
 8f. **A permission switch never lands mid-turn.** `setPanePerm` queues the mode in `pane.permPending` (dashed/dimmed dropdown via `paintPermSelect`) for **any** state that isn't `idle`/`error`, instead of restarting; `applyPendingPerm` fires it from the quiet path once the pane settles. Restarting mid-turn discards the in-flight work — it never reaches the session file, so the resumed thread comes back at an empty composer and reads as "Claude stopped thinking and just sat there". Attention waits for the same reason: a restart under a blocking menu throws away the question being asked. **Both functions must agree on the condition** — `setPanePerm` used to queue only on `busy` and send `attention` straight to a restart, so the one case `applyPendingPerm`'s comment called out was the one the entry path didn't honour. `applyPendingPerm` is the single arbiter of *when*; `setPanePerm` only decides *whether*. Flipping back to `pane.permRunning` cancels the queue.

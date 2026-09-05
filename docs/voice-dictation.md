@@ -8,7 +8,9 @@ offline** — there is no cloud speech API, no API key, and no network use at tr
 time. Two engine kinds exist: transformers.js models (Moonshine default) running in a web
 worker, and **native models** (Parakeet TDT 0.6B) decoded by `sherpa-onnx` in a main-process
 utility process (`stt-native.js`) for far higher accuracy. Toggled with the `~` key, the mic
-toolbar button (`#voice-toggle`, an inline SVG mic — red and pulsing while listening), or the spoken commands "start/stop voice typing".
+toolbar button (`#voice-toggle`, an inline SVG mic — amber while the mic opens and the model
+loads, red and pulsing once it can actually transcribe; see *Readiness signalling*), or the
+spoken commands "start/stop voice typing".
 
 ## Architecture
 
@@ -147,7 +149,7 @@ Worker → renderer (handled in `bootSttWorker`, `renderer.js:8859`):
 
 | Type | Payload | Meaning |
 | --- | --- | --- |
-| `ready` | `{ device: 'wasm' }` | ASR pipeline loaded and warmed up (0.5 s of silence pre-run). |
+| `ready` | `{ device: 'wasm' }` | ASR pipeline loaded **and warmed up** (0.5 s of silence pre-run) — see *Readiness signalling*. |
 | `progress` | `{ data }` (transformers.js progress object) | Model file load/download progress → HUD percentage. |
 | `error` | `{ message }` | ASR pipeline failed to load (fatal for this worker). |
 | `result` | `{ id, text, error? }` | Transcription for segment `id`; empty text + `error` = per-utterance inference failure; empty text, no error = "didn't catch that". |
@@ -159,7 +161,7 @@ IPC (preload `window.api`, `preload.js`):
 | Call | Returns / payload |
 | --- | --- |
 | `stt.ensureModel(repo)` | `{ ok, alreadyPresent?, error? }` — streams each file to `<name>.part`, renames on completion (no truncated files, no whole-file buffering) |
-| `stt.nativeLoad(repo)` | `{ ok, error? }` — spawns/loads the sherpa utility process (idempotent per repo) |
+| `stt.nativeLoad(repo)` | `{ ok, error? }` — spawns/loads the sherpa utility process and runs a warm-up decode before resolving (idempotent per repo) |
 | `stt.nativeTranscribe(audio)` | `{ ok, text, error? }` — one utterance (Float32Array) through the native engine |
 | `stt.nativeStop()` | fire-and-forget kill of the utility process |
 | `onSttDownloadProgress(cb)` | `{ repo, done, total, file, bytes, totalBytes }` — byte fields let the HUD show MB progress on big files (>20 MB) instead of a stuck file count |
@@ -168,6 +170,45 @@ The worker's `load` message also accepts `{ vadOnly: true }` (no model/dtype): l
 post `ready`, never load a transcriber. Used whenever the active model is native. In that mode
 the worker's `ready` must **not** set `sttReady` — only the native engine's load does
 (`bootSttWorker`'s `vadOnly` option).
+
+## Readiness signalling
+
+Toggling voice on is **not** the same as being able to hear the user, and the UI must never
+imply otherwise — a red pulsing mic beside the word "Listening…" while the model is still
+loading reads as "speak now" and costs the user their first sentence. `voicePhase()`
+(`src/renderer.js`) is the single source of truth, derived from `micLive` (set at the end of
+`startCapture`, cleared in `stopCapture`) and `sttReady`:
+
+| Phase | Condition | What is true | UI |
+| --- | --- | --- | --- |
+| `mic` | `!micLive` | `getUserMedia` / `AudioContext` / worklet still coming up — audio spoken now is **lost** | amber mic + HUD `Starting…`, "Opening the microphone — wait before speaking…" |
+| `model` | `micLive && !sttReady` | frames are captured; segments queue in `sttPending` and flush when ready | amber mic + HUD `Not ready yet…`, plus the load stage and elapsed seconds |
+| `ready` | `micLive && sttReady` | the engine can transcribe now | red pulsing mic + HUD `Listening…` / `Transcribing…` |
+
+`renderVoiceState()` applies the phase to the toolbar mic (`.listening` vs `.warming`), the
+HUD (`#voice-hud.warming`, `#voice-hud-state`), and the training modal's mic button and
+"heard" placeholder — it is the only place any of those may be told "listening".
+`renderVoiceListening()` calls it first and then owns the HUD's second, **detail** line,
+which it leaves empty in the `ready` phase (the state label already says it).
+
+During the `model` phase the detail line belongs to `renderSttLoading()`, driven by
+`sttLoadNote` (latest stage, set by `setSttLoadNote()` from the `stt:downloadProgress`
+listener and the worker's `progress` messages) plus a 1 s ticker showing elapsed seconds.
+The ticker exists because **the slow part comes after the last file reports 100%**: cold,
+Moonshine spends ~1 s reading files and ~17-25 s building the ONNX sessions and warming up,
+so a frozen "100%" reads as a hang. That is why the handler switches to "Preparing speech
+model…" at 100%/`done` instead of leaving a percentage up. The load continues after
+`stopVoice()` (so the next start is instant), so `renderSttLoading()` retires its own ticker
+once `voiceActive` goes false or the engine is ready; `sttLoadNote` survives that so a
+restart mid-download resumes the same stage text.
+
+**`ready` must mean "the next utterance comes back fast", not "the constructor returned".**
+Both engines warm up before reporting ready: the worker runs 0.5 s of silence through the
+transformers.js pipeline (`voice-worker.js`), and `stt-native.js` decodes 0.5 s of silence
+through the freshly built `OfflineRecognizer` — a 0.6 B Parakeet's first decode otherwise
+pays seconds of one-off graph/allocation cost *after* the UI has said it is listening. Keep
+that warm-up in any new engine path. The OpenAI cloud engine has nothing to load, so it
+goes ready as soon as the API key check passes.
 
 ## Invariants & gotchas
 
@@ -219,7 +260,7 @@ the worker's `ready` must **not** set `sttReady` — only the native engine's lo
   Voice can be exercised over CDP without a mic: `ensureSttWorker()` resolves when the engine
   is loaded, and posting `transcribe`/`vad` messages straight at `sttWorker` proves inference
   end to end (a pure tone correctly comes back as empty text with no error).
-- Per `CLAUDE.md`, any user-facing change here (shortcuts, buttons, settings) must be
+- Per `AGENTS.md`, any user-facing change here (shortcuts, buttons, settings) must be
   reflected in the Help modal in `src/index.html` in the same change.
 
 ## How to extend

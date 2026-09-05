@@ -9,7 +9,8 @@ The main process (`main.js`) is the privileged half of the app. It owns:
 
 - **Window lifecycle** — one `BrowserWindow` (`createWindow`, `main.js:291`), loading
   `src/index.html` over `file://`, with menu removed, navigation locked down, and
-  mic-only permission handling.
+  mic-only permission handling. It starts maximized (`mainWindow.maximize()`); the
+  1400x900 constructor size is only the restore bounds.
 - **PTY spawning** — one `node-pty` pseudo-terminal per pane, auto-typing a `claude`
   (or `codex`, or arbitrary) startup command with model/permission/resume/session
   flags composed from pane options (`spawnPty`, `main.js:155`).
@@ -73,10 +74,16 @@ PTY. The command is built by string surgery on the configured `startupCommand`
   stripped; PowerShell `''` vs POSIX `'\''` escaping). This is the only safe
   delivery — typing it later could hand it to the shell if the CLI is slow.
 
-**Environment variables.** The PTY inherits a copy of `process.env` with two
+**Environment variables.** The PTY inherits a copy of `process.env` with a few
 possible edits: **`CODEX_HOME`**, set for a ChatGPT thread that names a non-default
-account (see "ChatGPT accounts"), and **`PATH`**, extended by `agentCli.augmentEnv`
-(see "Finding the agent CLIs"). The one env var `main.js` itself honors is
+account (see "ChatGPT accounts"); **`PATH`**, extended by `agentCli.augmentEnv`
+(see "Finding the agent CLIs"); and **`HIVEMIND_THREAD`** / **`HIVEMIND_HIVE`**, the
+thread's own name and its hive's, so an agent can identify itself when it starts a
+thread consult on its own (`docs/sidecar-modules.md` → consult.js) — a thread is handed
+a shell, not an argv, so the environment is the only place it can read its own identity
+from. Both go through `envValue` (control characters stripped, capped at 120 chars):
+nothing here is spliced into a command line, but a thread name is user-typed and a stray
+CR/LF would be echoed into the TUI by anything that prints it. The one env var `main.js` itself honors is
 **`HM_USER_DATA`** (`main.js:12`): if set *before* launch,
 `app.setPath('userData', ...)` redirects the entire userData tree. This is the
 sanctioned way to run a test instance without touching the user's real
@@ -206,7 +213,7 @@ untrusted agent output.
 | `image:saveTemp` | `{ bytes, ext }` | Writes pasted/dropped image bytes to `os.tmpdir()/hivemind-images/`; returns path or null. `ext` is an **allowlist** (`png jpg jpeg gif webp bmp svg avif`, anything else becomes `png`) and the payload is capped at 32 MB — sanitizing `ext` to `[a-z0-9]` still admitted `exe`/`cmd`/`ps1`, which combined with `files:open` was a renderer→code-execution path |
 | `image:fromClipboard` | — | Reads a native clipboard bitmap, saves as PNG in the same temp dir; returns path or null |
 | `attach:stage` | `{ cwd, srcPath }` | Copies a file into `<cwd>/.hivemind/attachments/` (sweeps >1-week-old copies); returns staged path or null. **Both ends are pinned**: `cwd` must be a known board directory (`isKnownBoardDir`), and `srcPath` must sit in `os.tmpdir()/hivemind-images`, inside that board, or be a path the user picked this session via `dialog:pickFiles` (tracked in `pickedFiles`). Without the source check, staging `~/.claude/.credentials.json` would drop a token into a directory whose whole purpose is being readable by agent threads |
-| `pty:spawn` | `{ id, cwd, cols, rows, startupCommand, model, resume, permissionMode, initialPrompt, sessionId, codexAccount }` | Spawns a shell PTY, auto-types the composed agent command; returns `{ id }` |
+| `pty:spawn` | `{ id, cwd, cols, rows, startupCommand, model, resume, permissionMode, initialPrompt, sessionId, codexAccount, threadName, hiveName }` | Spawns a shell PTY, auto-types the composed agent command; returns `{ id }` |
 | `git:status` | `{ cwd }` | `git.status` — status object for the Source Control panel |
 | `git:diff` | `{ cwd, file, staged, untracked }` | Diff text for one file |
 | `git:stage` / `git:unstage` / `git:discard` | `{ cwd, files }` | Stage/unstage/discard listed files |
@@ -228,12 +235,20 @@ untrusted agent output.
 | `gh:authCancel` | — | Kill any in-flight device-flow login PTY |
 | `git:aiCommit` | `{ cwd }` | Draft a commit message from the diff via one-shot `claude -p` |
 | `hm:interpret` | `{ payload }` | Map free-form "Hivemind, …" phrasing onto the command registry via one-shot `claude -p` (`git.hmInterpret`) |
+| `files:index` | `{ cwd }` | Flat list of every project-relative file path (plus the directories holding them) behind the composer's `@` picker — **path names only, never file contents**. `git ls-files` inside a repo so `.gitignore` is honoured, a bounded symlink-skipping walk outside one; see `files.js` |
 | `files:list` / `files:open` / `files:reveal` | `{ cwd, rel }` | File Explorer: list a dir, open in OS default app, reveal in Explorer. `files:open` **refuses executable extensions** (`.exe .bat .cmd .ps1 .js .vbs .lnk .reg .hta …`, `EXECUTABLE_EXTS` in `files.js`) — `shell.openPath` on those is `ShellExecute`, i.e. running code, and the path guards only prove the file is *inside* the project, which is exactly where agent output lands. Use Reveal instead |
 | `plan:read` / `plan:write` | `{ cwd, planId [, content] }` | Read/write `.hivemind/plans/<planId>.md` |
 | `plan:readFile` | `{ cwd, file }` | Read a native plan-mode file by absolute path (guarded to `~/.claude/plans` + project `.hivemind/plans`) |
 | `plan:comments:read` / `plan:comments:write` | `{ cwd, planId [, comments] }` | Highlight-comment sidecar JSON |
 | `plan:clear` | `{ cwd, planId }` | Delete a plan |
 | `plan:ensureIgnored` / `promptHistory:ensureIgnored` | `{ cwd }` | Both call `plan.ensureIgnored` — add `.hivemind/` to the project `.gitignore` |
+| `handoff:read` / `handoff:clear` | `{ cwd, id }` | Thread handoff: read/delete the brief at `.hivemind/handoffs/<id>.md`. **Read-only by design — no write channel:** the brief is written by the source *thread*, not by Hivemind |
+| `handoff:sweep` | `{ cwd }` | Delete handoff briefs older than a week |
+| `consult:read` / `consult:readReply` | `{ cwd, id }` | Thread consult: read the question at `.hivemind/consults/<id>.md` / the answer at `<id>.reply.md`. **Neither side is writable here by design:** the question is written by the asking *thread*, the answer by the answering one |
+| `consult:requests` | `{ cwd }` | Unsolicited `ask-*.md` questions with no answer beside them yet — `{ ok, requests: [{ id, mtime }] }` |
+| `consult:clear` | `{ cwd, id }` | Delete both sides of one consult |
+| `consult:sweep` | `{ cwd }` | Delete consults older than a week (keeps `README.md`) |
+| `consult:ensureDocs` | `{ cwd }` | Write `.hivemind/consults/README.md`, the request protocol agents read to start a consult themselves. The **only** write channel in this group |
 | `promptHistory:read` / `promptHistory:append` / `promptHistory:write` | `{ cwd [, entry \| entries] }` | Per-hive prompt log in `.hivemind/prompt-history.json` |
 | `codex:accounts` | — | ChatGPT accounts: `{ id, label, home, builtin, signedIn, email, plan, method }` each, Default first. No tokens |
 | `codex:addAccount` | `{ label }` | Creates a Codex home for a new account (seeded with the default home's `config.toml`); returns `{ ok, id, accounts }` or `{ ok: false, error }` |
@@ -303,6 +318,8 @@ above). Every `on*` subscription returns an unsubscribe function.
 | `setWatch(cwd)` / `onFsChanged(cb)` | `watch:set` / `fs:changed` event |
 | `files.list/open/reveal(cwd, rel)` | `files:*` |
 | `plan.read/readFile/write/readComments/writeComments/clear/ensureIgnored` | `plan:*` (comments map to `plan:comments:read`/`write`) |
+| `handoff.read/clear/sweep` | `handoff:*` |
+| `consult.read/readReply/requests/clear/sweep/ensureDocs` | `consult:*` (`readReply` maps to `consult:readReply`) |
 | `promptHistory.read/append/write/ensureIgnored` | `promptHistory:*` |
 | `transcript.bind/unbind/noteSent/listSessions/readSession/refresh` | `transcript:bind`/`unbind`/`noteSent`/`sessions`/`session`/`refresh` |
 | `transcript.onEntries(cb)` / `transcript.onStatus(cb)` | `transcript:entries` / `transcript:status` events |
@@ -412,6 +429,6 @@ To add a new IPC feature (say, `foo:doThing`):
    subscription in preload that returns an unsubscribe function (copy the
    `onBuildProgress` pattern, `preload.js:176`).
 5. If the feature is user-facing, **update the Help modal** in `src/index.html`
-   (`#help-modal`) in the same change — project rule from `CLAUDE.md`.
+   (`#help-modal`) in the same change — project rule from `AGENTS.md`.
 6. Main-process changes need a full app relaunch (no hot reload). Test with an
    isolated instance: set `HM_USER_DATA` to a scratch dir before launching.

@@ -31,9 +31,9 @@ edits so you don't clobber concurrent changes.
 Test runs are isolated from the live instance via the `HM_USER_DATA` env var,
 which overrides Electron's userData directory:
 
-1. Seed a userData dir containing a `boards.json` (array of boards). A minimal
-   board with an empty `startupCommand` spawns plain PowerShell, so no Claude
-   session starts.
+1. Seed a userData dir containing a `boards.json` (array of boards). For a shell-only fixture, set
+   `startupCommand` to `powershell -NoLogo`; an empty startup command defaults
+   to Claude.
 2. Launch: `$env:HM_USER_DATA='<seeded dir>'; npx electron . --remote-debugging-port=9223`
 3. Drive it over CDP (no Playwright needed — Node 22+ has global `WebSocket`):
    `GET http://127.0.0.1:9223/json/list`, connect to the `page` target matching
@@ -41,7 +41,7 @@ which overrides Electron's userData directory:
 4. Teardown: kill only processes whose command line matches the debug port
    (`9223`), never by process name alone.
 
-The project skill `.claude/skills/verify/SKILL.md` documents this flow in full,
+The project skill `.agents/skills/verify/SKILL.md` documents this flow in full,
 including useful DOM handles and git fixtures. Prefer invoking that skill.
 
 ## Simulating a first run (what a new user sees)
@@ -108,7 +108,8 @@ packaged install would ship with.
 ### Chat regression checks
 
 Run `node --test scripts/test-chat.cjs` for composer/submission guards and early
-question-transcript timing. Live verification results and limits are recorded in
+question-transcript timing, and `node --test scripts/test-file-mentions.cjs` for
+the `@`-mention file index and its fuzzy ranking. Live verification results and limits are recorded in
 `docs/chat-verification.md`; use an isolated profile for those tests.
 
 ## Toolchain constraints (why Electron is pinned)
@@ -129,7 +130,7 @@ be compiled from source:
 
 ## Project conventions
 
-- **Help modal sync rule (from CLAUDE.md):** any change to a user-facing
+- **Help modal sync rule (from AGENTS.md):** any change to a user-facing
   feature, shortcut, or button must update `#help-modal` in `src/index.html` in
   the same change. The change isn't done until the Help modal matches.
 - **Version bump rule:** always bump `package.json` version before building a

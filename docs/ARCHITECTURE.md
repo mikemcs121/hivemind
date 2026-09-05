@@ -58,7 +58,7 @@ one agent thread:
 | Agent model discovery: installed CLI catalogs + safe fallbacks | `agent-models.js` | `docs/main-process.md` |
 | Agent CLI lookup: install dirs PATH can miss (Codex desktop app) | `agent-cli.js` | `docs/main-process.md` |
 | First-run setup: which agent CLIs exist and are signed in | `agent-setup.js` | `docs/main-process.md` |
-| Per-project sidecars: plans, prompt history, transcripts, usage | `plan.js`, `promptHistory.js`, `transcript.js`, `usage.js` | `docs/sidecar-modules.md` |
+| Per-project sidecars: plans, handoff briefs, consults, prompt history, transcripts, usage | `plan.js`, `handoff.js`, `consult.js`, `promptHistory.js`, `transcript.js`, `usage.js` | `docs/sidecar-modules.md` |
 | Voice typing (offline STT) | `src/voice-worker.js`, `scripts/fetch-model.mjs`, `models/` | `docs/voice-dictation.md` |
 | Build, packaging, releases, auto-update | `build.js`, `updater.js`, `scripts/before-build.js`, package.json `build` | `docs/build-and-release.md` |
 | Dev environment, live testing, toolchain pins | — | `docs/development.md` |
@@ -74,7 +74,7 @@ The complete channel-by-channel table lives in `docs/main-process.md`. Groups:
 - `codex:*` — named ChatGPT accounts (Codex CLI homes; see `docs/main-process.md`)
 - `agents:models` — sanitized Claude/Codex/Grok model catalogs from the installed CLIs
 - `agents:detect` — which agent CLIs are installed/signed in (first-run setup wizard)
-- `plan:*`, `promptHistory:*`, `usage:get` — sidecars
+- `plan:*`, `handoff:*`, `consult:*`, `promptHistory:*`, `usage:get` — sidecars
 - `transcript:*` + `transcript:entries`/`transcript:status` pushes — chat view
 - `stt:ensureModel`/`stt:downloadProgress` — voice model downloads; `stt:nativeLoad`/`stt:nativeTranscribe`/`stt:nativeStop` — the sherpa-onnx native speech engine (`stt-native.js` utility process)
 - `build:*` — in-app portable build
@@ -88,7 +88,7 @@ The complete channel-by-channel table lives in `docs/main-process.md`. Groups:
 | Location | Contents |
 |---|---|
 | userData (`%APPDATA%\hivemind`, or `HM_USER_DATA` override) | `boards.json` (boards + layouts), `codex-accounts.json` + `codex-homes/<id>/` (one Codex CLI home per named ChatGPT account — same reasoning: credentials never in the project tree), downloaded STT models under `models/` |
-| `<project>\.hivemind\` | per-project sidecars: `prompt-history.json`, `plans/` (`kanban.json` and `todos.json` are legacy — nothing reads them) |
+| `<project>\.hivemind\` | per-project sidecars: `prompt-history.json`, `plans/`, `handoffs/` (thread-written handoff briefs), `consults/` (thread-written questions + answers, plus the `README.md` that teaches threads the request format) (`kanban.json` and `todos.json` are legacy — nothing reads them) |
 | `~/.claude/projects/<encoded-dir>/*.jsonl` | Claude Code session transcripts (read-only input to the chat view) |
 | `<codex home>/sessions/YYYY/MM/DD/` | Codex rollouts (same role for Codex panes). The home is `~/.codex` unless the thread runs on a named ChatGPT account, which has its own (`codex.js`) |
 | `models/` (repo / asar-unpacked) | bundled Moonshine + Silero VAD ONNX models |
@@ -97,7 +97,7 @@ The complete channel-by-channel table lives in `docs/main-process.md`. Groups:
 ## Cross-cutting invariants (the "do not break" list)
 
 1. **Help modal sync:** any user-facing feature/shortcut/button change must
-   update `#help-modal` in `src/index.html` in the same change (CLAUDE.md
+   update `#help-modal` in `src/index.html` in the same change (AGENTS.md
    rule). Exception: `#hm-cmd-list` is auto-generated from `HM_COMMANDS`.
 2. **The user's live instance is usually running — never kill Hivemind.exe or
    electron.exe by name.** It runs as `Hivemind.exe` (a hard link to the bundled

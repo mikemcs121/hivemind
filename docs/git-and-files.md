@@ -74,6 +74,7 @@ blocking symlink traversal out of the tree.
 | Export | Args | Returns | Does |
 |---|---|---|---|
 | `list(root, rel)` (`files.js:27`) | project root, relative dir ('' = root) | `{ ok, entries: [{ name, path, isDir }] }` or `{ ok:false, reason: 'no-dir'\|'not-found'\|'error' }` | `fs.promises.readdir` one level; symlinks-to-dirs whose real target stays inside the root are treated as dirs, but a symlink resolving *outside* the root is omitted entirely (via `realInside`); sorted folders-first then case-insensitive alpha |
+| `index(root)` | project root | `{ ok, files: [rel], dirs: [rel], truncated, source: 'git'\|'walk' }` or `{ ok:false, reason }` | Flat whole-project path list for the composer's `@` picker. Inside a git work tree it is `git ls-files --cached --others --exclude-standard -z`, so it honours `.gitignore` exactly like an editor's quick-open (no `node_modules/`, no build output) and returns cwd-relative `/`-separated paths; outside one it falls back to a depth- and count-bounded walk (`INDEX_SKIP_DIRS`, `INDEX_MAX_DEPTH`, `INDEX_MAX_FILES`) that **skips symlinks outright** rather than realpath-checking each one, since a whole-tree walk that follows links is both a loop hazard and a way for an in-tree link to pull outside paths into the picker. `dirs` is derived from the files, every ancestor included. Concurrent callers share one build (`indexInFlight`) |
 | `open(root, rel)` (`files.js:60`) | root, rel file | `{ ok }` or `{ ok:false, message }` | `shell.openPath` — OS default application |
 | `reveal(root, rel)` (`files.js:68`) | root, rel file | `{ ok }` | `shell.showItemInFolder` — Explorer/Finder highlight |
 
@@ -83,7 +84,8 @@ Wiring is uniform: renderer calls `window.api.git.*` / `window.api.files.*` (exp
 `contextBridge` in `preload.js:61-108`), which `ipcRenderer.invoke`s a channel handled in
 `main.js:746-785`, which calls the module function directly. Channel names mirror the
 function names (`git:status`, `git:diff`, … `gh:check`, `gh:createRepo`, `gh:listRepos`,
-`gh:clone`, `git:aiCommit`, `hm:interpret`, `files:list`, `files:open`, `files:reveal`).
+`gh:clone`, `git:aiCommit`, `hm:interpret`, `files:list`, `files:index`, `files:open`,
+`files:reveal`).
 Exception: the GitHub device-flow **sign-in** (`gh:authStart`/`gh:authCancel`, streaming
 `gh:authStatus`) is *not* backed by `git.js` — it runs `gh auth login --web` inside a
 `node-pty` shell in the main process (`startGhAuth`, `main.js`), because that command needs
@@ -106,7 +108,8 @@ a real TTY.
 | "Clone a project from GitHub…" in the New-hive modal (`#modal-clone` → `#clone-backdrop`): sign in via device flow, pick a repo (list or URL) + destination, clone, fill the modal's dir/name | `openCloneWizard`/`renderCloneChoose`/`cloneDoClone` `renderer.js` | `gh:check`, `gh:authStart`+`gh:authStatus`, `gh:listRepos`, `gh:clone` |
 | `show diff [for <file>]` chat command | `renderer.js:1698` | `git:status`, then `showDiff` |
 | File Explorer panel (`#files-toggle`): lazy tree, click = OS-open, ⤓ insert path into thread, ⧉ reveal | `refreshFiles`/`renderFxItem` `renderer.js:6036-6138` | `files:list`, `files:open`, `files:reveal` |
-| Slash-command autocomplete (`.claude/commands`, `.claude/skills`) and `@`-path completion in composer | `renderer.js:2768-2810` | `files:list` |
+| Slash-command autocomplete (`.claude/commands`, `.claude/skills`) in composer | `discoverProjectCommands` `renderer.js` | `files:list` |
+| `@`-mention picker: whole-project fuzzy file search in composer (see `docs/renderer.md`) | `projectFileIndex`/`fileItems` `renderer.js` | `files:index`, plus `files:list` for the gitignored-path fallback |
 | Build button reveals `dist/` after portable build | `renderer.js:5492` | `files:reveal` |
 
 **Background auto-fetch** (`renderer.js:5584-5616`): `git status` only compares against
@@ -184,7 +187,7 @@ Example: add `git stash`.
    `gitRun('Stashing', (d) => window.api.git.stash(d), { okMsg: 'Stashed.' })` so the
    busy-guard, error reporting, and post-op refresh come free. Confirm first if destructive
    (see `doRevertToRemote`, `renderer.js:5712`).
-5. **Help modal** — per `CLAUDE.md`, update `#help-modal` in `src/index.html` in the same
+5. **Help modal** — per `AGENTS.md`, update `#help-modal` in `src/index.html` in the same
    change if the feature is user-visible.
 6. Note: a full Electron relaunch is required to pick up main-process changes
    (steps 1-3); renderer-only changes reload with the window.
